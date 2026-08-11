@@ -93,6 +93,8 @@ impl Default for StatletCore {
 fn present(snapshot: SystemSnapshot) -> StatusPresentation {
     let cpu = rounded_percent(snapshot.cpu_percent);
     let ram = rounded_percent(snapshot.ram_percent);
+    let (memory_severity, pressure_description) =
+        memory_pressure_presentation(snapshot.memory_pressure);
     StatusPresentation {
         top: MetricPresentation {
             label: "C",
@@ -102,11 +104,10 @@ fn present(snapshot: SystemSnapshot) -> StatusPresentation {
         bottom: MetricPresentation {
             label: "R",
             value: format!("{ram:>3}%"),
-            severity: memory_severity(snapshot.memory_pressure),
+            severity: memory_severity,
         },
         accessibility_label: format!(
-            "CPU {cpu}%, RAM {ram}%, pressão de memória {}",
-            pressure_description(snapshot.memory_pressure)
+            "CPU {cpu}%, RAM {ram}%, pressão de memória {pressure_description}"
         ),
     }
 }
@@ -123,18 +124,10 @@ fn cpu_severity(percent: f64) -> MetricSeverity {
     }
 }
 
-fn memory_severity(pressure: MemoryPressure) -> MetricSeverity {
+fn memory_pressure_presentation(pressure: MemoryPressure) -> (MetricSeverity, &'static str) {
     match pressure {
-        MemoryPressure::Normal => MetricSeverity::Good,
-        MemoryPressure::Warning => MetricSeverity::Warning,
-        MemoryPressure::Critical => MetricSeverity::Critical,
-    }
-}
-
-fn pressure_description(pressure: MemoryPressure) -> &'static str {
-    match pressure {
-        MemoryPressure::Normal => "normal",
-        MemoryPressure::Warning => "em atenção",
-        MemoryPressure::Critical => "crítica",
+        MemoryPressure::Normal => (MetricSeverity::Good, "normal"),
+        MemoryPressure::Warning => (MetricSeverity::Warning, "em atenção"),
+        MemoryPressure::Critical => (MetricSeverity::Critical, "crítica"),
     }
 }

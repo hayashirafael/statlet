@@ -33,12 +33,13 @@ fn main() {
     let mut sampler = MacSampler::new();
     sampler.prime_cpu();
     let renderer = Renderer::new();
-    let mut _tray: Option<TrayIcon> = None;
+    // tray-icon removes the status item when its owner is dropped.
+    let mut _retained_tray: Option<TrayIcon> = None;
     let mut button = None;
 
     event_loop.run(move |event, _target, control_flow| match event {
         Event::NewEvents(StartCause::Init) => {
-            _tray = Some(
+            _retained_tray = Some(
                 TrayIconBuilder::new()
                     .with_menu(Box::new(menu.clone()))
                     .build()
