@@ -1,0 +1,22 @@
+[package]
+name = "statlet"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Tiny macOS system stats, stacked"
+license = "Apache-2.0"
+repository = "https://github.com/hayashirafael/statlet"
+
+[dependencies]
+libc = "0.2"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSAccessibility", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSControl", "NSStatusBarButton", "NSFont", "NSAttributedString", "NSText", "NSColor", "NSImage", "NSStringDrawing", "NSGraphics", "NSGraphicsContext", "NSCell"] }
+objc2-foundation = { version = "0.3.2", features = ["NSString", "NSDictionary", "NSAttributedString"] }
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+tao = "0.34"
+tray-icon = "0.21"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
