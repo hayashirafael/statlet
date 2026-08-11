@@ -4,11 +4,12 @@ use statlet::core::{AppEvent, MemoryPressure, MetricSeverity, StatletCore, Syste
 fn metrics_sample_becomes_the_compact_accessible_status() {
     let mut app = StatletCore::new();
 
-    let state = app.handle(AppEvent::MetricsSample(SystemSnapshot {
+    app.handle(AppEvent::MetricsSample(SystemSnapshot {
         cpu_percent: 39.4,
         ram_percent: 72.6,
         memory_pressure: MemoryPressure::Normal,
     }));
+    let state = app.state();
 
     assert_eq!(state.status.top.label, "C");
     assert_eq!(state.status.top.value, " 39%");
@@ -33,11 +34,12 @@ fn cpu_thresholds_change_only_the_value_severity() {
 
     for (cpu_percent, expected) in cases {
         let mut app = StatletCore::new();
-        let state = app.handle(AppEvent::MetricsSample(SystemSnapshot {
+        app.handle(AppEvent::MetricsSample(SystemSnapshot {
             cpu_percent,
             ram_percent: 50.0,
             memory_pressure: MemoryPressure::Normal,
         }));
+        let state = app.state();
         assert_eq!(state.status.top.severity, expected);
     }
 }
@@ -52,11 +54,12 @@ fn ram_color_follows_pressure_instead_of_percentage() {
 
     for (ram_percent, memory_pressure, expected) in cases {
         let mut app = StatletCore::new();
-        let state = app.handle(AppEvent::MetricsSample(SystemSnapshot {
+        app.handle(AppEvent::MetricsSample(SystemSnapshot {
             cpu_percent: 10.0,
             ram_percent,
             memory_pressure,
         }));
+        let state = app.state();
         assert_eq!(state.status.bottom.severity, expected);
     }
 }
@@ -66,11 +69,12 @@ fn percentage_fields_keep_the_same_width() {
     let mut app = StatletCore::new();
 
     for percent in [0.0, 9.0, 10.0, 99.0, 100.0] {
-        let state = app.handle(AppEvent::MetricsSample(SystemSnapshot {
+        app.handle(AppEvent::MetricsSample(SystemSnapshot {
             cpu_percent: percent,
             ram_percent: percent,
             memory_pressure: MemoryPressure::Normal,
         }));
+        let state = app.state();
         assert_eq!(state.status.top.value.chars().count(), 4);
         assert_eq!(state.status.bottom.value.chars().count(), 4);
     }

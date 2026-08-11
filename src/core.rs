@@ -52,11 +52,67 @@ pub struct StatusPresentation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppState {
     pub status: StatusPresentation,
+    pub preferences: Preferences,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AppEvent {
     MetricsSample(SystemSnapshot),
+    OpenPreferences,
+    OpenHistory,
+    Quit,
+    SetMoleIntegrationEnabled(bool),
+    SetWarningThreshold(WarningThreshold),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowKind {
+    Preferences,
+    History,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppEffect {
+    ShowWindow(WindowKind),
+    SavePreferences(Preferences),
+    SetDiskSamplingEnabled(bool),
+    Quit,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Preferences {
+    pub mole_integration_enabled: bool,
+    pub warning_threshold: WarningThreshold,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WarningThreshold(u8);
+
+impl WarningThreshold {
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl Default for WarningThreshold {
+    fn default() -> Self {
+        Self(90)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidWarningThreshold(pub u8);
+
+impl TryFrom<u8> for WarningThreshold {
+    type Error = InvalidWarningThreshold;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if (70..=95).contains(&value) && value.is_multiple_of(5) {
+            Ok(Self(value))
+        } else {
+            Err(InvalidWarningThreshold(value))
+        }
+    }
 }
 
 pub struct StatletCore {
@@ -65,22 +121,60 @@ pub struct StatletCore {
 
 impl StatletCore {
     pub fn new() -> Self {
-        Self {
+        Self::with_preferences(Preferences::default()).0
+    }
+
+    pub fn with_preferences(preferences: Preferences) -> (Self, Vec<AppEffect>) {
+        let disk_sampling_enabled = preferences.mole_integration_enabled;
+        let core = Self {
             state: AppState {
                 status: present(SystemSnapshot {
                     cpu_percent: 0.0,
                     ram_percent: 0.0,
                     memory_pressure: MemoryPressure::Normal,
                 }),
+                preferences,
             },
-        }
+        };
+        (
+            core,
+            vec![AppEffect::SetDiskSamplingEnabled(disk_sampling_enabled)],
+        )
     }
 
-    pub fn handle(&mut self, event: AppEvent) -> &AppState {
-        match event {
-            AppEvent::MetricsSample(snapshot) => self.state.status = present(snapshot),
-        }
+    pub fn state(&self) -> &AppState {
         &self.state
+    }
+
+    pub fn handle(&mut self, event: AppEvent) -> Vec<AppEffect> {
+        match event {
+            AppEvent::MetricsSample(snapshot) => {
+                self.state.status = present(snapshot);
+                Vec::new()
+            }
+            AppEvent::OpenPreferences => {
+                vec![AppEffect::ShowWindow(WindowKind::Preferences)]
+            }
+            AppEvent::OpenHistory => vec![AppEffect::ShowWindow(WindowKind::History)],
+            AppEvent::Quit => vec![AppEffect::Quit],
+            AppEvent::SetMoleIntegrationEnabled(enabled) => {
+                if self.state.preferences.mole_integration_enabled == enabled {
+                    return Vec::new();
+                }
+                self.state.preferences.mole_integration_enabled = enabled;
+                vec![
+                    AppEffect::SavePreferences(self.state.preferences),
+                    AppEffect::SetDiskSamplingEnabled(enabled),
+                ]
+            }
+            AppEvent::SetWarningThreshold(threshold) => {
+                if self.state.preferences.warning_threshold == threshold {
+                    return Vec::new();
+                }
+                self.state.preferences.warning_threshold = threshold;
+                vec![AppEffect::SavePreferences(self.state.preferences)]
+            }
+        }
     }
 }
 
