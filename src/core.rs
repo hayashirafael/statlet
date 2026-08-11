@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::disk::DiskObservation;
+use crate::history::HistoryEventKind;
 use crate::mole::MoleStatus;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,10 +79,12 @@ pub enum AppEvent {
     SetMoleIntegrationEnabled(bool),
     SetWarningThreshold(WarningThreshold),
     DiskObserved(DiskObservation),
+    DiskMonitoringFailed,
     ReviewSpace,
     NotificationActivated,
     MoleStatusObserved(MoleStatus),
     OpenMoleInTerminal,
+    ClearHistoryConfirmed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +103,8 @@ pub enum AppEffect {
     RequestNotificationAuthorization,
     CheckMoleCompatibility,
     LaunchMoleInTerminal,
+    RecordHistory(HistoryEventKind),
+    ClearHistory,
     Quit,
 }
 
@@ -143,6 +148,8 @@ pub struct StatletCore {
     state: AppState,
     system_snapshot: SystemSnapshot,
     disk_episode: DiskEpisode,
+    last_mole_block: Option<HistoryEventKind>,
+    monitoring_failure_active: bool,
 }
 
 impl StatletCore {
@@ -166,6 +173,8 @@ impl StatletCore {
             },
             system_snapshot,
             disk_episode: DiskEpisode::default(),
+            last_mole_block: None,
+            monitoring_failure_active: false,
         };
         let mut effects = vec![AppEffect::SetDiskSamplingEnabled(disk_sampling_enabled)];
         if disk_sampling_enabled {
@@ -209,6 +218,8 @@ impl StatletCore {
                     self.disk_episode = DiskEpisode::default();
                     self.state.latest_disk_observation = None;
                     self.state.mole_status = MoleStatus::Unknown;
+                    self.last_mole_block = None;
+                    self.monitoring_failure_active = false;
                     self.refresh_status();
                 }
                 let mut effects = vec![
@@ -233,15 +244,30 @@ impl StatletCore {
                     return Vec::new();
                 }
                 self.state.latest_disk_observation = Some(observation);
-                let alert_started = self
+                self.monitoring_failure_active = false;
+                let transition = self
                     .disk_episode
                     .observe(observation, self.state.preferences.warning_threshold);
                 self.refresh_status();
-                if alert_started {
-                    vec![AppEffect::DiskPressureAlert(observation)]
-                } else {
-                    Vec::new()
+                match transition {
+                    DiskEpisodeTransition::Started => vec![
+                        AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
+                        AppEffect::DiskPressureAlert(observation),
+                    ],
+                    DiskEpisodeTransition::Recovered => vec![AppEffect::RecordHistory(
+                        HistoryEventKind::DiskPressureRecovered,
+                    )],
+                    DiskEpisodeTransition::None => Vec::new(),
                 }
+            }
+            AppEvent::DiskMonitoringFailed => {
+                if !self.state.preferences.mole_integration_enabled
+                    || self.monitoring_failure_active
+                {
+                    return Vec::new();
+                }
+                self.monitoring_failure_active = true;
+                vec![AppEffect::RecordHistory(HistoryEventKind::MonitoringFailed)]
             }
             AppEvent::MoleStatusObserved(status) => {
                 if !self.state.preferences.mole_integration_enabled {
@@ -249,7 +275,23 @@ impl StatletCore {
                 }
                 self.state.mole_status = status;
                 self.refresh_status();
-                Vec::new()
+                let block = match status {
+                    MoleStatus::Missing => Some(HistoryEventKind::MoleMissing),
+                    MoleStatus::Unavailable => Some(HistoryEventKind::MoleUnavailable),
+                    MoleStatus::Incompatible(_) => Some(HistoryEventKind::MoleIncompatible),
+                    MoleStatus::Compatible(_) => {
+                        self.last_mole_block = None;
+                        None
+                    }
+                    MoleStatus::Unknown => None,
+                };
+                match block {
+                    Some(block) if Some(block) != self.last_mole_block => {
+                        self.last_mole_block = Some(block);
+                        vec![AppEffect::RecordHistory(block)]
+                    }
+                    _ => Vec::new(),
+                }
             }
             AppEvent::OpenMoleInTerminal => {
                 if self.state.preferences.mole_integration_enabled
@@ -260,6 +302,7 @@ impl StatletCore {
                     Vec::new()
                 }
             }
+            AppEvent::ClearHistoryConfirmed => vec![AppEffect::ClearHistory],
         }
     }
 
@@ -295,11 +338,27 @@ enum DiskEpisode {
     Active,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiskEpisodeTransition {
+    None,
+    Started,
+    Recovered,
+}
+
 impl DiskEpisode {
-    fn observe(&mut self, observation: DiskObservation, threshold: WarningThreshold) -> bool {
+    fn observe(
+        &mut self,
+        observation: DiskObservation,
+        threshold: WarningThreshold,
+    ) -> DiskEpisodeTransition {
         if !observation.is_at_or_above(threshold.get()) {
+            let recovered = matches!(self, Self::Active);
             *self = Self::Ready;
-            return false;
+            return if recovered {
+                DiskEpisodeTransition::Recovered
+            } else {
+                DiskEpisodeTransition::None
+            };
         }
 
         let observed_at = observation.observed_at();
@@ -309,7 +368,7 @@ impl DiskEpisode {
                     started_at: observed_at,
                     last_observed_at: observed_at,
                 };
-                false
+                DiskEpisodeTransition::None
             }
             Self::Debouncing {
                 started_at,
@@ -323,21 +382,21 @@ impl DiskEpisode {
                         started_at: observed_at,
                         last_observed_at: observed_at,
                     };
-                    return false;
+                    return DiskEpisodeTransition::None;
                 }
 
                 if observed_at.saturating_sub(started_at) >= REQUIRED_PRESSURE_DURATION {
                     *self = Self::Active;
-                    true
+                    DiskEpisodeTransition::Started
                 } else {
                     *self = Self::Debouncing {
                         started_at,
                         last_observed_at: observed_at,
                     };
-                    false
+                    DiskEpisodeTransition::None
                 }
             }
-            Self::Active => false,
+            Self::Active => DiskEpisodeTransition::None,
         }
     }
 

@@ -5,13 +5,15 @@
 
 mod macos;
 
+use std::collections::VecDeque;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use objc2::MainThreadMarker;
 use statlet::core::{AppEffect, AppEvent, StatletCore};
 use statlet::disk::macos::{ContinuousClock, StartupVolumeSampler};
 use statlet::disk::DiskSamplingSchedule;
+use statlet::history::{History, HistoryStore};
 use statlet::mole::{MoleDetection, MoleDetector, MoleInstallation, MoleStatus};
 use statlet::preferences::PreferencesStore;
 use tao::event::{Event, StartCause};
@@ -67,9 +69,18 @@ fn main() {
 
     let preferences_store = PreferencesStore::for_current_user()
         .expect("resolve the current user's preferences directory");
+    let history_store =
+        HistoryStore::for_current_user().expect("resolve the current user's history directory");
+    let history = history_store.load();
     let initial_preferences = preferences_store.load();
     let (mut core, startup_effects) = StatletCore::with_preferences(initial_preferences);
-    let mut runtime = RuntimeAdapters::new(preferences_store, review_space_item, proxy.clone());
+    let mut runtime = RuntimeAdapters::new(
+        preferences_store,
+        history_store,
+        history,
+        review_space_item,
+        proxy.clone(),
+    );
     let renderer = Renderer::new();
     // tray-icon removes the status item when its owner is dropped.
     let mut _retained_tray: Option<TrayIcon> = None;
@@ -126,6 +137,8 @@ fn main() {
 
 struct RuntimeAdapters {
     preferences_store: PreferencesStore,
+    history_store: HistoryStore,
+    history: History,
     windows: Option<WindowManager>,
     samplers: RuntimeSamplers,
     mole: RuntimeMole,
@@ -136,11 +149,15 @@ struct RuntimeAdapters {
 impl RuntimeAdapters {
     fn new(
         preferences_store: PreferencesStore,
+        history_store: HistoryStore,
+        history: History,
         review_space_item: MenuItem,
         proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
     ) -> Self {
         Self {
             preferences_store,
+            history_store,
+            history,
             windows: None,
             samplers: RuntimeSamplers::new(),
             mole: RuntimeMole::new(proxy),
@@ -160,15 +177,16 @@ impl RuntimeAdapters {
 
     fn apply_effects(&mut self, effects: &[AppEffect], core: &mut StatletCore) -> bool {
         let mut should_quit = false;
-        for effect in effects {
+        let mut pending = effects.iter().copied().collect::<VecDeque<_>>();
+        while let Some(effect) = pending.pop_front() {
             match effect {
                 AppEffect::ShowWindow(kind) => {
                     if let Some(windows) = &mut self.windows {
-                        windows.show(*kind, core.state());
+                        windows.show(kind, core.state(), &self.history);
                     }
                 }
                 AppEffect::SavePreferences(preferences) => {
-                    if let Err(error) = self.preferences_store.save(*preferences) {
+                    if let Err(error) = self.preferences_store.save(preferences) {
                         eprintln!("Statlet could not save preferences: {error}");
                     }
                     if let Some(windows) = &self.windows {
@@ -176,14 +194,14 @@ impl RuntimeAdapters {
                     }
                 }
                 AppEffect::SetDiskSamplingEnabled(enabled) => {
-                    self.samplers.set_disk_sampling_enabled(*enabled);
+                    self.samplers.set_disk_sampling_enabled(enabled);
                     if !enabled {
                         self.mole.cancel();
                     }
                 }
                 AppEffect::DiskPressureAlert(observation) => {
                     if let Some(notifications) = &self.notifications {
-                        notifications.deliver_disk_pressure(*observation);
+                        notifications.deliver_disk_pressure(observation);
                     }
                 }
                 AppEffect::RequestNotificationAuthorization => {
@@ -194,7 +212,9 @@ impl RuntimeAdapters {
                 AppEffect::CheckMoleCompatibility => {
                     if let Err(error) = self.mole.check() {
                         eprintln!("Statlet could not start Mole compatibility check: {error}");
-                        core.handle(AppEvent::MoleStatusObserved(MoleStatus::Unavailable));
+                        pending.extend(
+                            core.handle(AppEvent::MoleStatusObserved(MoleStatus::Unavailable)),
+                        );
                     }
                 }
                 AppEffect::LaunchMoleInTerminal => {
@@ -202,6 +222,26 @@ impl RuntimeAdapters {
                         eprintln!("Statlet could not open Mole in Terminal: {error}");
                     }
                 }
+                AppEffect::RecordHistory(kind) => {
+                    match self.history_store.record(kind, SystemTime::now()) {
+                        Ok(history) => {
+                            self.history = history;
+                            if let Some(windows) = &self.windows {
+                                windows.update_history(&self.history);
+                            }
+                        }
+                        Err(error) => eprintln!("Statlet could not record history: {error}"),
+                    }
+                }
+                AppEffect::ClearHistory => match self.history_store.clear() {
+                    Ok(history) => {
+                        self.history = history;
+                        if let Some(windows) = &self.windows {
+                            windows.update_history(&self.history);
+                        }
+                    }
+                    Err(error) => eprintln!("Statlet could not clear history: {error}"),
+                },
                 AppEffect::Quit => should_quit = true,
             }
         }
@@ -334,7 +374,7 @@ impl RuntimeSamplers {
                     Ok(observation) => core.handle(AppEvent::DiskObserved(observation)),
                     Err(error) => {
                         eprintln!("Statlet could not sample the startup volume: {error:?}");
-                        Vec::new()
+                        core.handle(AppEvent::DiskMonitoringFailed)
                     }
                 }
             } else {

@@ -2,14 +2,17 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSControlStateValueOn, NSLineBreakMode,
-    NSPopUpButton, NSTextField, NSWindow, NSWindowStyleMask,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSBackingStoreType, NSButton,
+    NSControlStateValueOn, NSLineBreakMode, NSPopUpButton, NSScrollView, NSTextField, NSView,
+    NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSFileManager, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    ns_string, MainThreadMarker, NSDate, NSDateFormatter, NSDateFormatterStyle, NSFileManager,
+    NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
 };
 use statlet::core::{AppEvent, AppState, Preferences, WarningThreshold, WindowKind};
 use statlet::disk::format_decimal_gigabytes;
+use statlet::history::{History, HistoryEventKind, HistoryRecord, MAX_HISTORY_RECORDS};
 use statlet::mole::MoleStatus;
 use tao::event_loop::EventLoopProxy;
 
@@ -63,6 +66,25 @@ define_class!(
                 .proxy
                 .send_event(RuntimeEvent::App(AppEvent::OpenMoleInTerminal));
         }
+
+        #[unsafe(method(clearHistory:))]
+        fn clear_history(&self, _sender: &NSButton) {
+            let mtm = MainThreadMarker::new().expect("history actions run on the main thread");
+            let alert = NSAlert::new(mtm);
+            alert.setAlertStyle(NSAlertStyle::Warning);
+            alert.setMessageText(ns_string!("Apagar todo o histórico?"));
+            alert.setInformativeText(ns_string!(
+                "Esta ação remove os registros locais do Statlet e não pode ser desfeita."
+            ));
+            alert.addButtonWithTitle(ns_string!("Apagar histórico"));
+            alert.addButtonWithTitle(ns_string!("Cancelar"));
+            if alert.runModal() == NSAlertFirstButtonReturn {
+                let _ = self
+                    .ivars()
+                    .proxy
+                    .send_event(RuntimeEvent::App(AppEvent::ClearHistoryConfirmed));
+            }
+        }
     }
 );
 
@@ -76,7 +98,7 @@ impl ControlTarget {
 pub struct WindowManager {
     control_target: Retained<ControlTarget>,
     preferences: Option<PreferencesWindow>,
-    history: Option<Retained<NSWindow>>,
+    history: Option<HistoryWindow>,
     free_space: Option<FreeSpaceWindow>,
 }
 
@@ -95,6 +117,15 @@ struct FreeSpaceWindow {
     open_mole_button: Retained<NSButton>,
 }
 
+struct HistoryWindow {
+    window: Retained<NSWindow>,
+    document: Retained<NSView>,
+    rows: Vec<Retained<NSTextField>>,
+    empty_label: Retained<NSTextField>,
+    scroll_view: Retained<NSScrollView>,
+    clear_button: Retained<NSButton>,
+}
+
 impl WindowManager {
     pub fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Self {
         let control_target = ControlTarget::new(mtm, proxy);
@@ -106,7 +137,7 @@ impl WindowManager {
         }
     }
 
-    pub fn show(&mut self, kind: WindowKind, state: &AppState) {
+    pub fn show(&mut self, kind: WindowKind, state: &AppState, history: &History) {
         let mtm = MainThreadMarker::new().expect("native window actions run on the main thread");
         let window = match kind {
             WindowKind::Preferences => {
@@ -120,9 +151,17 @@ impl WindowManager {
                     .expect("preferences window was created")
                     .window
             }
-            WindowKind::History => self
-                .history
-                .get_or_insert_with(|| create_history_window(mtm)),
+            WindowKind::History => {
+                if self.history.is_none() {
+                    self.history = Some(create_history_window(mtm, &self.control_target));
+                }
+                self.update_history(history);
+                &self
+                    .history
+                    .as_ref()
+                    .expect("history window was created")
+                    .window
+            }
             WindowKind::FreeSpace => {
                 if self.free_space.is_none() {
                     self.free_space = Some(create_free_space_window(mtm, &self.control_target));
@@ -146,6 +185,12 @@ impl WindowManager {
         }
         if let Some(window) = &self.free_space {
             window.apply(state);
+        }
+    }
+
+    pub fn update_history(&self, history: &History) {
+        if let Some(window) = &self.history {
+            window.apply(history);
         }
     }
 }
@@ -403,30 +448,142 @@ fn value_label(mtm: MainThreadMarker, y: f64) -> Retained<NSTextField> {
     label
 }
 
-fn create_history_window(mtm: MainThreadMarker) -> Retained<NSWindow> {
-    let window = create_window(mtm, "Histórico do Statlet", NSSize::new(520.0, 310.0));
+impl HistoryWindow {
+    fn apply(&self, history: &History) {
+        let empty = history.is_empty();
+        self.empty_label.setHidden(!empty);
+        self.scroll_view.setHidden(empty);
+        self.clear_button.setEnabled(!empty);
+
+        let document_height = (history.records().len() as f64 * 36.0).max(320.0);
+        self.document
+            .setFrameSize(NSSize::new(532.0, document_height));
+        for (index, row) in self.rows.iter().enumerate() {
+            let Some(record) = history.records().get(index) else {
+                row.setHidden(true);
+                continue;
+            };
+            row.setHidden(false);
+            row.setStringValue(&objc2_foundation::NSString::from_str(
+                &format_history_record(*record),
+            ));
+            row.setFrame(NSRect::new(
+                NSPoint::new(8.0, document_height - ((index + 1) as f64 * 36.0)),
+                NSSize::new(508.0, 28.0),
+            ));
+        }
+        let clip_view = self.scroll_view.contentView();
+        clip_view.scrollToPoint(NSPoint::new(0.0, (document_height - 300.0).max(0.0)));
+        self.scroll_view.reflectScrolledClipView(&clip_view);
+    }
+}
+
+fn create_history_window(mtm: MainThreadMarker, target: &ControlTarget) -> HistoryWindow {
+    let window = create_window(mtm, "Histórico do Statlet", NSSize::new(600.0, 480.0));
     let content = window.contentView().expect("history window content view");
 
-    let heading = NSTextField::labelWithString(ns_string!("Nenhum alerta ainda"), mtm);
+    let heading = NSTextField::labelWithString(ns_string!("Histórico local"), mtm);
     heading.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(17.0)));
     heading.setFrame(NSRect::new(
-        NSPoint::new(24.0, 238.0),
-        NSSize::new(460.0, 28.0),
+        NSPoint::new(24.0, 420.0),
+        NSSize::new(552.0, 28.0),
     ));
 
     let explanation = NSTextField::labelWithString(
-        ns_string!("Os alertas de uso sustentado do disco aparecerão aqui quando a integração estiver ativa."),
+        ns_string!("Até 30 eventos do disco e da integração, mantidos somente neste Mac."),
         mtm,
     );
     explanation.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
     explanation.setFrame(NSRect::new(
-        NSPoint::new(24.0, 204.0),
-        NSSize::new(470.0, 24.0),
+        NSPoint::new(24.0, 390.0),
+        NSSize::new(552.0, 24.0),
     ));
+
+    let empty_label = NSTextField::labelWithString(
+        ns_string!(
+            "Nenhum evento registrado. O Statlet não registra nomes nem caminhos de arquivos."
+        ),
+        mtm,
+    );
+    empty_label.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
+    empty_label.setFrame(NSRect::new(
+        NSPoint::new(24.0, 220.0),
+        NSSize::new(552.0, 44.0),
+    ));
+    empty_label.setMaximumNumberOfLines(2);
+    empty_label.setUsesSingleLineMode(false);
+    empty_label.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+
+    let scroll_view = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
+        NSRect::new(NSPoint::new(24.0, 76.0), NSSize::new(552.0, 300.0)),
+    );
+    scroll_view.setHasVerticalScroller(true);
+    scroll_view.setDrawsBackground(false);
+    let document = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(532.0, 320.0)),
+    );
+    let mut rows = Vec::with_capacity(MAX_HISTORY_RECORDS);
+    for _ in 0..MAX_HISTORY_RECORDS {
+        let row = text_label(
+            mtm,
+            "",
+            NSRect::new(NSPoint::new(8.0, 0.0), NSSize::new(508.0, 28.0)),
+        );
+        row.setHidden(true);
+        row.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        document.addSubview(&row);
+        rows.push(row);
+    }
+    scroll_view.setDocumentView(Some(&document));
+
+    let clear_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("Apagar histórico…"),
+            Some(target as &AnyObject),
+            Some(sel!(clearHistory:)),
+            mtm,
+        )
+    };
+    clear_button.setFrame(NSRect::new(
+        NSPoint::new(24.0, 24.0),
+        NSSize::new(160.0, 34.0),
+    ));
+    clear_button.setEnabled(false);
 
     content.addSubview(&heading);
     content.addSubview(&explanation);
-    window
+    content.addSubview(&empty_label);
+    content.addSubview(&scroll_view);
+    content.addSubview(&clear_button);
+
+    HistoryWindow {
+        window,
+        document,
+        rows,
+        empty_label,
+        scroll_view,
+        clear_button,
+    }
+}
+
+fn format_history_record(record: HistoryRecord) -> String {
+    let date = NSDate::dateWithTimeIntervalSince1970(record.timestamp_unix_seconds as f64);
+    let timestamp = NSDateFormatter::localizedStringFromDate_dateStyle_timeStyle(
+        &date,
+        NSDateFormatterStyle::ShortStyle,
+        NSDateFormatterStyle::ShortStyle,
+    );
+    let summary = match record.kind {
+        HistoryEventKind::DiskPressureStarted => "Pouco espaço detectado",
+        HistoryEventKind::DiskPressureRecovered => "Uso do disco voltou ao normal",
+        HistoryEventKind::MoleMissing => "Mole não encontrado",
+        HistoryEventKind::MoleIncompatible => "Versão do Mole incompatível",
+        HistoryEventKind::MoleUnavailable => "Não foi possível verificar o Mole",
+        HistoryEventKind::MonitoringFailed => "Falha ao ler o volume de inicialização",
+    };
+    format!("{timestamp}  —  {summary}")
 }
 
 fn create_window(mtm: MainThreadMarker, title: &str, size: NSSize) -> Retained<NSWindow> {
