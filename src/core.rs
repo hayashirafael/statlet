@@ -72,6 +72,8 @@ pub struct AppState {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AppEvent {
+    ApplicationLaunched,
+    ApplicationReopened { has_visible_windows: bool },
     MetricsSample(SystemSnapshot),
     OpenPreferences,
     OpenHistory,
@@ -189,6 +191,15 @@ impl StatletCore {
 
     pub fn handle(&mut self, event: AppEvent) -> Vec<AppEffect> {
         match event {
+            AppEvent::ApplicationLaunched => {
+                vec![AppEffect::ShowWindow(WindowKind::Preferences)]
+            }
+            AppEvent::ApplicationReopened {
+                has_visible_windows: false,
+            } => vec![AppEffect::ShowWindow(WindowKind::Preferences)],
+            AppEvent::ApplicationReopened {
+                has_visible_windows: true,
+            } => Vec::new(),
             AppEvent::MetricsSample(snapshot) => {
                 self.system_snapshot = snapshot;
                 self.refresh_status();
