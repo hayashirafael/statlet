@@ -1,3 +1,7 @@
+use std::time::Duration;
+
+use crate::disk::DiskObservation;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryPressure {
     Normal,
@@ -46,7 +50,13 @@ pub struct MetricPresentation {
 pub struct StatusPresentation {
     pub top: MetricPresentation,
     pub bottom: MetricPresentation,
+    pub disk_badge: Option<DiskBadge>,
     pub accessibility_label: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiskBadge {
+    Warning,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,6 +73,7 @@ pub enum AppEvent {
     Quit,
     SetMoleIntegrationEnabled(bool),
     SetWarningThreshold(WarningThreshold),
+    DiskObserved(DiskObservation),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +87,7 @@ pub enum AppEffect {
     ShowWindow(WindowKind),
     SavePreferences(Preferences),
     SetDiskSamplingEnabled(bool),
+    DiskPressureAlert(DiskObservation),
     Quit,
 }
 
@@ -117,6 +129,8 @@ impl TryFrom<u8> for WarningThreshold {
 
 pub struct StatletCore {
     state: AppState,
+    system_snapshot: SystemSnapshot,
+    disk_episode: DiskEpisode,
 }
 
 impl StatletCore {
@@ -126,15 +140,18 @@ impl StatletCore {
 
     pub fn with_preferences(preferences: Preferences) -> (Self, Vec<AppEffect>) {
         let disk_sampling_enabled = preferences.mole_integration_enabled;
+        let system_snapshot = SystemSnapshot {
+            cpu_percent: 0.0,
+            ram_percent: 0.0,
+            memory_pressure: MemoryPressure::Normal,
+        };
         let core = Self {
             state: AppState {
-                status: present(SystemSnapshot {
-                    cpu_percent: 0.0,
-                    ram_percent: 0.0,
-                    memory_pressure: MemoryPressure::Normal,
-                }),
+                status: present(system_snapshot, None),
                 preferences,
             },
+            system_snapshot,
+            disk_episode: DiskEpisode::default(),
         };
         (
             core,
@@ -149,7 +166,8 @@ impl StatletCore {
     pub fn handle(&mut self, event: AppEvent) -> Vec<AppEffect> {
         match event {
             AppEvent::MetricsSample(snapshot) => {
-                self.state.status = present(snapshot);
+                self.system_snapshot = snapshot;
+                self.refresh_status();
                 Vec::new()
             }
             AppEvent::OpenPreferences => {
@@ -162,6 +180,10 @@ impl StatletCore {
                     return Vec::new();
                 }
                 self.state.preferences.mole_integration_enabled = enabled;
+                if !enabled {
+                    self.disk_episode = DiskEpisode::default();
+                    self.refresh_status();
+                }
                 vec![
                     AppEffect::SavePreferences(self.state.preferences),
                     AppEffect::SetDiskSamplingEnabled(enabled),
@@ -174,7 +196,26 @@ impl StatletCore {
                 self.state.preferences.warning_threshold = threshold;
                 vec![AppEffect::SavePreferences(self.state.preferences)]
             }
+            AppEvent::DiskObserved(observation) => {
+                if !self.state.preferences.mole_integration_enabled {
+                    return Vec::new();
+                }
+                let alert_started = self
+                    .disk_episode
+                    .observe(observation, self.state.preferences.warning_threshold);
+                self.refresh_status();
+                if alert_started {
+                    vec![AppEffect::DiskPressureAlert(observation)]
+                } else {
+                    Vec::new()
+                }
+            }
         }
+    }
+
+    fn refresh_status(&mut self) {
+        let disk_badge = self.disk_episode.is_active().then_some(DiskBadge::Warning);
+        self.state.status = present(self.system_snapshot, disk_badge);
     }
 }
 
@@ -184,11 +225,81 @@ impl Default for StatletCore {
     }
 }
 
-fn present(snapshot: SystemSnapshot) -> StatusPresentation {
+const REQUIRED_PRESSURE_DURATION: Duration = Duration::from_secs(5 * 60);
+const MAX_OBSERVED_GAP: Duration = Duration::from_secs(90);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DiskEpisode {
+    #[default]
+    Ready,
+    Debouncing {
+        started_at: Duration,
+        last_observed_at: Duration,
+    },
+    Active,
+}
+
+impl DiskEpisode {
+    fn observe(&mut self, observation: DiskObservation, threshold: WarningThreshold) -> bool {
+        if !observation.is_at_or_above(threshold.get()) {
+            *self = Self::Ready;
+            return false;
+        }
+
+        let observed_at = observation.observed_at();
+        match *self {
+            Self::Ready => {
+                *self = Self::Debouncing {
+                    started_at: observed_at,
+                    last_observed_at: observed_at,
+                };
+                false
+            }
+            Self::Debouncing {
+                started_at,
+                last_observed_at,
+            } => {
+                let continuous = observed_at
+                    .checked_sub(last_observed_at)
+                    .is_some_and(|gap| gap <= MAX_OBSERVED_GAP);
+                if !continuous {
+                    *self = Self::Debouncing {
+                        started_at: observed_at,
+                        last_observed_at: observed_at,
+                    };
+                    return false;
+                }
+
+                if observed_at.saturating_sub(started_at) >= REQUIRED_PRESSURE_DURATION {
+                    *self = Self::Active;
+                    true
+                } else {
+                    *self = Self::Debouncing {
+                        started_at,
+                        last_observed_at: observed_at,
+                    };
+                    false
+                }
+            }
+            Self::Active => false,
+        }
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
+fn present(snapshot: SystemSnapshot, disk_badge: Option<DiskBadge>) -> StatusPresentation {
     let cpu = rounded_percent(snapshot.cpu_percent);
     let ram = rounded_percent(snapshot.ram_percent);
     let (memory_severity, pressure_description) =
         memory_pressure_presentation(snapshot.memory_pressure);
+    let disk_description = if disk_badge.is_some() {
+        ", disco acima do limite"
+    } else {
+        ""
+    };
     StatusPresentation {
         top: MetricPresentation {
             label: "C",
@@ -200,8 +311,9 @@ fn present(snapshot: SystemSnapshot) -> StatusPresentation {
             value: format!("{ram:>3}%"),
             severity: memory_severity,
         },
+        disk_badge,
         accessibility_label: format!(
-            "CPU {cpu}%, RAM {ram}%, pressão de memória {pressure_description}"
+            "CPU {cpu}%, RAM {ram}%, pressão de memória {pressure_description}{disk_description}"
         ),
     }
 }
