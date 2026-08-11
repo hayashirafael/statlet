@@ -9,3 +9,5 @@ O Statlet começará como uma derivação rastreável do featherbar em Rust porq
 ## Consequências
 
 A implementação deve provar que continua leve em Apple Silicon e evitar abstrações ou features que descaracterizem o modelo de performance da referência.
+
+O protótipo `prototype/runtime-feasibility`, baseado no featherbar `90ab504b025db15665ce5d97b8ae4d4cdeb47dc3`, confirmou a viabilidade no Apple M4. Ele também mostrou que “sem workers permanentes” descreve threads criadas pelo Statlet, não as threads internas que AppKit e libdispatch adicionam ao processo.
