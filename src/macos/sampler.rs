@@ -67,11 +67,11 @@ fn read_memory(total_bytes: u64) -> Option<MemoryReading> {
             purgeable: u64::from(stats.purgeable_count),
             external: u64::from(stats.external_page_count),
         },
-        read_memory_pressure(),
+        read_memory_pressure()?,
     ))
 }
 
-fn read_memory_pressure() -> MemoryPressure {
+fn read_memory_pressure() -> Option<MemoryPressure> {
     let name = CString::new("kern.memorystatus_vm_pressure_level").expect("static sysctl name");
     let mut level: libc::c_int = 0;
     let mut size = mem::size_of_val(&level);
@@ -85,12 +85,8 @@ fn read_memory_pressure() -> MemoryPressure {
         )
     };
     if result != 0 {
-        return MemoryPressure::Normal;
+        return None;
     }
 
-    match level {
-        2 => MemoryPressure::Warning,
-        4 => MemoryPressure::Critical,
-        _ => MemoryPressure::Normal,
-    }
+    MemoryPressure::try_from(level).ok()
 }

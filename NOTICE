@@ -1,0 +1,11 @@
+Statlet
+Copyright 2026 Rafael Hayashi
+
+Portions of the macOS event-loop and status-item renderer are derived from
+featherbar by the featherbar contributors:
+https://github.com/nim444/featherbar
+
+The upstream Git history used by Statlet is preserved at:
+https://github.com/hayashirafael/statlet/tree/upstream/featherbar
+
+Statlet and featherbar are licensed under the Apache License, Version 2.0.

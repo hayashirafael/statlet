@@ -5,6 +5,22 @@ pub enum MemoryPressure {
     Critical,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnknownMemoryPressure(pub i32);
+
+impl TryFrom<i32> for MemoryPressure {
+    type Error = UnknownMemoryPressure;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Normal),
+            2 => Ok(Self::Warning),
+            4 => Ok(Self::Critical),
+            other => Err(UnknownMemoryPressure(other)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SystemSnapshot {
     pub cpu_percent: f64,

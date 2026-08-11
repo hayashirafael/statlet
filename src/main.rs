@@ -33,12 +33,12 @@ fn main() {
     let mut sampler = MacSampler::new();
     sampler.prime_cpu();
     let renderer = Renderer::new();
-    let mut tray: Option<TrayIcon> = None;
+    let mut _tray: Option<TrayIcon> = None;
     let mut button = None;
 
     event_loop.run(move |event, _target, control_flow| match event {
         Event::NewEvents(StartCause::Init) => {
-            tray = Some(
+            _tray = Some(
                 TrayIconBuilder::new()
                     .with_menu(Box::new(menu.clone()))
                     .build()
@@ -46,13 +46,7 @@ fn main() {
             );
             let marker = MainThreadMarker::new().expect("main-thread event loop");
             button = macos::renderer::status_button(marker);
-            redraw(
-                &mut core,
-                &mut sampler,
-                &renderer,
-                button.as_deref(),
-                tray.as_ref(),
-            );
+            redraw(&mut core, &mut sampler, &renderer, button.as_deref());
             *control_flow = ControlFlow::WaitUntil(Instant::now() + METRICS_REFRESH);
         }
         Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
@@ -62,13 +56,11 @@ fn main() {
                     return;
                 }
             }
-            redraw(
-                &mut core,
-                &mut sampler,
-                &renderer,
-                button.as_deref(),
-                tray.as_ref(),
-            );
+            if button.is_none() {
+                let marker = MainThreadMarker::new().expect("main-thread event loop");
+                button = macos::renderer::status_button(marker);
+            }
+            redraw(&mut core, &mut sampler, &renderer, button.as_deref());
             *control_flow = ControlFlow::WaitUntil(Instant::now() + METRICS_REFRESH);
         }
         _ => {}
@@ -80,7 +72,6 @@ fn redraw(
     sampler: &mut MacSampler,
     renderer: &Renderer,
     button: Option<&objc2_app_kit::NSStatusBarButton>,
-    tray: Option<&TrayIcon>,
 ) {
     let Some(snapshot) = sampler.sample() else {
         return;
@@ -90,14 +81,6 @@ fn redraw(
         let state = core.handle(AppEvent::MetricsSample(snapshot));
         if let Some(button) = button {
             renderer.set_status(button, &state.status);
-        } else if let Some(tray) = tray {
-            tray.set_title(Some(format!(
-                "{}{} · {}{}",
-                state.status.top.label,
-                state.status.top.value,
-                state.status.bottom.label,
-                state.status.bottom.value
-            )));
         }
     });
 }
