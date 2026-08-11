@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use statlet::core::{AppEffect, AppEvent, DiskBadge, Preferences, StatletCore, WindowKind};
 use statlet::disk::DiskObservation;
+use statlet::history::HistoryEventKind;
 use statlet::mole::{MoleStatus, MoleVersion};
 
 fn observation(occupied: u64, minute: u64) -> DiskObservation {
@@ -148,7 +149,10 @@ fn threshold_crossing_and_opening_the_window_never_launch_mole() {
     let alert = observation(90, 5);
     assert_eq!(
         app.handle(AppEvent::DiskObserved(alert)),
-        vec![AppEffect::DiskPressureAlert(alert)]
+        vec![
+            AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
+            AppEffect::DiskPressureAlert(alert),
+        ]
     );
     assert_eq!(
         app.handle(AppEvent::ReviewSpace),

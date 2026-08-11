@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use statlet::core::{AppEffect, AppEvent, DiskBadge, Preferences, StatletCore};
 use statlet::disk::DiskObservation;
+use statlet::history::HistoryEventKind;
 
 fn observation(occupied_percent: u64, minute: u64) -> DiskObservation {
     DiskObservation::new(
@@ -46,7 +47,10 @@ fn exact_threshold_requires_five_continuous_minutes_before_one_alert() {
     let active_observation = observation(90, 5);
     assert_eq!(
         app.handle(AppEvent::DiskObserved(active_observation)),
-        vec![AppEffect::DiskPressureAlert(active_observation)]
+        vec![
+            AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
+            AppEffect::DiskPressureAlert(active_observation),
+        ]
     );
     assert_eq!(app.state().status.disk_badge, Some(DiskBadge::Warning));
     assert!(app
@@ -87,7 +91,10 @@ fn below_threshold_during_debounce_restarts_the_five_minute_window() {
     let restarted_episode = observation(91, 9);
     assert_eq!(
         app.handle(AppEvent::DiskObserved(restarted_episode)),
-        vec![AppEffect::DiskPressureAlert(restarted_episode)]
+        vec![
+            AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
+            AppEffect::DiskPressureAlert(restarted_episode),
+        ]
     );
 }
 
@@ -98,9 +105,12 @@ fn below_threshold_after_alert_clears_the_badge_and_rearms() {
         app.handle(AppEvent::DiskObserved(observation(90, minute)));
     }
 
-    assert!(app
-        .handle(AppEvent::DiskObserved(observation(89, 6)))
-        .is_empty());
+    assert_eq!(
+        app.handle(AppEvent::DiskObserved(observation(89, 6))),
+        vec![AppEffect::RecordHistory(
+            HistoryEventKind::DiskPressureRecovered
+        )]
+    );
     assert_eq!(app.state().status.disk_badge, None);
 
     for minute in 7..12 {
@@ -111,7 +121,10 @@ fn below_threshold_after_alert_clears_the_badge_and_rearms() {
     let second_episode = observation(90, 12);
     assert_eq!(
         app.handle(AppEvent::DiskObserved(second_episode)),
-        vec![AppEffect::DiskPressureAlert(second_episode)]
+        vec![
+            AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
+            AppEffect::DiskPressureAlert(second_episode),
+        ]
     );
 }
 
@@ -150,6 +163,9 @@ fn an_unobserved_sleep_gap_restarts_debounce_instead_of_counting_as_pressure() {
     let after_five_observed_minutes = observation(90, 10);
     assert_eq!(
         app.handle(AppEvent::DiskObserved(after_five_observed_minutes)),
-        vec![AppEffect::DiskPressureAlert(after_five_observed_minutes)]
+        vec![
+            AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
+            AppEffect::DiskPressureAlert(after_five_observed_minutes),
+        ]
     );
 }
