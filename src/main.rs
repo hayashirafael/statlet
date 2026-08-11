@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use objc2::MainThreadMarker;
 use statlet::core::{AppEffect, AppEvent, StatletCore};
+use statlet::disk::macos::{ContinuousClock, StartupVolumeSampler};
+use statlet::disk::DiskSamplingSchedule;
 use statlet::preferences::PreferencesStore;
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -58,14 +60,12 @@ fn main() {
         .expect("resolve the current user's preferences directory");
     let initial_preferences = preferences_store.load();
     let (mut core, startup_effects) = StatletCore::with_preferences(initial_preferences);
-    let mut sampler = MacSampler::new();
-    sampler.prime_cpu();
+    let mut samplers = RuntimeSamplers::new();
     let renderer = Renderer::new();
     // tray-icon removes the status item when its owner is dropped.
     let mut _retained_tray: Option<TrayIcon> = None;
     let mut button = None;
     let mut windows = None;
-    let mut disk_sampling_enabled = false;
 
     event_loop.run(move |event, _target, control_flow| match event {
         Event::NewEvents(StartCause::Init) => {
@@ -83,9 +83,16 @@ fn main() {
                 &core,
                 &preferences_store,
                 windows.as_mut(),
-                &mut disk_sampling_enabled,
+                &mut samplers,
             );
-            redraw(&mut core, &mut sampler, &renderer, button.as_deref());
+            let disk_effects = samplers.refresh(&mut core, &renderer, button.as_deref());
+            let _ = apply_effects(
+                &disk_effects,
+                &core,
+                &preferences_store,
+                windows.as_mut(),
+                &mut samplers,
+            );
             *control_flow = ControlFlow::WaitUntil(Instant::now() + METRICS_REFRESH);
         }
         Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
@@ -93,7 +100,14 @@ fn main() {
                 let marker = MainThreadMarker::new().expect("main-thread event loop");
                 button = macos::renderer::status_button(marker);
             }
-            redraw(&mut core, &mut sampler, &renderer, button.as_deref());
+            let disk_effects = samplers.refresh(&mut core, &renderer, button.as_deref());
+            let _ = apply_effects(
+                &disk_effects,
+                &core,
+                &preferences_store,
+                windows.as_mut(),
+                &mut samplers,
+            );
             *control_flow = ControlFlow::WaitUntil(Instant::now() + METRICS_REFRESH);
         }
         Event::UserEvent(RuntimeEvent(app_event)) => {
@@ -103,7 +117,7 @@ fn main() {
                 &core,
                 &preferences_store,
                 windows.as_mut(),
-                &mut disk_sampling_enabled,
+                &mut samplers,
             ) {
                 *control_flow = ControlFlow::Exit;
             }
@@ -117,7 +131,7 @@ fn apply_effects(
     core: &StatletCore,
     preferences_store: &PreferencesStore,
     mut windows: Option<&mut WindowManager>,
-    disk_sampling_enabled: &mut bool,
+    samplers: &mut RuntimeSamplers,
 ) -> bool {
     let mut should_quit = false;
     for effect in effects {
@@ -136,29 +150,65 @@ fn apply_effects(
                 }
             }
             AppEffect::SetDiskSamplingEnabled(enabled) => {
-                *disk_sampling_enabled = *enabled;
+                samplers.set_disk_sampling_enabled(*enabled);
             }
+            AppEffect::DiskPressureAlert(_) => {}
             AppEffect::Quit => should_quit = true,
         }
     }
     should_quit
 }
 
-fn redraw(
-    core: &mut StatletCore,
-    sampler: &mut MacSampler,
-    renderer: &Renderer,
-    button: Option<&objc2_app_kit::NSStatusBarButton>,
-) {
-    let Some(snapshot) = sampler.sample() else {
-        return;
-    };
+struct RuntimeSamplers {
+    metrics: MacSampler,
+    disk: StartupVolumeSampler,
+    disk_schedule: DiskSamplingSchedule,
+    clock: ContinuousClock,
+}
 
-    objc2::rc::autoreleasepool(|_| {
-        core.handle(AppEvent::MetricsSample(snapshot));
-        let state = core.state();
-        if let Some(button) = button {
-            renderer.set_status(button, &state.status);
+impl RuntimeSamplers {
+    fn new() -> Self {
+        let mut metrics = MacSampler::new();
+        metrics.prime_cpu();
+        Self {
+            metrics,
+            disk: StartupVolumeSampler::new(),
+            disk_schedule: DiskSamplingSchedule::new(),
+            clock: ContinuousClock::new().expect("initialize the macOS continuous clock"),
         }
-    });
+    }
+
+    fn set_disk_sampling_enabled(&mut self, enabled: bool) {
+        self.disk_schedule.set_enabled(enabled, self.clock.now());
+    }
+
+    fn refresh(
+        &mut self,
+        core: &mut StatletCore,
+        renderer: &Renderer,
+        button: Option<&objc2_app_kit::NSStatusBarButton>,
+    ) -> Vec<AppEffect> {
+        objc2::rc::autoreleasepool(|_| {
+            if let Some(snapshot) = self.metrics.sample() {
+                core.handle(AppEvent::MetricsSample(snapshot));
+            }
+            let now = self.clock.now();
+            let effects = if self.disk_schedule.take_due(now) {
+                match self.disk.sample(now) {
+                    Ok(observation) => core.handle(AppEvent::DiskObserved(observation)),
+                    Err(error) => {
+                        eprintln!("Statlet could not sample the startup volume: {error:?}");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let state = core.state();
+            if let Some(button) = button {
+                renderer.set_status(button, &state.status);
+            }
+            effects
+        })
+    }
 }

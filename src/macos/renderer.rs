@@ -12,18 +12,19 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSDictionary, NSMutableAttributedString, NSPoint, NSSize, NSString};
 
-use statlet::core::{MetricPresentation, MetricSeverity, StatusPresentation};
+use statlet::core::{DiskBadge, MetricPresentation, MetricSeverity, StatusPresentation};
 
 const FONT_SIZE: f64 = 12.0;
 const LINE_GAP: f64 = 2.0;
 const HEIGHT: f64 = 22.0;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Level {
     Neutral,
     Good,
     Warning,
     Critical,
+    DiskWarning,
 }
 
 struct Segment {
@@ -32,7 +33,7 @@ struct Segment {
 }
 
 pub struct Renderer {
-    attributes: [Retained<NSDictionary<NSString, AnyObject>>; 4],
+    attributes: [Retained<NSDictionary<NSString, AnyObject>>; 5],
     top_y: f64,
     bottom_y: f64,
 }
@@ -42,18 +43,24 @@ impl Renderer {
         let font = NSFont::monospacedSystemFontOfSize_weight(FONT_SIZE, unsafe {
             objc2_app_kit::NSFontWeightMedium
         });
-        let attributes =
-            [Level::Neutral, Level::Good, Level::Warning, Level::Critical].map(|level| {
-                NSDictionary::from_retained_objects(
-                    &[unsafe { NSFontAttributeName }, unsafe {
-                        NSForegroundColorAttributeName
-                    }],
-                    &[
-                        Retained::into_super(Retained::into_super(font.retain())),
-                        Retained::into_super(Retained::into_super(color(level))),
-                    ],
-                )
-            });
+        let attributes = [
+            Level::Neutral,
+            Level::Good,
+            Level::Warning,
+            Level::Critical,
+            Level::DiskWarning,
+        ]
+        .map(|level| {
+            NSDictionary::from_retained_objects(
+                &[unsafe { NSFontAttributeName }, unsafe {
+                    NSForegroundColorAttributeName
+                }],
+                &[
+                    Retained::into_super(Retained::into_super(font.retain())),
+                    Retained::into_super(Retained::into_super(color(level))),
+                ],
+            )
+        });
 
         let cap_height = font.capHeight();
         let descent = -font.descender();
@@ -66,7 +73,13 @@ impl Renderer {
     }
 
     pub fn set_status(&self, button: &NSStatusBarButton, status: &StatusPresentation) {
-        let top = self.attributed_line(&segments(&status.top));
+        let top_segments = segments(&status.top);
+        let top = if let Some(badge) = disk_badge_segment(status.disk_badge) {
+            let [label, value] = top_segments;
+            self.attributed_line(&[label, value, badge])
+        } else {
+            self.attributed_line(&top_segments)
+        };
         let bottom = self.attributed_line(&segments(&status.bottom));
         let width = top.size().width.max(bottom.size().width).ceil();
         let image = NSImage::initWithSize(
@@ -154,11 +167,50 @@ fn segments(metric: &MetricPresentation) -> [Segment; 2] {
     ]
 }
 
+fn disk_badge_segment(badge: Option<DiskBadge>) -> Option<Segment> {
+    badge.map(|badge| match badge {
+        DiskBadge::Warning => Segment {
+            text: " !".to_owned(),
+            level: Level::DiskWarning,
+        },
+    })
+}
+
 fn color(level: Level) -> Retained<NSColor> {
     match level {
         Level::Neutral => NSColor::labelColor(),
         Level::Good => NSColor::systemGreenColor(),
         Level::Warning => NSColor::systemOrangeColor(),
         Level::Critical => NSColor::systemRedColor(),
+        Level::DiskWarning => NSColor::systemYellowColor(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cpu_metric() -> MetricPresentation {
+        MetricPresentation {
+            label: "C",
+            value: " 42%".to_owned(),
+            severity: MetricSeverity::Warning,
+        }
+    }
+
+    #[test]
+    fn disk_warning_appends_a_symbolic_yellow_segment() {
+        let segment = disk_badge_segment(Some(DiskBadge::Warning)).unwrap();
+
+        assert_eq!(segment.text, " !");
+        assert_eq!(segment.level, Level::DiskWarning);
+    }
+
+    #[test]
+    fn no_disk_badge_preserves_the_compact_cpu_line() {
+        let segments = segments(&cpu_metric());
+
+        assert_eq!(segments.len(), 2);
+        assert!(disk_badge_segment(None).is_none());
     }
 }

@@ -11,7 +11,7 @@ repository = "https://github.com/hayashirafael/statlet"
 libc = "0.2"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSAccessibility", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSControl", "NSStatusBarButton", "NSFont", "NSAttributedString", "NSText", "NSTextField", "NSButton", "NSPopUpButton", "NSMenu", "NSResponder", "NSColor", "NSImage", "NSStringDrawing", "NSGraphics", "NSGraphicsContext", "NSCell"] }
-objc2-foundation = { version = "0.3.2", features = ["NSString", "NSDictionary", "NSAttributedString"] }
+objc2-foundation = { version = "0.3.2", features = ["NSString", "NSDictionary", "NSAttributedString", "NSURL", "NSError", "NSValue"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
