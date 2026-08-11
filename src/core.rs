@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::disk::DiskObservation;
+use crate::mole::MoleStatus;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryPressure {
@@ -57,12 +58,15 @@ pub struct StatusPresentation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiskBadge {
     Warning,
+    Error,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppState {
     pub status: StatusPresentation,
     pub preferences: Preferences,
+    pub latest_disk_observation: Option<DiskObservation>,
+    pub mole_status: MoleStatus,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -74,12 +78,17 @@ pub enum AppEvent {
     SetMoleIntegrationEnabled(bool),
     SetWarningThreshold(WarningThreshold),
     DiskObserved(DiskObservation),
+    ReviewSpace,
+    NotificationActivated,
+    MoleStatusObserved(MoleStatus),
+    OpenMoleInTerminal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowKind {
     Preferences,
     History,
+    FreeSpace,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +97,9 @@ pub enum AppEffect {
     SavePreferences(Preferences),
     SetDiskSamplingEnabled(bool),
     DiskPressureAlert(DiskObservation),
+    RequestNotificationAuthorization,
+    CheckMoleCompatibility,
+    LaunchMoleInTerminal,
     Quit,
 }
 
@@ -149,14 +161,17 @@ impl StatletCore {
             state: AppState {
                 status: present(system_snapshot, None),
                 preferences,
+                latest_disk_observation: None,
+                mole_status: MoleStatus::Unknown,
             },
             system_snapshot,
             disk_episode: DiskEpisode::default(),
         };
-        (
-            core,
-            vec![AppEffect::SetDiskSamplingEnabled(disk_sampling_enabled)],
-        )
+        let mut effects = vec![AppEffect::SetDiskSamplingEnabled(disk_sampling_enabled)];
+        if disk_sampling_enabled {
+            effects.push(AppEffect::CheckMoleCompatibility);
+        }
+        (core, effects)
     }
 
     pub fn state(&self) -> &AppState {
@@ -174,6 +189,16 @@ impl StatletCore {
                 vec![AppEffect::ShowWindow(WindowKind::Preferences)]
             }
             AppEvent::OpenHistory => vec![AppEffect::ShowWindow(WindowKind::History)],
+            AppEvent::ReviewSpace | AppEvent::NotificationActivated => {
+                let mut effects = Vec::with_capacity(2);
+                if self.state.preferences.mole_integration_enabled {
+                    self.state.mole_status = MoleStatus::Unknown;
+                    self.refresh_status();
+                    effects.push(AppEffect::CheckMoleCompatibility);
+                }
+                effects.push(AppEffect::ShowWindow(WindowKind::FreeSpace));
+                effects
+            }
             AppEvent::Quit => vec![AppEffect::Quit],
             AppEvent::SetMoleIntegrationEnabled(enabled) => {
                 if self.state.preferences.mole_integration_enabled == enabled {
@@ -182,12 +207,19 @@ impl StatletCore {
                 self.state.preferences.mole_integration_enabled = enabled;
                 if !enabled {
                     self.disk_episode = DiskEpisode::default();
+                    self.state.latest_disk_observation = None;
+                    self.state.mole_status = MoleStatus::Unknown;
                     self.refresh_status();
                 }
-                vec![
+                let mut effects = vec![
                     AppEffect::SavePreferences(self.state.preferences),
                     AppEffect::SetDiskSamplingEnabled(enabled),
-                ]
+                ];
+                if enabled {
+                    effects.push(AppEffect::RequestNotificationAuthorization);
+                    effects.push(AppEffect::CheckMoleCompatibility);
+                }
+                effects
             }
             AppEvent::SetWarningThreshold(threshold) => {
                 if self.state.preferences.warning_threshold == threshold {
@@ -200,6 +232,7 @@ impl StatletCore {
                 if !self.state.preferences.mole_integration_enabled {
                     return Vec::new();
                 }
+                self.state.latest_disk_observation = Some(observation);
                 let alert_started = self
                     .disk_episode
                     .observe(observation, self.state.preferences.warning_threshold);
@@ -210,11 +243,34 @@ impl StatletCore {
                     Vec::new()
                 }
             }
+            AppEvent::MoleStatusObserved(status) => {
+                if !self.state.preferences.mole_integration_enabled {
+                    return Vec::new();
+                }
+                self.state.mole_status = status;
+                self.refresh_status();
+                Vec::new()
+            }
+            AppEvent::OpenMoleInTerminal => {
+                if self.state.preferences.mole_integration_enabled
+                    && self.state.mole_status.is_compatible()
+                {
+                    vec![AppEffect::LaunchMoleInTerminal]
+                } else {
+                    Vec::new()
+                }
+            }
         }
     }
 
     fn refresh_status(&mut self) {
-        let disk_badge = self.disk_episode.is_active().then_some(DiskBadge::Warning);
+        let disk_badge = if self.state.preferences.mole_integration_enabled
+            && self.state.mole_status.is_error()
+        {
+            Some(DiskBadge::Error)
+        } else {
+            self.disk_episode.is_active().then_some(DiskBadge::Warning)
+        };
         self.state.status = present(self.system_snapshot, disk_badge);
     }
 }
@@ -295,10 +351,10 @@ fn present(snapshot: SystemSnapshot, disk_badge: Option<DiskBadge>) -> StatusPre
     let ram = rounded_percent(snapshot.ram_percent);
     let (memory_severity, pressure_description) =
         memory_pressure_presentation(snapshot.memory_pressure);
-    let disk_description = if disk_badge.is_some() {
-        ", disco acima do limite"
-    } else {
-        ""
+    let disk_description = match disk_badge {
+        Some(DiskBadge::Warning) => ", disco acima do limite",
+        Some(DiskBadge::Error) => ", Mole indisponível",
+        None => "",
     };
     StatusPresentation {
         top: MetricPresentation {

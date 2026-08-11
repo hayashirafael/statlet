@@ -45,6 +45,8 @@ fn enabling_the_integration_saves_preferences_and_starts_sampling() {
         vec![
             AppEffect::SavePreferences(expected),
             AppEffect::SetDiskSamplingEnabled(true),
+            AppEffect::RequestNotificationAuthorization,
+            AppEffect::CheckMoleCompatibility,
         ]
     );
 }
@@ -74,7 +76,13 @@ fn startup_preferences_control_disk_sampling_without_rewriting_the_file() {
     let (app, effects) = StatletCore::with_preferences(preferences);
 
     assert_eq!(app.state().preferences, preferences);
-    assert_eq!(effects, vec![AppEffect::SetDiskSamplingEnabled(true)]);
+    assert_eq!(
+        effects,
+        vec![
+            AppEffect::SetDiskSamplingEnabled(true),
+            AppEffect::CheckMoleCompatibility,
+        ]
+    );
 }
 
 #[test]
