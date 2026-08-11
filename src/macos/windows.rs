@@ -2,9 +2,9 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSBackingStoreType, NSButton,
-    NSControlStateValueOn, NSLineBreakMode, NSPopUpButton, NSScrollView, NSTextField, NSView,
-    NSWindow, NSWindowStyleMask,
+    NSAccessibility, NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication,
+    NSBackingStoreType, NSButton, NSControlStateValueOn, NSLineBreakMode, NSPopUpButton,
+    NSScrollView, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSDate, NSDateFormatter, NSDateFormatterStyle, NSFileManager,
@@ -175,8 +175,12 @@ impl WindowManager {
             }
         };
 
+        let app = NSApplication::sharedApplication(mtm);
+        // A window is shown only after an explicit launch, menu choice, or
+        // notification click, so request cooperative activation before
+        // promoting the retained window.
+        app.activate();
         window.makeKeyAndOrderFront(None);
-        NSApplication::sharedApplication(mtm).activate();
     }
 
     pub fn update_state(&self, state: &AppState) {
@@ -208,13 +212,23 @@ impl FreeSpaceWindow {
             .unwrap_or_else(|| ("Aguardando leitura".to_owned(), "—".to_owned()));
         self.occupied_value
             .setStringValue(&objc2_foundation::NSString::from_str(&occupied));
+        self.occupied_value
+            .setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+                "Ocupado: {occupied}"
+            ))));
         self.available_value
             .setStringValue(&objc2_foundation::NSString::from_str(&available));
+        self.available_value
+            .setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+                "Disponível para uso importante: {available}"
+            ))));
+        let threshold = format!("{}%", state.preferences.warning_threshold.get());
         self.threshold_value
-            .setStringValue(&objc2_foundation::NSString::from_str(&format!(
-                "{}%",
-                state.preferences.warning_threshold.get()
-            )));
+            .setStringValue(&objc2_foundation::NSString::from_str(&threshold));
+        self.threshold_value
+            .setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+                "Limite configurado: {threshold}"
+            ))));
 
         let (status, enabled) = match state.mole_status {
             MoleStatus::Unknown => ("Verificando a instalação do Mole…".to_owned(), false),
@@ -244,6 +258,10 @@ impl FreeSpaceWindow {
         };
         self.mole_status
             .setStringValue(&objc2_foundation::NSString::from_str(&status));
+        self.mole_status
+            .setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+                "Estado da integração do Mole: {status}"
+            ))));
         self.open_mole_button.setEnabled(enabled);
     }
 }
@@ -288,6 +306,12 @@ fn create_preferences_window(mtm: MainThreadMarker, target: &ControlTarget) -> P
         NSPoint::new(24.0, 144.0),
         NSSize::new(410.0, 24.0),
     ));
+    checkbox.setAccessibilityLabel(Some(ns_string!(
+        "Monitorar o disco com a integração do Mole"
+    )));
+    checkbox.setAccessibilityHelp(Some(ns_string!(
+        "Ativa os avisos de pouco espaço e mostra o badge de disco no indicador."
+    )));
 
     let explanation = NSTextField::labelWithString(
         ns_string!(
@@ -323,12 +347,17 @@ fn create_preferences_window(mtm: MainThreadMarker, target: &ControlTarget) -> P
             WarningThreshold::try_from(value).expect("known threshold"),
         ));
     }
+    threshold.setAccessibilityLabel(Some(ns_string!("Limite de aviso do disco")));
+    threshold.setAccessibilityHelp(Some(ns_string!(
+        "Escolha o percentual de ocupação que inicia a observação de pouco espaço."
+    )));
 
     content.addSubview(&heading);
     content.addSubview(&checkbox);
     content.addSubview(&explanation);
     content.addSubview(&threshold_label);
     content.addSubview(&threshold);
+    window.setInitialFirstResponder(Some(&checkbox));
 
     PreferencesWindow {
         window,
@@ -408,6 +437,10 @@ fn create_free_space_window(mtm: MainThreadMarker, target: &ControlTarget) -> Fr
         NSSize::new(190.0, 34.0),
     ));
     open_mole_button.setEnabled(false);
+    open_mole_button.setAccessibilityLabel(Some(ns_string!("Abrir Mole no Terminal")));
+    open_mole_button.setAccessibilityHelp(Some(ns_string!(
+        "Abre o comando interativo oficial do Mole fora do Statlet."
+    )));
 
     content.addSubview(&heading);
     content.addSubview(&subtitle);
@@ -420,6 +453,7 @@ fn create_free_space_window(mtm: MainThreadMarker, target: &ControlTarget) -> Fr
     content.addSubview(&guarantee);
     content.addSubview(&mole_status);
     content.addSubview(&open_mole_button);
+    window.setInitialFirstResponder(Some(&open_mole_button));
 
     FreeSpaceWindow {
         window,
@@ -467,6 +501,9 @@ impl HistoryWindow {
             row.setStringValue(&objc2_foundation::NSString::from_str(
                 &format_history_record(*record),
             ));
+            row.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(
+                &format_history_record(*record),
+            )));
             row.setFrame(NSRect::new(
                 NSPoint::new(8.0, document_height - ((index + 1) as f64 * 36.0)),
                 NSSize::new(508.0, 28.0),
@@ -520,6 +557,9 @@ fn create_history_window(mtm: MainThreadMarker, target: &ControlTarget) -> Histo
     );
     scroll_view.setHasVerticalScroller(true);
     scroll_view.setDrawsBackground(false);
+    scroll_view.setAccessibilityLabel(Some(ns_string!(
+        "Eventos do histórico local, do mais recente para o mais antigo"
+    )));
     let document = NSView::initWithFrame(
         NSView::alloc(mtm),
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(532.0, 320.0)),
@@ -551,12 +591,17 @@ fn create_history_window(mtm: MainThreadMarker, target: &ControlTarget) -> Histo
         NSSize::new(160.0, 34.0),
     ));
     clear_button.setEnabled(false);
+    clear_button.setAccessibilityLabel(Some(ns_string!("Apagar histórico local")));
+    clear_button.setAccessibilityHelp(Some(ns_string!(
+        "Pede confirmação antes de remover todos os eventos locais do Statlet."
+    )));
 
     content.addSubview(&heading);
     content.addSubview(&explanation);
     content.addSubview(&empty_label);
     content.addSubview(&scroll_view);
     content.addSubview(&clear_button);
+    window.setInitialFirstResponder(Some(&clear_button));
 
     HistoryWindow {
         window,
@@ -597,6 +642,7 @@ fn create_window(mtm: MainThreadMarker, title: &str, size: NSSize) -> Retained<N
         )
     };
     unsafe { window.setReleasedWhenClosed(false) };
+    window.setCollectionBehavior(NSWindowCollectionBehavior::MoveToActiveSpace);
     window.setTitle(&objc2_foundation::NSString::from_str(title));
     window.center();
     window

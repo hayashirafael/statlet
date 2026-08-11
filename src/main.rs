@@ -88,15 +88,20 @@ fn main() {
 
     event_loop.run(move |event, _target, control_flow| match event {
         Event::NewEvents(StartCause::Init) => {
-            _retained_tray = Some(
-                TrayIconBuilder::new()
-                    .with_menu(Box::new(menu.clone()))
-                    .build()
-                    .expect("create status item"),
-            );
+            _retained_tray = match TrayIconBuilder::new()
+                .with_menu(Box::new(menu.clone()))
+                .build()
+            {
+                Ok(tray) => Some(tray),
+                Err(error) => {
+                    eprintln!("Statlet could not create its status item: {error}");
+                    None
+                }
+            };
             let marker = MainThreadMarker::new().expect("main-thread event loop");
             button = macos::renderer::status_button(marker);
             runtime.initialize_native(marker, proxy.clone());
+            let _ = proxy.send_event(RuntimeEvent::App(AppEvent::ApplicationLaunched));
             let _ = runtime.apply_effects(&startup_effects, &mut core);
             let disk_effects = runtime
                 .samplers
@@ -130,6 +135,15 @@ fn main() {
             if runtime.apply_effects(&effects, &mut core) {
                 *control_flow = ControlFlow::Exit;
             }
+        }
+        Event::Reopen {
+            has_visible_windows,
+            ..
+        } => {
+            let effects = core.handle(AppEvent::ApplicationReopened {
+                has_visible_windows,
+            });
+            let _ = runtime.apply_effects(&effects, &mut core);
         }
         _ => {}
     });
