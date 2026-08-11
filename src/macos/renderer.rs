@@ -25,6 +25,7 @@ enum Level {
     Warning,
     Critical,
     DiskWarning,
+    DiskError,
 }
 
 struct Segment {
@@ -33,7 +34,7 @@ struct Segment {
 }
 
 pub struct Renderer {
-    attributes: [Retained<NSDictionary<NSString, AnyObject>>; 5],
+    attributes: [Retained<NSDictionary<NSString, AnyObject>>; 6],
     top_y: f64,
     bottom_y: f64,
 }
@@ -49,6 +50,7 @@ impl Renderer {
             Level::Warning,
             Level::Critical,
             Level::DiskWarning,
+            Level::DiskError,
         ]
         .map(|level| {
             NSDictionary::from_retained_objects(
@@ -173,6 +175,10 @@ fn disk_badge_segment(badge: Option<DiskBadge>) -> Option<Segment> {
             text: " !".to_owned(),
             level: Level::DiskWarning,
         },
+        DiskBadge::Error => Segment {
+            text: " ×".to_owned(),
+            level: Level::DiskError,
+        },
     })
 }
 
@@ -183,6 +189,7 @@ fn color(level: Level) -> Retained<NSColor> {
         Level::Warning => NSColor::systemOrangeColor(),
         Level::Critical => NSColor::systemRedColor(),
         Level::DiskWarning => NSColor::systemYellowColor(),
+        Level::DiskError => NSColor::systemRedColor(),
     }
 }
 
@@ -212,5 +219,13 @@ mod tests {
 
         assert_eq!(segments.len(), 2);
         assert!(disk_badge_segment(None).is_none());
+    }
+
+    #[test]
+    fn mole_error_appends_a_symbolic_red_segment() {
+        let segment = disk_badge_segment(Some(DiskBadge::Error)).unwrap();
+
+        assert_eq!(segment.text, " ×");
+        assert_eq!(segment.level, Level::DiskError);
     }
 }

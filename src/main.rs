@@ -5,12 +5,14 @@
 
 mod macos;
 
+use std::thread;
 use std::time::{Duration, Instant};
 
 use objc2::MainThreadMarker;
 use statlet::core::{AppEffect, AppEvent, StatletCore};
 use statlet::disk::macos::{ContinuousClock, StartupVolumeSampler};
 use statlet::disk::DiskSamplingSchedule;
+use statlet::mole::{MoleDetection, MoleDetector, MoleInstallation, MoleStatus};
 use statlet::preferences::PreferencesStore;
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -18,9 +20,11 @@ use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
+use macos::notifications::NotificationManager;
 use macos::renderer::Renderer;
 use macos::sampler::MacSampler;
-use macos::windows::{RuntimeEvent, WindowManager};
+use macos::windows::WindowManager;
+use macos::RuntimeEvent;
 
 const METRICS_REFRESH: Duration = Duration::from_secs(2);
 
@@ -29,6 +33,8 @@ fn main() {
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
     let proxy = event_loop.create_proxy();
 
+    let review_space_item = MenuItem::new("Revisar espaço…", false, None);
+    let review_space_id: MenuId = review_space_item.id().clone();
     let preferences_item = MenuItem::new("Preferências…", true, None);
     let preferences_id: MenuId = preferences_item.id().clone();
     let history_item = MenuItem::new("Histórico…", true, None);
@@ -36,18 +42,21 @@ fn main() {
     let quit = MenuItem::new("Sair", true, None);
     let quit_id: MenuId = quit.id().clone();
     let menu = Menu::new();
+    menu.append(&review_space_item).expect("build menu");
     menu.append(&preferences_item).expect("build menu");
     menu.append(&history_item).expect("build menu");
     menu.append(&quit).expect("build menu");
 
     let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-        let runtime_event = if event.id == preferences_id {
-            Some(RuntimeEvent(AppEvent::OpenPreferences))
+        let runtime_event = if event.id == review_space_id {
+            Some(RuntimeEvent::App(AppEvent::ReviewSpace))
+        } else if event.id == preferences_id {
+            Some(RuntimeEvent::App(AppEvent::OpenPreferences))
         } else if event.id == history_id {
-            Some(RuntimeEvent(AppEvent::OpenHistory))
+            Some(RuntimeEvent::App(AppEvent::OpenHistory))
         } else if event.id == quit_id {
-            Some(RuntimeEvent(AppEvent::Quit))
+            Some(RuntimeEvent::App(AppEvent::Quit))
         } else {
             None
         };
@@ -60,12 +69,11 @@ fn main() {
         .expect("resolve the current user's preferences directory");
     let initial_preferences = preferences_store.load();
     let (mut core, startup_effects) = StatletCore::with_preferences(initial_preferences);
-    let mut samplers = RuntimeSamplers::new();
+    let mut runtime = RuntimeAdapters::new(preferences_store, review_space_item, proxy.clone());
     let renderer = Renderer::new();
     // tray-icon removes the status item when its owner is dropped.
     let mut _retained_tray: Option<TrayIcon> = None;
     let mut button = None;
-    let mut windows = None;
 
     event_loop.run(move |event, _target, control_flow| match event {
         Event::NewEvents(StartCause::Init) => {
@@ -77,22 +85,12 @@ fn main() {
             );
             let marker = MainThreadMarker::new().expect("main-thread event loop");
             button = macos::renderer::status_button(marker);
-            windows = Some(WindowManager::new(marker, proxy.clone()));
-            let _ = apply_effects(
-                &startup_effects,
-                &core,
-                &preferences_store,
-                windows.as_mut(),
-                &mut samplers,
-            );
-            let disk_effects = samplers.refresh(&mut core, &renderer, button.as_deref());
-            let _ = apply_effects(
-                &disk_effects,
-                &core,
-                &preferences_store,
-                windows.as_mut(),
-                &mut samplers,
-            );
+            runtime.initialize_native(marker, proxy.clone());
+            let _ = runtime.apply_effects(&startup_effects, &mut core);
+            let disk_effects = runtime
+                .samplers
+                .refresh(&mut core, &renderer, button.as_deref());
+            let _ = runtime.apply_effects(&disk_effects, &mut core);
             *control_flow = ControlFlow::WaitUntil(Instant::now() + METRICS_REFRESH);
         }
         Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
@@ -100,25 +98,25 @@ fn main() {
                 let marker = MainThreadMarker::new().expect("main-thread event loop");
                 button = macos::renderer::status_button(marker);
             }
-            let disk_effects = samplers.refresh(&mut core, &renderer, button.as_deref());
-            let _ = apply_effects(
-                &disk_effects,
-                &core,
-                &preferences_store,
-                windows.as_mut(),
-                &mut samplers,
-            );
+            let disk_effects = runtime
+                .samplers
+                .refresh(&mut core, &renderer, button.as_deref());
+            let _ = runtime.apply_effects(&disk_effects, &mut core);
             *control_flow = ControlFlow::WaitUntil(Instant::now() + METRICS_REFRESH);
         }
-        Event::UserEvent(RuntimeEvent(app_event)) => {
-            let effects = core.handle(app_event);
-            if apply_effects(
-                &effects,
-                &core,
-                &preferences_store,
-                windows.as_mut(),
-                &mut samplers,
-            ) {
+        Event::UserEvent(runtime_event) => {
+            let effects = match runtime_event {
+                RuntimeEvent::App(app_event) => core.handle(app_event),
+                RuntimeEvent::MoleDetected {
+                    generation,
+                    detection,
+                } => runtime
+                    .mole
+                    .apply_detection(generation, detection)
+                    .map(|status| core.handle(AppEvent::MoleStatusObserved(status)))
+                    .unwrap_or_default(),
+            };
+            if runtime.apply_effects(&effects, &mut core) {
                 *control_flow = ControlFlow::Exit;
             }
         }
@@ -126,37 +124,175 @@ fn main() {
     });
 }
 
-fn apply_effects(
-    effects: &[AppEffect],
-    core: &StatletCore,
-    preferences_store: &PreferencesStore,
-    mut windows: Option<&mut WindowManager>,
-    samplers: &mut RuntimeSamplers,
-) -> bool {
-    let mut should_quit = false;
-    for effect in effects {
-        match effect {
-            AppEffect::ShowWindow(kind) => {
-                if let Some(windows) = windows.as_deref_mut() {
-                    windows.show(*kind, core.state().preferences);
-                }
-            }
-            AppEffect::SavePreferences(preferences) => {
-                if let Err(error) = preferences_store.save(*preferences) {
-                    eprintln!("Statlet could not save preferences: {error}");
-                }
-                if let Some(windows) = windows.as_deref_mut() {
-                    windows.update_preferences(*preferences);
-                }
-            }
-            AppEffect::SetDiskSamplingEnabled(enabled) => {
-                samplers.set_disk_sampling_enabled(*enabled);
-            }
-            AppEffect::DiskPressureAlert(_) => {}
-            AppEffect::Quit => should_quit = true,
+struct RuntimeAdapters {
+    preferences_store: PreferencesStore,
+    windows: Option<WindowManager>,
+    samplers: RuntimeSamplers,
+    mole: RuntimeMole,
+    notifications: Option<NotificationManager>,
+    review_space_item: MenuItem,
+}
+
+impl RuntimeAdapters {
+    fn new(
+        preferences_store: PreferencesStore,
+        review_space_item: MenuItem,
+        proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
+    ) -> Self {
+        Self {
+            preferences_store,
+            windows: None,
+            samplers: RuntimeSamplers::new(),
+            mole: RuntimeMole::new(proxy),
+            notifications: None,
+            review_space_item,
         }
     }
-    should_quit
+
+    fn initialize_native(
+        &mut self,
+        marker: MainThreadMarker,
+        proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
+    ) {
+        self.windows = Some(WindowManager::new(marker, proxy.clone()));
+        self.notifications = NotificationManager::new(marker, proxy);
+    }
+
+    fn apply_effects(&mut self, effects: &[AppEffect], core: &mut StatletCore) -> bool {
+        let mut should_quit = false;
+        for effect in effects {
+            match effect {
+                AppEffect::ShowWindow(kind) => {
+                    if let Some(windows) = &mut self.windows {
+                        windows.show(*kind, core.state());
+                    }
+                }
+                AppEffect::SavePreferences(preferences) => {
+                    if let Err(error) = self.preferences_store.save(*preferences) {
+                        eprintln!("Statlet could not save preferences: {error}");
+                    }
+                    if let Some(windows) = &self.windows {
+                        windows.update_state(core.state());
+                    }
+                }
+                AppEffect::SetDiskSamplingEnabled(enabled) => {
+                    self.samplers.set_disk_sampling_enabled(*enabled);
+                    if !enabled {
+                        self.mole.cancel();
+                    }
+                }
+                AppEffect::DiskPressureAlert(observation) => {
+                    if let Some(notifications) = &self.notifications {
+                        notifications.deliver_disk_pressure(*observation);
+                    }
+                }
+                AppEffect::RequestNotificationAuthorization => {
+                    if let Some(notifications) = &self.notifications {
+                        notifications.request_authorization();
+                    }
+                }
+                AppEffect::CheckMoleCompatibility => {
+                    if let Err(error) = self.mole.check() {
+                        eprintln!("Statlet could not start Mole compatibility check: {error}");
+                        core.handle(AppEvent::MoleStatusObserved(MoleStatus::Unavailable));
+                    }
+                }
+                AppEffect::LaunchMoleInTerminal => {
+                    if let Err(error) = self.mole.launch_in_terminal() {
+                        eprintln!("Statlet could not open Mole in Terminal: {error}");
+                    }
+                }
+                AppEffect::Quit => should_quit = true,
+            }
+        }
+        self.review_space_item
+            .set_enabled(core.state().preferences.mole_integration_enabled);
+        if let Some(windows) = &self.windows {
+            windows.update_state(core.state());
+        }
+        should_quit
+    }
+}
+
+struct RuntimeMole {
+    detector: MoleDetector,
+    installation: Option<MoleInstallation>,
+    generation: u64,
+    check_in_flight: bool,
+    proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
+}
+
+impl RuntimeMole {
+    fn new(proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>) -> Self {
+        Self {
+            detector: MoleDetector::system(),
+            installation: None,
+            generation: 0,
+            check_in_flight: false,
+            proxy,
+        }
+    }
+
+    fn check(&mut self) -> std::io::Result<()> {
+        if self.check_in_flight {
+            return Ok(());
+        }
+        let detector = self.detector.clone();
+        self.installation = None;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let proxy = self.proxy.clone();
+        self.check_in_flight = true;
+        match thread::Builder::new()
+            .name("statlet-mole-check".to_owned())
+            .spawn(move || {
+                let detection = detector.detect();
+                let _ = proxy.send_event(RuntimeEvent::MoleDetected {
+                    generation,
+                    detection,
+                });
+            }) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.check_in_flight = false;
+                Err(error)
+            }
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.check_in_flight = false;
+        self.installation = None;
+    }
+
+    fn apply_detection(&mut self, generation: u64, detection: MoleDetection) -> Option<MoleStatus> {
+        if generation != self.generation {
+            return None;
+        }
+        self.check_in_flight = false;
+        self.installation = detection.installation;
+        Some(detection.status)
+    }
+
+    fn launch_in_terminal(&self) -> std::io::Result<()> {
+        let installation = self.installation.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "compatible Mole is unavailable",
+            )
+        })?;
+        thread::Builder::new()
+            .name("statlet-mole-launch".to_owned())
+            .spawn(move || match installation.terminal_launch_plan().launch() {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    eprintln!("Statlet could not open Mole: osascript exited with {status}")
+                }
+                Err(error) => eprintln!("Statlet could not open Mole in Terminal: {error}"),
+            })?;
+        Ok(())
+    }
 }
 
 struct RuntimeSamplers {

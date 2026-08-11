@@ -5,6 +5,11 @@ pub mod macos;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 
+pub fn format_decimal_gigabytes(bytes: u64) -> String {
+    const BYTES_PER_GIGABYTE: f64 = 1_000_000_000.0;
+    format!("{:.1} GB", bytes as f64 / BYTES_PER_GIGABYTE)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DiskObservation {
     total_bytes: u64,

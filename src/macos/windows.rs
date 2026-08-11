@@ -2,17 +2,18 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSControlStateValueOn, NSPopUpButton, NSTextField,
-    NSWindow, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSButton, NSControlStateValueOn, NSLineBreakMode,
+    NSPopUpButton, NSTextField, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    ns_string, MainThreadMarker, NSFileManager, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
 };
-use statlet::core::{AppEvent, Preferences, WarningThreshold, WindowKind};
+use statlet::core::{AppEvent, AppState, Preferences, WarningThreshold, WindowKind};
+use statlet::disk::format_decimal_gigabytes;
+use statlet::mole::MoleStatus;
 use tao::event_loop::EventLoopProxy;
 
-#[derive(Clone, Copy, Debug)]
-pub struct RuntimeEvent(pub AppEvent);
+use super::RuntimeEvent;
 
 struct ControlTargetIvars {
     proxy: EventLoopProxy<RuntimeEvent>,
@@ -33,7 +34,9 @@ define_class!(
             let _ = self
                 .ivars()
                 .proxy
-                .send_event(RuntimeEvent(AppEvent::SetMoleIntegrationEnabled(enabled)));
+                .send_event(RuntimeEvent::App(AppEvent::SetMoleIntegrationEnabled(
+                    enabled,
+                )));
         }
 
         #[unsafe(method(changeWarningThreshold:))]
@@ -50,7 +53,15 @@ define_class!(
             let _ = self
                 .ivars()
                 .proxy
-                .send_event(RuntimeEvent(AppEvent::SetWarningThreshold(threshold)));
+                .send_event(RuntimeEvent::App(AppEvent::SetWarningThreshold(threshold)));
+        }
+
+        #[unsafe(method(openMoleInTerminal:))]
+        fn open_mole_in_terminal(&self, _sender: &NSButton) {
+            let _ = self
+                .ivars()
+                .proxy
+                .send_event(RuntimeEvent::App(AppEvent::OpenMoleInTerminal));
         }
     }
 );
@@ -66,12 +77,22 @@ pub struct WindowManager {
     control_target: Retained<ControlTarget>,
     preferences: Option<PreferencesWindow>,
     history: Option<Retained<NSWindow>>,
+    free_space: Option<FreeSpaceWindow>,
 }
 
 struct PreferencesWindow {
     window: Retained<NSWindow>,
     mole_checkbox: Retained<NSButton>,
     warning_threshold: Retained<NSPopUpButton>,
+}
+
+struct FreeSpaceWindow {
+    window: Retained<NSWindow>,
+    occupied_value: Retained<NSTextField>,
+    available_value: Retained<NSTextField>,
+    threshold_value: Retained<NSTextField>,
+    mole_status: Retained<NSTextField>,
+    open_mole_button: Retained<NSButton>,
 }
 
 impl WindowManager {
@@ -81,17 +102,18 @@ impl WindowManager {
             control_target,
             preferences: None,
             history: None,
+            free_space: None,
         }
     }
 
-    pub fn show(&mut self, kind: WindowKind, preferences: Preferences) {
+    pub fn show(&mut self, kind: WindowKind, state: &AppState) {
         let mtm = MainThreadMarker::new().expect("native window actions run on the main thread");
         let window = match kind {
             WindowKind::Preferences => {
                 if self.preferences.is_none() {
                     self.preferences = Some(create_preferences_window(mtm, &self.control_target));
                 }
-                self.update_preferences(preferences);
+                self.update_state(state);
                 &self
                     .preferences
                     .as_ref()
@@ -101,17 +123,83 @@ impl WindowManager {
             WindowKind::History => self
                 .history
                 .get_or_insert_with(|| create_history_window(mtm)),
+            WindowKind::FreeSpace => {
+                if self.free_space.is_none() {
+                    self.free_space = Some(create_free_space_window(mtm, &self.control_target));
+                }
+                self.update_state(state);
+                &self
+                    .free_space
+                    .as_ref()
+                    .expect("free-space window was created")
+                    .window
+            }
         };
 
         window.makeKeyAndOrderFront(None);
         NSApplication::sharedApplication(mtm).activate();
     }
 
-    pub fn update_preferences(&self, preferences: Preferences) {
-        let Some(window) = &self.preferences else {
-            return;
+    pub fn update_state(&self, state: &AppState) {
+        if let Some(window) = &self.preferences {
+            window.apply(state.preferences);
+        }
+        if let Some(window) = &self.free_space {
+            window.apply(state);
+        }
+    }
+}
+
+impl FreeSpaceWindow {
+    fn apply(&self, state: &AppState) {
+        let (occupied, available) = state
+            .latest_disk_observation
+            .map(|observation| {
+                (
+                    format!("{:.1}%", observation.occupied_percent()),
+                    format_decimal_gigabytes(observation.available_bytes()),
+                )
+            })
+            .unwrap_or_else(|| ("Aguardando leitura".to_owned(), "—".to_owned()));
+        self.occupied_value
+            .setStringValue(&objc2_foundation::NSString::from_str(&occupied));
+        self.available_value
+            .setStringValue(&objc2_foundation::NSString::from_str(&available));
+        self.threshold_value
+            .setStringValue(&objc2_foundation::NSString::from_str(&format!(
+                "{}%",
+                state.preferences.warning_threshold.get()
+            )));
+
+        let (status, enabled) = match state.mole_status {
+            MoleStatus::Unknown => ("Verificando a instalação do Mole…".to_owned(), false),
+            MoleStatus::Compatible(version) => (
+                format!(
+                    "Mole {}.{}.{} pronto para abrir no Terminal.",
+                    version.major, version.minor, version.patch
+                ),
+                true,
+            ),
+            MoleStatus::Missing => (
+                "Mole não encontrado. Instale-o pelo site oficial e tente novamente.".to_owned(),
+                false,
+            ),
+            MoleStatus::Unavailable => (
+                "Não foi possível validar o Mole. Atualize ou reinstale e tente novamente."
+                    .to_owned(),
+                false,
+            ),
+            MoleStatus::Incompatible(version) => (
+                format!(
+                    "Mole {}.{}.{} não é compatível. Atualize para uma versão 1.x recente.",
+                    version.major, version.minor, version.patch
+                ),
+                false,
+            ),
         };
-        window.apply(preferences);
+        self.mole_status
+            .setStringValue(&objc2_foundation::NSString::from_str(&status));
+        self.open_mole_button.setEnabled(enabled);
     }
 }
 
@@ -202,6 +290,117 @@ fn create_preferences_window(mtm: MainThreadMarker, target: &ControlTarget) -> P
         mole_checkbox: checkbox,
         warning_threshold: threshold,
     }
+}
+
+fn create_free_space_window(mtm: MainThreadMarker, target: &ControlTarget) -> FreeSpaceWindow {
+    let window = create_window(mtm, "Liberar espaço", NSSize::new(540.0, 420.0));
+    let content = window
+        .contentView()
+        .expect("free-space window content view");
+
+    let heading = text_label(
+        mtm,
+        "Liberar espaço",
+        NSRect::new(NSPoint::new(24.0, 360.0), NSSize::new(490.0, 28.0)),
+    );
+    heading.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(18.0)));
+    let volume_name = NSFileManager::defaultManager()
+        .displayNameAtPath(ns_string!("/"))
+        .to_string();
+    let subtitle = text_label(
+        mtm,
+        &format!("Volume de inicialização: {volume_name}"),
+        NSRect::new(NSPoint::new(24.0, 330.0), NSSize::new(490.0, 24.0)),
+    );
+    subtitle.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
+
+    let occupied_label = text_label(
+        mtm,
+        "Ocupado",
+        NSRect::new(NSPoint::new(24.0, 278.0), NSSize::new(240.0, 24.0)),
+    );
+    let occupied_value = value_label(mtm, 278.0);
+    let available_label = text_label(
+        mtm,
+        "Disponível para uso importante",
+        NSRect::new(NSPoint::new(24.0, 242.0), NSSize::new(270.0, 24.0)),
+    );
+    let available_value = value_label(mtm, 242.0);
+    let threshold_label = text_label(
+        mtm,
+        "Limite configurado",
+        NSRect::new(NSPoint::new(24.0, 206.0), NSSize::new(240.0, 24.0)),
+    );
+    let threshold_value = value_label(mtm, 206.0);
+
+    let guarantee = text_label(
+        mtm,
+        "O Statlet apenas monitora e avisa. Abrir esta janela não analisa nem remove arquivos; o macOS pode recuperar parte do espaço disponível.",
+        NSRect::new(NSPoint::new(24.0, 142.0), NSSize::new(490.0, 48.0)),
+    );
+    guarantee.setMaximumNumberOfLines(3);
+    guarantee.setUsesSingleLineMode(false);
+    guarantee.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+    guarantee.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
+
+    let mole_status = text_label(
+        mtm,
+        "Verificando a instalação do Mole…",
+        NSRect::new(NSPoint::new(24.0, 88.0), NSSize::new(490.0, 42.0)),
+    );
+    mole_status.setMaximumNumberOfLines(2);
+
+    let open_mole_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("Abrir Mole no Terminal"),
+            Some(target as &AnyObject),
+            Some(sel!(openMoleInTerminal:)),
+            mtm,
+        )
+    };
+    open_mole_button.setFrame(NSRect::new(
+        NSPoint::new(24.0, 28.0),
+        NSSize::new(190.0, 34.0),
+    ));
+    open_mole_button.setEnabled(false);
+
+    content.addSubview(&heading);
+    content.addSubview(&subtitle);
+    content.addSubview(&occupied_label);
+    content.addSubview(&occupied_value);
+    content.addSubview(&available_label);
+    content.addSubview(&available_value);
+    content.addSubview(&threshold_label);
+    content.addSubview(&threshold_value);
+    content.addSubview(&guarantee);
+    content.addSubview(&mole_status);
+    content.addSubview(&open_mole_button);
+
+    FreeSpaceWindow {
+        window,
+        occupied_value,
+        available_value,
+        threshold_value,
+        mole_status,
+        open_mole_button,
+    }
+}
+
+fn text_label(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<NSTextField> {
+    let label = NSTextField::labelWithString(&objc2_foundation::NSString::from_str(text), mtm);
+    label.setFrame(frame);
+    label
+}
+
+fn value_label(mtm: MainThreadMarker, y: f64) -> Retained<NSTextField> {
+    let label = text_label(
+        mtm,
+        "—",
+        NSRect::new(NSPoint::new(320.0, y), NSSize::new(194.0, 24.0)),
+    );
+    label.setAlignment(objc2_app_kit::NSTextAlignment::Right);
+    label.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(13.0)));
+    label
 }
 
 fn create_history_window(mtm: MainThreadMarker) -> Retained<NSWindow> {
