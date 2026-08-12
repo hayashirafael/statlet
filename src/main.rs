@@ -239,6 +239,7 @@ struct RuntimeDecision {
     save: bool,
     redraw: bool,
     refresh_fonts: bool,
+    invalidate_render_cache: bool,
 }
 
 fn decision_for(reason: RedrawReason) -> RuntimeDecision {
@@ -247,6 +248,7 @@ fn decision_for(reason: RedrawReason) -> RuntimeDecision {
         save: false,
         redraw: true,
         refresh_fonts: reason == RedrawReason::Fonts,
+        invalidate_render_cache: reason == RedrawReason::Appearance,
     }
 }
 
@@ -254,6 +256,7 @@ trait RuntimeRedrawTarget {
     fn poll_due(&mut self);
     fn coalesce_redraw_effects_owned_by_cycle(&mut self);
     fn refresh_fonts_and_invalidate(&mut self);
+    fn invalidate_render_cache(&mut self);
     fn preferences_surface_exists(&self) -> bool;
     fn redraw_indicator_surfaces(&mut self, include_previews: bool);
 }
@@ -269,6 +272,9 @@ fn execute_redraw_reason(reason: RedrawReason, target: &mut impl RuntimeRedrawTa
     }
     if decision.refresh_fonts {
         target.refresh_fonts_and_invalidate();
+    }
+    if decision.invalidate_render_cache {
+        target.invalidate_render_cache();
     }
     if decision.redraw {
         let include_previews = target.preferences_surface_exists();
@@ -299,6 +305,10 @@ impl RuntimeRedrawTarget for LiveRedrawTarget<'_> {
 
     fn refresh_fonts_and_invalidate(&mut self) {
         self.renderer.refresh_fonts();
+    }
+
+    fn invalidate_render_cache(&mut self) {
+        self.renderer.invalidate();
     }
 
     fn preferences_surface_exists(&self) -> bool {
@@ -772,6 +782,7 @@ mod tests {
         Sample,
         Save,
         RefreshFontsAndInvalidate,
+        InvalidateRenderCache,
         RedrawStatus,
         RedrawPreviewLight,
         RedrawPreviewDark,
@@ -833,6 +844,10 @@ mod tests {
             self.actions.push(RecordedAction::RefreshFontsAndInvalidate);
         }
 
+        fn invalidate_render_cache(&mut self) {
+            self.actions.push(RecordedAction::InvalidateRenderCache);
+        }
+
         fn preferences_surface_exists(&self) -> bool {
             self.preferences_surface_exists
         }
@@ -860,9 +875,30 @@ mod tests {
                     save: false,
                     redraw: true,
                     refresh_fonts: reason == RedrawReason::Fonts,
+                    invalidate_render_cache: reason == RedrawReason::Appearance,
                 }
             );
         }
+    }
+
+    #[test]
+    fn visual_environment_changes_invalidate_semantic_color_paint_without_side_effects() {
+        let decision = decision_for(RedrawReason::Appearance);
+
+        assert!(decision.invalidate_render_cache);
+        assert!(!decision.sample);
+        assert!(!decision.save);
+        assert!(decision.redraw);
+
+        let mut target = FakeRedrawTarget::new(false);
+        execute_redraw_reason(RedrawReason::Appearance, &mut target);
+        assert_eq!(
+            target.actions,
+            vec![
+                RecordedAction::InvalidateRenderCache,
+                RecordedAction::RedrawStatus,
+            ]
+        );
     }
 
     #[test]
@@ -951,13 +987,20 @@ mod tests {
     fn previews_are_skipped_until_the_preferences_surface_exists() {
         let mut absent = FakeRedrawTarget::new(false);
         execute_redraw_reason(RedrawReason::Appearance, &mut absent);
-        assert_eq!(absent.actions, vec![RecordedAction::RedrawStatus]);
+        assert_eq!(
+            absent.actions,
+            vec![
+                RecordedAction::InvalidateRenderCache,
+                RecordedAction::RedrawStatus,
+            ]
+        );
 
         let mut created = FakeRedrawTarget::new(true);
         execute_redraw_reason(RedrawReason::Appearance, &mut created);
         assert_eq!(
             created.actions,
             vec![
+                RecordedAction::InvalidateRenderCache,
                 RecordedAction::RedrawStatus,
                 RecordedAction::RedrawPreviewLight,
                 RecordedAction::RedrawPreviewDark,
@@ -1030,6 +1073,8 @@ mod tests {
         fn coalesce_redraw_effects_owned_by_cycle(&mut self) {}
 
         fn refresh_fonts_and_invalidate(&mut self) {}
+
+        fn invalidate_render_cache(&mut self) {}
 
         fn preferences_surface_exists(&self) -> bool {
             false

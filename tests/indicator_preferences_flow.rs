@@ -143,13 +143,12 @@ fn closing_preferences_discards_only_the_transient_undo_snapshot() {
     let mut app = customized_app(false);
 
     app.handle(AppEvent::ResetIndicatorConfirmed);
+    let after_reset = app.state().preferences.clone();
     app.handle(AppEvent::PreferencesWindowClosed);
 
     assert!(app.handle(AppEvent::UndoIndicatorReset).is_empty());
-    assert_eq!(
-        app.state().preferences.indicator,
-        IndicatorPreferences::default()
-    );
+    assert_eq!(app.state().preferences, after_reset);
+    assert!(!app.state().can_undo_indicator_reset);
 }
 
 #[test]

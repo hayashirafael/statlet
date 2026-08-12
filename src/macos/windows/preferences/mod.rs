@@ -4,7 +4,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAccessibility, NSButton, NSColorWell, NSControlStateValueOn, NSImageView, NSLayoutConstraint,
+    NSAccessibility, NSButton, NSColorWell, NSControlStateValueOn, NSLayoutConstraint,
     NSPopUpButton, NSScrollView, NSSegmentSwitchTracking, NSSegmentedControl, NSStackView,
     NSTextField, NSView, NSWindow, NSWindowDelegate,
 };
@@ -12,21 +12,19 @@ use objc2_foundation::{
     ns_string, MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint,
     NSRect, NSSize,
 };
-use statlet::core::{AppState, WarningThreshold};
+use statlet::core::{AppEvent, AppState, PreferencesSaveStatus, WarningThreshold};
 
-use super::common::{create_window, threshold_title, ControlTarget};
-use super::{
-    IndicatorFontFallback, IndicatorLayoutDiagnostics, IndicatorSurfaceUpdate,
-    PreviewContrastWarnings,
-};
-use crate::macos::environment::VisualEnvironment;
+use super::common::{threshold_title, ControlTarget, PreferencesWindowHost};
+use super::{IndicatorFontFallback, IndicatorLayoutDiagnostics, IndicatorSurfaceUpdate};
 use crate::macos::renderer::PreviewImages;
 
 mod color_editor;
 mod font_picker;
 mod indicator;
+pub(super) mod preview;
 
 use indicator::IndicatorControls;
+use preview::PreviewPane;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum PreferencesArea {
@@ -104,13 +102,26 @@ impl PreferencesShellContract {
             "indicator.save.retry",
         ]
     }
+}
 
-    pub(super) const fn preview_images_are_accessibility_elements(self) -> bool {
-        false
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreferencesFooterPresentation {
+    undo_visible: bool,
+    retry_visible: bool,
+    save_error: Option<&'static str>,
+}
 
-    pub(super) const fn footer_placeholders_are_hidden_and_disabled(self) -> bool {
-        true
+impl PreferencesFooterPresentation {
+    const fn new(can_undo_indicator_reset: bool, save_failed: bool) -> Self {
+        Self {
+            undo_visible: can_undo_indicator_reset,
+            retry_visible: save_failed,
+            save_error: if save_failed {
+                Some("Não foi possível salvar as preferências.")
+            } else {
+                None
+            },
+        }
     }
 }
 
@@ -189,31 +200,39 @@ define_class!(
             for well in &self.ivars().color_wells {
                 well.deactivate();
             }
+            let _ = self
+                .ivars()
+                .proxy
+                .send_event(crate::macos::RuntimeEvent::App(
+                    AppEvent::PreferencesWindowClosed,
+                ));
         }
     }
 );
 
 struct PreferencesWindowDelegateIvars {
     color_wells: Vec<Retained<NSColorWell>>,
+    proxy: tao::event_loop::EventLoopProxy<crate::macos::RuntimeEvent>,
 }
 
 impl PreferencesWindowDelegate {
-    fn new(mtm: MainThreadMarker, color_wells: Vec<Retained<NSColorWell>>) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(PreferencesWindowDelegateIvars { color_wells });
+    fn new(
+        mtm: MainThreadMarker,
+        color_wells: Vec<Retained<NSColorWell>>,
+        proxy: tao::event_loop::EventLoopProxy<crate::macos::RuntimeEvent>,
+    ) -> Retained<Self> {
+        let this =
+            Self::alloc(mtm).set_ivars(PreferencesWindowDelegateIvars { color_wells, proxy });
         unsafe { msg_send![super(this), init] }
     }
 }
 
 struct IndicatorPage {
     root: Retained<NSView>,
-    light_image: Retained<NSImageView>,
-    dark_image: Retained<NSImageView>,
-    light_description: Retained<NSTextField>,
-    dark_description: Retained<NSTextField>,
+    preview: PreviewPane,
     controls: IndicatorControls,
     _groups_scroll: Retained<NSScrollView>,
     _groups_stack: Retained<NSStackView>,
-    _preview_stack: Retained<NSStackView>,
 }
 
 struct DiskAndMolePage {
@@ -224,31 +243,56 @@ struct DiskAndMolePage {
 
 struct PreferencesFooter {
     _view: Retained<NSView>,
-    _reset_all: Retained<NSButton>,
-    _undo: Retained<NSButton>,
-    _retry_save: Retained<NSButton>,
+    reset_all: Retained<NSButton>,
+    undo: Retained<NSButton>,
+    save_error: Retained<NSTextField>,
+    retry_save: Retained<NSButton>,
+}
+
+impl PreferencesFooter {
+    fn apply(&self, presentation: PreferencesFooterPresentation) {
+        self.reset_all.setHidden(false);
+        self.reset_all.setEnabled(true);
+        self.undo.setHidden(!presentation.undo_visible);
+        self.undo.setEnabled(presentation.undo_visible);
+        self.retry_save.setHidden(!presentation.retry_visible);
+        self.retry_save.setEnabled(presentation.retry_visible);
+        self.save_error
+            .setStringValue(&objc2_foundation::NSString::from_str(
+                presentation.save_error.unwrap_or(""),
+            ));
+        self.save_error.setAccessibilityLabel(
+            presentation
+                .save_error
+                .map(objc2_foundation::NSString::from_str)
+                .as_deref(),
+        );
+        self.save_error.setHidden(presentation.save_error.is_none());
+    }
 }
 
 pub(super) struct PreferencesWindow {
     pub(super) window: Retained<NSWindow>,
+    _host: Retained<PreferencesWindowHost>,
     _area_selector: Retained<NSSegmentedControl>,
     indicator: IndicatorPage,
     disk_and_mole: DiskAndMolePage,
     _footer: PreferencesFooter,
     _area_target: Retained<PreferencesControlTarget>,
     _delegate: Retained<PreferencesWindowDelegate>,
-    indicator_previews: RefCell<Option<PreviewImages>>,
-    indicator_font_fallback: RefCell<Option<IndicatorFontFallback>>,
-    indicator_contrast_warnings: RefCell<Option<PreviewContrastWarnings>>,
-    indicator_layout: RefCell<Option<IndicatorLayoutDiagnostics>>,
-    visual_environment: RefCell<Option<VisualEnvironment>>,
 }
 
 impl PreferencesWindow {
     pub(super) fn new(mtm: MainThreadMarker, target: &ControlTarget) -> Self {
         let contract = PreferencesShellContract::new();
         let (width, height) = contract.content_size();
-        let window = create_window(mtm, "Preferências do Statlet", NSSize::new(width, height));
+        let host = PreferencesWindowHost::new(
+            mtm,
+            "Preferências do Statlet",
+            NSSize::new(width, height),
+            target.event_proxy(),
+        );
+        let window = Retained::into_super(host.clone());
         let content = window
             .contentView()
             .expect("preferences window content view");
@@ -298,31 +342,28 @@ impl PreferencesWindow {
         ]);
         NSLayoutConstraint::activateConstraints(&constraints);
 
-        let footer = create_footer(mtm, contract, &indicator.root);
+        let footer = create_footer(mtm, contract, &indicator.root, target);
         unsafe {
             area_selector.setNextKeyView(Some(indicator.controls.first_key_view()));
         }
         window.setInitialFirstResponder(Some(&area_selector));
-        let delegate = PreferencesWindowDelegate::new(mtm, indicator.controls.wells());
+        let delegate =
+            PreferencesWindowDelegate::new(mtm, indicator.controls.wells(), target.event_proxy());
         window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
         Self {
             window,
+            _host: host,
             _area_selector: area_selector,
             indicator,
             disk_and_mole,
             _footer: footer,
             _area_target: area_target,
             _delegate: delegate,
-            indicator_previews: RefCell::new(None),
-            indicator_font_fallback: RefCell::new(None),
-            indicator_contrast_warnings: RefCell::new(None),
-            indicator_layout: RefCell::new(None),
-            visual_environment: RefCell::new(None),
         }
     }
 
-    pub(super) fn apply(&self, state: &AppState, previews: Option<&PreviewImages>) {
+    pub(super) fn apply(&self, state: &AppState, _previews: Option<&PreviewImages>) {
         self.disk_and_mole
             .mole_checkbox
             .setState(if state.preferences.mole_integration_enabled {
@@ -337,8 +378,40 @@ impl PreferencesWindow {
             .warning_threshold
             .setEnabled(state.preferences.mole_integration_enabled);
         self.indicator.controls.apply(&state.preferences.indicator);
-        if let Some(previews) = previews {
-            self.set_preview_images(previews);
+        let save_failed = state.preferences_save_status == PreferencesSaveStatus::Failed;
+        let footer =
+            PreferencesFooterPresentation::new(state.can_undo_indicator_reset, save_failed);
+        self._footer.apply(footer);
+        self._host
+            .set_can_undo_indicator_reset(state.can_undo_indicator_reset);
+        unsafe {
+            self.indicator
+                .controls
+                .last_key_view()
+                .setNextKeyView(Some(&self._footer.reset_all));
+            if footer.undo_visible {
+                self._footer
+                    .reset_all
+                    .setNextKeyView(Some(&self._footer.undo));
+            } else if footer.retry_visible {
+                self._footer
+                    .reset_all
+                    .setNextKeyView(Some(&self._footer.retry_save));
+            } else {
+                self._footer
+                    .reset_all
+                    .setNextKeyView(Some(&self._area_selector));
+            }
+            if footer.retry_visible {
+                self._footer
+                    .undo
+                    .setNextKeyView(Some(&self._footer.retry_save));
+            } else {
+                self._footer.undo.setNextKeyView(Some(&self._area_selector));
+            }
+            self._footer
+                .retry_save
+                .setNextKeyView(Some(&self._area_selector));
         }
     }
 
@@ -350,45 +423,20 @@ impl PreferencesWindow {
             layout,
             environment,
         } = surfaces;
-        self.set_preview_images(&previews);
-        self.update_preview_description(true, contrast_warnings.light);
-        self.update_preview_description(false, contrast_warnings.dark);
+        self.indicator.preview.apply_with_contrast(
+            &previews,
+            &layout.light,
+            font_fallback.as_ref(),
+            &environment,
+            contrast_warnings,
+        );
         self.indicator
             .controls
             .apply_diagnostics(font_fallback.as_ref(), &layout);
-        self.indicator_previews.replace(Some(previews));
-        self.indicator_font_fallback.replace(font_fallback);
-        self.indicator_contrast_warnings
-            .replace(Some(contrast_warnings));
-        self.indicator_layout.replace(Some(layout));
-        self.visual_environment.replace(Some(environment));
     }
 
     pub(super) fn is_created_and_visible(&self) -> bool {
         self.window.isVisible()
-    }
-
-    fn set_preview_images(&self, previews: &PreviewImages) {
-        self.indicator.light_image.setImage(Some(&previews.light));
-        self.indicator.dark_image.setImage(Some(&previews.dark));
-    }
-
-    fn update_preview_description(&self, light: bool, contrast_warning: bool) {
-        let appearance = if light { "clara" } else { "escura" };
-        let description = if contrast_warning {
-            format!(
-                "Prévia do indicador em aparência {appearance}. Aviso: o contraste pode ser insuficiente."
-            )
-        } else {
-            format!("Prévia do indicador em aparência {appearance}.")
-        };
-        let field = if light {
-            &self.indicator.light_description
-        } else {
-            &self.indicator.dark_description
-        };
-        field.setStringValue(&objc2_foundation::NSString::from_str(&description));
-        field.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(&description)));
     }
 }
 
@@ -402,47 +450,17 @@ fn create_indicator_page(
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(680.0, 640.0)),
     );
 
-    let preview_stack = NSStackView::initWithFrame(
-        NSStackView::alloc(mtm),
+    let identifiers = contract.accessibility_identifiers();
+    let preview = PreviewPane::new(
+        mtm,
         fixed_region_frame(
             contract,
             PreferencesRegion::Previews,
             NSRect::new(NSPoint::new(24.0, 462.0), NSSize::new(632.0, 150.0)),
         ),
+        [identifiers[1], identifiers[2]],
     );
-    preview_stack.setSpacing(16.0);
-    let light_card = create_preview_card(mtm, "Claro");
-    let dark_card = create_preview_card(mtm, "Escuro");
-    preview_stack.addArrangedSubview(&light_card);
-    preview_stack.addArrangedSubview(&dark_card);
-    root.addSubview(&preview_stack);
-
-    let light_image = NSImageView::initWithFrame(
-        NSImageView::alloc(mtm),
-        NSRect::new(NSPoint::new(20.0, 50.0), NSSize::new(270.0, 44.0)),
-    );
-    let dark_image = NSImageView::initWithFrame(
-        NSImageView::alloc(mtm),
-        NSRect::new(NSPoint::new(20.0, 50.0), NSSize::new(270.0, 44.0)),
-    );
-    light_image.setAccessibilityElement(contract.preview_images_are_accessibility_elements());
-    dark_image.setAccessibilityElement(contract.preview_images_are_accessibility_elements());
-    light_card.addSubview(&light_image);
-    dark_card.addSubview(&dark_image);
-
-    let identifiers = contract.accessibility_identifiers();
-    let light_description = preview_description(
-        mtm,
-        "Prévia do indicador em aparência clara.",
-        identifiers[1],
-    );
-    let dark_description = preview_description(
-        mtm,
-        "Prévia do indicador em aparência escura.",
-        identifiers[2],
-    );
-    light_card.addSubview(&light_description);
-    dark_card.addSubview(&dark_description);
+    root.addSubview(preview.view());
 
     let groups_scroll = NSScrollView::initWithFrame(
         NSScrollView::alloc(mtm),
@@ -472,53 +490,18 @@ fn create_indicator_page(
 
     IndicatorPage {
         root,
-        light_image,
-        dark_image,
-        light_description,
-        dark_description,
+        preview,
         controls,
         _groups_scroll: groups_scroll,
         _groups_stack: groups_stack,
-        _preview_stack: preview_stack,
     }
-}
-
-fn create_preview_card(mtm: MainThreadMarker, title: &str) -> Retained<NSView> {
-    let card = NSView::initWithFrame(
-        NSView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(308.0, 150.0)),
-    );
-    let heading = NSTextField::labelWithString(&objc2_foundation::NSString::from_str(title), mtm);
-    heading.setFrame(NSRect::new(
-        NSPoint::new(16.0, 116.0),
-        NSSize::new(276.0, 22.0),
-    ));
-    heading.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(13.0)));
-    card.addSubview(&heading);
-    card
-}
-
-fn preview_description(
-    mtm: MainThreadMarker,
-    text: &str,
-    identifier: &str,
-) -> Retained<NSTextField> {
-    let description =
-        NSTextField::labelWithString(&objc2_foundation::NSString::from_str(text), mtm);
-    description.setFrame(NSRect::new(
-        NSPoint::new(16.0, 10.0),
-        NSSize::new(276.0, 36.0),
-    ));
-    description.setMaximumNumberOfLines(2);
-    description.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
-    description.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(identifier)));
-    description
 }
 
 fn create_footer(
     mtm: MainThreadMarker,
     contract: PreferencesShellContract,
     indicator_root: &NSView,
+    target: &ControlTarget,
 ) -> PreferencesFooter {
     let view = NSView::initWithFrame(
         NSView::alloc(mtm),
@@ -529,36 +512,51 @@ fn create_footer(
         ),
     );
     let ids = contract.accessibility_identifiers();
-    let reset_all = footer_placeholder(
+    let reset_all = footer_button(
         mtm,
         "Restaurar indicador aos padrões…",
         ids[3],
         NSRect::new(NSPoint::new(0.0, 10.0), NSSize::new(230.0, 34.0)),
+        target,
+        sel!(resetIndicator:),
     );
-    let undo = footer_placeholder(
+    let undo = footer_button(
         mtm,
         "Desfazer restauração",
         ids[4],
         NSRect::new(NSPoint::new(244.0, 10.0), NSSize::new(170.0, 34.0)),
+        target,
+        sel!(undoIndicatorReset:),
     );
-    let retry_save = footer_placeholder(
+    let save_error = NSTextField::labelWithString(ns_string!(""), mtm);
+    save_error.setFrame(NSRect::new(
+        NSPoint::new(420.0, 34.0),
+        NSSize::new(212.0, 20.0),
+    ));
+    save_error.setTextColor(Some(&objc2_app_kit::NSColor::systemRedColor()));
+    save_error.setHidden(true);
+    let retry_save = footer_button(
         mtm,
         "Tentar novamente",
         ids[5],
-        NSRect::new(NSPoint::new(448.0, 10.0), NSSize::new(164.0, 34.0)),
+        NSRect::new(NSPoint::new(448.0, 0.0), NSSize::new(164.0, 30.0)),
+        target,
+        sel!(retrySavePreferences:),
     );
     for button in [&reset_all, &undo, &retry_save] {
-        button.setEnabled(false);
-        button.setHidden(contract.footer_placeholders_are_hidden_and_disabled());
         view.addSubview(button);
     }
+    view.addSubview(&save_error);
     indicator_root.addSubview(&view);
-    PreferencesFooter {
+    let footer = PreferencesFooter {
         _view: view,
-        _reset_all: reset_all,
-        _undo: undo,
-        _retry_save: retry_save,
-    }
+        reset_all,
+        undo,
+        save_error,
+        retry_save,
+    };
+    footer.apply(PreferencesFooterPresentation::new(false, false));
+    footer
 }
 
 fn fixed_region_frame(
@@ -572,17 +570,19 @@ fn fixed_region_frame(
     }
 }
 
-fn footer_placeholder(
+fn footer_button(
     mtm: MainThreadMarker,
     title: &str,
     identifier: &str,
     frame: NSRect,
+    target: &ControlTarget,
+    action: objc2::runtime::Sel,
 ) -> Retained<NSButton> {
     let button = unsafe {
         NSButton::buttonWithTitle_target_action(
             &objc2_foundation::NSString::from_str(title),
-            None,
-            None,
+            Some(target as &AnyObject),
+            Some(action),
             mtm,
         )
     };
@@ -685,9 +685,10 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
+    use super::super::common::should_intercept_indicator_undo;
     use super::{
-        get_or_create_window, PreferencesArea, PreferencesAreaState, PreferencesRegion,
-        PreferencesShellContract, RegionPlacement,
+        get_or_create_window, PreferencesArea, PreferencesAreaState, PreferencesFooterPresentation,
+        PreferencesRegion, PreferencesShellContract, RegionPlacement,
     };
 
     #[test]
@@ -750,8 +751,6 @@ mod tests {
                 "indicator.save.retry",
             ]
         );
-        assert!(!contract.preview_images_are_accessibility_elements());
-        assert!(contract.footer_placeholders_are_hidden_and_disabled());
     }
 
     #[test]
@@ -771,5 +770,29 @@ mod tests {
 
         assert!(Rc::ptr_eq(&first, &second));
         assert_eq!(creations.get(), 1);
+    }
+
+    #[test]
+    fn footer_presentation_exposes_only_available_recovery_actions() {
+        let normal = PreferencesFooterPresentation::new(false, false);
+        assert!(!normal.undo_visible);
+        assert!(!normal.retry_visible);
+        assert_eq!(normal.save_error, None);
+
+        let recovery = PreferencesFooterPresentation::new(true, true);
+        assert!(recovery.undo_visible);
+        assert!(recovery.retry_visible);
+        assert_eq!(
+            recovery.save_error,
+            Some("Não foi possível salvar as preferências.")
+        );
+    }
+
+    #[test]
+    fn command_z_is_reserved_only_for_an_available_indicator_reset_undo() {
+        assert!(should_intercept_indicator_undo("z", true, true));
+        assert!(!should_intercept_indicator_undo("z", true, false));
+        assert!(!should_intercept_indicator_undo("z", false, true));
+        assert!(!should_intercept_indicator_undo("Z", true, true));
     }
 }

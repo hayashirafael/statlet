@@ -54,6 +54,11 @@ define_class!(
             self.send_metric_mode(MetricKind::Cpu, sender);
         }
 
+        #[unsafe(method(resetCpuAndRam:))]
+        fn reset_cpu_and_ram(&self, _sender: &NSButton) {
+            self.reset_group(IndicatorPreferenceGroup::CpuAndRam);
+        }
+
         #[unsafe(method(changeRamColorMode:))]
         fn change_ram_color_mode(&self, sender: &NSSegmentedControl) {
             self.send_metric_mode(MetricKind::Ram, sender);
@@ -80,6 +85,11 @@ define_class!(
                 _ => LabelColorMode::Neutral,
             };
             self.send(IndicatorPreferenceChange::SetLabelColorMode(mode));
+        }
+
+        #[unsafe(method(resetLabels:))]
+        fn reset_labels(&self, _sender: &NSButton) {
+            self.reset_group(IndicatorPreferenceGroup::Labels);
         }
 
         #[unsafe(method(openFontPicker:))]
@@ -115,12 +125,7 @@ define_class!(
 
         #[unsafe(method(resetTypography:))]
         fn reset_typography(&self, _sender: &NSButton) {
-            if self.ivars().applying.get() {
-                return;
-            }
-            self.send_event(AppEvent::ResetIndicatorGroup(
-                IndicatorPreferenceGroup::Typography,
-            ));
+            self.reset_group(IndicatorPreferenceGroup::Typography);
         }
 
         #[unsafe(method(commitRefreshInterval:))]
@@ -135,6 +140,11 @@ define_class!(
             }
             let text = sender.integerValue().to_string();
             self.commit_refresh_interval_text(&text);
+        }
+
+        #[unsafe(method(resetRefreshInterval:))]
+        fn reset_refresh_interval(&self, _sender: &NSButton) {
+            self.reset_group(IndicatorPreferenceGroup::RefreshInterval);
         }
     }
 
@@ -182,6 +192,12 @@ impl IndicatorControlsTarget {
 
     fn send_event(&self, event: AppEvent) {
         let _ = self.ivars().proxy.send_event(RuntimeEvent::App(event));
+    }
+
+    fn reset_group(&self, group: IndicatorPreferenceGroup) {
+        if !self.ivars().applying.get() {
+            self.send_event(AppEvent::ResetIndicatorGroup(group));
+        }
     }
 
     fn commit_font_size(&self, field: &NSTextField) {
@@ -239,9 +255,11 @@ impl IndicatorControlsTarget {
 pub(super) struct IndicatorControls {
     view: Retained<NSStackView>,
     cpu_mode: Retained<NSSegmentedControl>,
+    reset_cpu_and_ram: Retained<NSButton>,
     ram_mode: Retained<NSSegmentedControl>,
     labels_visible: Retained<NSButton>,
     labels_mode: Retained<NSSegmentedControl>,
+    reset_labels: Retained<NSButton>,
     font_family: Retained<NSButton>,
     font_size: Retained<NSTextField>,
     font_weight: Retained<NSSegmentedControl>,
@@ -250,6 +268,7 @@ pub(super) struct IndicatorControls {
     reset_typography: Retained<NSButton>,
     interval_field: Retained<NSTextField>,
     interval_stepper: Retained<NSStepper>,
+    reset_refresh_interval: Retained<NSButton>,
     interval_error: Retained<NSTextField>,
     cpu_editor: ColorEditor,
     ram_editor: ColorEditor,
@@ -273,6 +292,11 @@ impl IndicatorControls {
             NSRect::new(NSPoint::new(100.0, 1096.0), NSSize::new(240.0, 28.0)),
             placeholder_target,
             None,
+        );
+        let reset_cpu_and_ram = reset_button(
+            mtm,
+            "Restaurar CPU e RAM",
+            NSRect::new(NSPoint::new(390.0, 1096.0), NSSize::new(160.0, 28.0)),
         );
         let cpu_editor = ColorEditor::new(
             mtm,
@@ -324,6 +348,11 @@ impl IndicatorControls {
             NSRect::new(NSPoint::new(100.0, 594.0), NSSize::new(390.0, 28.0)),
             placeholder_target,
             None,
+        );
+        let reset_labels = reset_button(
+            mtm,
+            "Restaurar rótulos",
+            NSRect::new(NSPoint::new(390.0, 632.0), NSSize::new(160.0, 28.0)),
         );
         let labels_editor = ColorEditor::new(mtm, ColorBinding::LabelShared, proxy.clone());
         labels_editor.view().setFrame(NSRect::new(
@@ -411,6 +440,11 @@ impl IndicatorControls {
         interval_help.setFrameSize(NSSize::new(500.0, 24.0));
         interval_help.setTextColor(Some(&NSColor::secondaryLabelColor()));
         let interval_error = warning_label(mtm, 60.0);
+        let reset_refresh_interval = reset_button(
+            mtm,
+            "Restaurar atualização",
+            NSRect::new(NSPoint::new(350.0, 124.0), NSSize::new(190.0, 28.0)),
+        );
 
         let defaults = IndicatorPreferences::default();
         let target = IndicatorControlsTarget::new(
@@ -432,20 +466,24 @@ impl IndicatorControls {
         configure_actions(
             &target,
             &cpu_mode,
+            &reset_cpu_and_ram,
             &ram_mode,
             &labels_visible,
             &labels_mode,
+            &reset_labels,
             &font_family,
             &font_size,
             &font_weight,
             &reset_typography,
             &interval_field,
             &interval_stepper,
+            &reset_refresh_interval,
         );
 
         for child in [
             &*cpu_heading as &NSView,
             &*cpu_mode,
+            &*reset_cpu_and_ram,
             cpu_editor.view(),
             &*ram_heading,
             &*ram_mode,
@@ -453,6 +491,7 @@ impl IndicatorControls {
             &*labels_heading,
             &*labels_visible,
             &*labels_mode,
+            &*reset_labels,
             labels_editor.view(),
             &*typography_heading,
             &*family_label,
@@ -469,6 +508,7 @@ impl IndicatorControls {
             &*interval_label,
             &*interval_field,
             &*interval_stepper,
+            &*reset_refresh_interval,
             &*seconds_label,
             &*interval_help,
             &*interval_error,
@@ -479,9 +519,11 @@ impl IndicatorControls {
         let controls = Self {
             view,
             cpu_mode,
+            reset_cpu_and_ram,
             ram_mode,
             labels_visible,
             labels_mode,
+            reset_labels,
             font_family,
             font_size,
             font_weight,
@@ -490,6 +532,7 @@ impl IndicatorControls {
             reset_typography,
             interval_field,
             interval_stepper,
+            reset_refresh_interval,
             interval_error,
             cpu_editor,
             ram_editor,
@@ -581,22 +624,25 @@ impl IndicatorControls {
             if ram_fixed {
                 self.ram_editor.configure_key_order(
                     &self.ram_mode,
-                    &self.labels_visible,
+                    &self.reset_cpu_and_ram,
                     &ram_state,
                 );
             } else {
-                self.ram_mode.setNextKeyView(Some(&self.labels_visible));
+                self.ram_mode.setNextKeyView(Some(&self.reset_cpu_and_ram));
             }
+            self.reset_cpu_and_ram
+                .setNextKeyView(Some(&self.labels_visible));
             self.labels_visible.setNextKeyView(Some(&self.labels_mode));
             if labels_fixed {
                 self.labels_editor.configure_key_order(
                     &self.labels_mode,
-                    &self.font_family,
+                    &self.reset_labels,
                     &labels_state,
                 );
             } else {
-                self.labels_mode.setNextKeyView(Some(&self.font_family));
+                self.labels_mode.setNextKeyView(Some(&self.reset_labels));
             }
+            self.reset_labels.setNextKeyView(Some(&self.font_family));
             self.font_family.setNextKeyView(Some(&self.font_size));
             self.font_size.setNextKeyView(Some(&self.font_weight));
             self.font_weight
@@ -605,7 +651,10 @@ impl IndicatorControls {
                 .setNextKeyView(Some(&self.interval_field));
             self.interval_field
                 .setNextKeyView(Some(&self.interval_stepper));
-            self.interval_stepper.setNextKeyView(Some(&self.cpu_mode));
+            self.interval_stepper
+                .setNextKeyView(Some(&self.reset_refresh_interval));
+            self.reset_refresh_interval
+                .setNextKeyView(Some(&self.cpu_mode));
         }
         self.target.ivars().applying.set(false);
     }
@@ -625,6 +674,10 @@ impl IndicatorControls {
 
     pub(super) fn first_key_view(&self) -> &NSSegmentedControl {
         &self.cpu_mode
+    }
+
+    pub(super) fn last_key_view(&self) -> &NSButton {
+        &self.reset_refresh_interval
     }
 
     pub(super) fn apply_diagnostics(
@@ -734,25 +787,45 @@ fn warning_label(mtm: MainThreadMarker, y: f64) -> Retained<NSTextField> {
     field
 }
 
+fn reset_button(mtm: MainThreadMarker, title: &str, frame: NSRect) -> Retained<NSButton> {
+    let button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &objc2_foundation::NSString::from_str(title),
+            None,
+            None,
+            mtm,
+        )
+    };
+    button.setFrame(frame);
+    button
+}
+
 #[allow(clippy::too_many_arguments)]
 fn configure_actions(
     target: &IndicatorControlsTarget,
     cpu_mode: &NSSegmentedControl,
+    reset_cpu_and_ram: &NSButton,
     ram_mode: &NSSegmentedControl,
     labels_visible: &NSButton,
     labels_mode: &NSSegmentedControl,
+    reset_labels: &NSButton,
     font_family: &NSButton,
     font_size: &NSTextField,
     font_weight: &NSSegmentedControl,
     reset_typography: &NSButton,
     interval_field: &NSTextField,
     interval_stepper: &NSStepper,
+    reset_refresh_interval: &NSButton,
 ) {
     unsafe {
         for (control, action) in [
             (
                 &**cpu_mode as &objc2_app_kit::NSControl,
                 sel!(changeCpuColorMode:),
+            ),
+            (
+                &**reset_cpu_and_ram as &objc2_app_kit::NSControl,
+                sel!(resetCpuAndRam:),
             ),
             (
                 &**ram_mode as &objc2_app_kit::NSControl,
@@ -765,6 +838,10 @@ fn configure_actions(
             (
                 &**labels_mode as &objc2_app_kit::NSControl,
                 sel!(changeLabelColorMode:),
+            ),
+            (
+                &**reset_labels as &objc2_app_kit::NSControl,
+                sel!(resetLabels:),
             ),
             (
                 &**font_family as &objc2_app_kit::NSControl,
@@ -789,6 +866,10 @@ fn configure_actions(
             (
                 &**interval_stepper as &objc2_app_kit::NSControl,
                 sel!(stepRefreshInterval:),
+            ),
+            (
+                &**reset_refresh_interval as &objc2_app_kit::NSControl,
+                sel!(resetRefreshInterval:),
             ),
         ] {
             control.setTarget(Some(target as &AnyObject));
