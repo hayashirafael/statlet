@@ -54,21 +54,28 @@ fn integration_blocks_are_recorded_once_until_mole_recovers() {
 
     assert_eq!(
         app.handle(AppEvent::MoleStatusObserved(MoleStatus::Missing)),
-        vec![AppEffect::RecordHistory(HistoryEventKind::MoleMissing)]
+        vec![
+            AppEffect::RedrawIndicator,
+            AppEffect::RecordHistory(HistoryEventKind::MoleMissing),
+        ]
     );
     assert!(app
         .handle(AppEvent::MoleStatusObserved(MoleStatus::Missing))
         .is_empty());
-    assert!(app
-        .handle(AppEvent::MoleStatusObserved(MoleStatus::Compatible(
+    assert_eq!(
+        app.handle(AppEvent::MoleStatusObserved(MoleStatus::Compatible(
             MoleVersion::new(1, 49, 2)
-        )))
-        .is_empty());
+        ))),
+        vec![AppEffect::RedrawIndicator]
+    );
     assert_eq!(
         app.handle(AppEvent::MoleStatusObserved(MoleStatus::Incompatible(
             MoleVersion::new(2, 0, 0)
         ))),
-        vec![AppEffect::RecordHistory(HistoryEventKind::MoleIncompatible)]
+        vec![
+            AppEffect::RedrawIndicator,
+            AppEffect::RecordHistory(HistoryEventKind::MoleIncompatible),
+        ]
     );
 }
 

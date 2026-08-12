@@ -24,11 +24,31 @@ fn stable_layout_uses_the_widest_value_from_zero_through_one_hundred() {
 }
 
 #[test]
+fn visible_metric_values_share_the_v1_three_digit_right_edge() {
+    let layout = measure_stable_layout(&FakeMeasurer, true, 40.0);
+
+    for value in ["0%", "9%", "10%", "99%", "100%"] {
+        let origin = layout.value_origin(&FakeMeasurer, layout.cpu_width, value);
+        assert_eq!(origin + FakeMeasurer.width(value), layout.cpu_width);
+    }
+}
+
+#[test]
 fn hiding_labels_removes_their_width_from_the_stable_measurement() {
     let layout = measure_stable_layout(&FakeMeasurer, false, 40.0);
 
     assert_eq!(layout.cpu_width, 24.0);
     assert_eq!(layout.ram_width, 24.0);
+}
+
+#[test]
+fn hidden_label_values_keep_the_same_three_digit_right_alignment() {
+    let layout = measure_stable_layout(&FakeMeasurer, false, 40.0);
+
+    for value in ["0%", "9%", "10%", "99%", "100%"] {
+        let origin = layout.value_origin(&FakeMeasurer, layout.base_width(), value);
+        assert_eq!(origin + FakeMeasurer.width(value), layout.base_width());
+    }
 }
 
 #[test]

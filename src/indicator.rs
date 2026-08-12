@@ -97,6 +97,87 @@ pub fn compose_indicator(
     }
 }
 
+pub fn preview_accessibility_summary(
+    scene: &IndicatorScene,
+    resolved_colors: &[[f64; 3]],
+    appearance: IndicatorAppearance,
+) -> String {
+    let mut color_index = 0;
+    let (cpu, cpu_has_label) =
+        preview_metric_summary("CPU", &scene.top, resolved_colors, &mut color_index);
+    let (ram, ram_has_label) =
+        preview_metric_summary("RAM", &scene.bottom, resolved_colors, &mut color_index);
+    let labels = if cpu_has_label && ram_has_label {
+        "rótulos exibidos"
+    } else {
+        "rótulos ocultos"
+    };
+    let badge = match &scene.disk_badge {
+        Some(run) => {
+            let state = match run.text.trim() {
+                "!" => "atenção",
+                "×" => "erro",
+                _ => "estado",
+            };
+            let color = resolved_colors
+                .get(color_index)
+                .map_or_else(|| "cor indisponível".to_owned(), |color| color_hex(*color));
+            format!("badge de {state} presente na cor {color}")
+        }
+        None => "badge ausente".to_owned(),
+    };
+    let appearance = match appearance {
+        IndicatorAppearance::Light => "clara",
+        IndicatorAppearance::Dark => "escura",
+    };
+
+    format!("Prévia {appearance}: {cpu}; {ram}; {labels}; {badge}.")
+}
+
+fn preview_metric_summary(
+    name: &str,
+    runs: &[IndicatorRun],
+    resolved_colors: &[[f64; 3]],
+    color_index: &mut usize,
+) -> (String, bool) {
+    match runs {
+        [_, value] => {
+            let label_color = resolved_colors
+                .get(*color_index)
+                .map_or_else(|| "cor indisponível".to_owned(), |color| color_hex(*color));
+            *color_index += 1;
+            let value_color = resolved_colors
+                .get(*color_index)
+                .map_or_else(|| "cor indisponível".to_owned(), |color| color_hex(*color));
+            *color_index += 1;
+            (
+                format!(
+                    "{name} {}, rótulo {label_color} e valor {value_color}",
+                    value.text.trim()
+                ),
+                true,
+            )
+        }
+        [value] => {
+            let value_color = resolved_colors
+                .get(*color_index)
+                .map_or_else(|| "cor indisponível".to_owned(), |color| color_hex(*color));
+            *color_index += 1;
+            (
+                format!("{name} {}, valor {value_color}", value.text.trim()),
+                false,
+            )
+        }
+        _ => (format!("{name} indisponível"), false),
+    }
+}
+
+fn color_hex(components: [f64; 3]) -> String {
+    let [red, green, blue] =
+        components.map(|component| (component.clamp(0.0, 1.0) * 255.0).round() as u8);
+    format!("#{red:02X}{green:02X}{blue:02X}")
+}
+
 fn metric_runs(
     metric: &MetricContent,
     metric_color: SegmentColor,
@@ -171,6 +252,10 @@ impl StableLayout {
             _ => 0.0,
         };
         self.base_width() + badge_width
+    }
+
+    pub fn value_origin(&self, measurer: &impl TextMeasurer, line_width: f64, value: &str) -> f64 {
+        line_width - measurer.width(value)
     }
 }
 

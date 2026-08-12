@@ -20,7 +20,7 @@ use statlet::disk::macos::{ContinuousClock, StartupVolumeSampler};
 use statlet::disk::DiskSamplingSchedule;
 use statlet::history::{History, HistoryStore};
 use statlet::indicator::{
-    compose_indicator, has_low_text_contrast, IndicatorScene, PreviewBackground,
+    compose_indicator, has_low_text_contrast, preview_accessibility_summary, PreviewBackground,
 };
 use statlet::indicator_preferences::{IndicatorAppearance, MetricsRefreshInterval};
 use statlet::metrics_schedule::MetricsSamplingSchedule;
@@ -38,7 +38,7 @@ use macos::renderer::{resolved_scene_srgb_colors, PreviewImages, RenderSlot, Ren
 use macos::sampler::MacSampler;
 use macos::windows::{
     IndicatorFontFallback, IndicatorLayoutDiagnostics, IndicatorSurfaceUpdate,
-    PreviewContrastWarnings, WindowManager,
+    PreviewContrastWarnings, PreviewSummaries, WindowManager,
 };
 use macos::RuntimeEvent;
 
@@ -571,12 +571,9 @@ impl RuntimeAdapters {
             requested_family: light.font.requested_family.clone(),
             resolved_family: light.font.resolved_family.clone(),
         });
-        let contrast_warnings = preview_contrast_warnings(
-            &light_scene,
-            &light_appearance,
-            &dark_scene,
-            &dark_appearance,
-        );
+        let light_colors = resolved_scene_srgb_colors(&light_scene, &light_appearance);
+        let dark_colors = resolved_scene_srgb_colors(&dark_scene, &dark_appearance);
+        let contrast_warnings = preview_contrast_warnings(&light_colors, &dark_colors);
         windows.update_indicator_surfaces(IndicatorSurfaceUpdate {
             previews: PreviewImages {
                 light: light.image,
@@ -584,6 +581,18 @@ impl RuntimeAdapters {
             },
             font_fallback,
             contrast_warnings,
+            summaries: PreviewSummaries {
+                light: preview_accessibility_summary(
+                    &light_scene,
+                    &light_colors,
+                    IndicatorAppearance::Light,
+                ),
+                dark: preview_accessibility_summary(
+                    &dark_scene,
+                    &dark_colors,
+                    IndicatorAppearance::Dark,
+                ),
+            },
             layout: IndicatorLayoutDiagnostics {
                 status: status_layout,
                 light: light.layout,
@@ -611,16 +620,12 @@ fn preview_appearance(name: PreviewAppearanceName) -> objc2::rc::Retained<NSAppe
 }
 
 fn preview_contrast_warnings(
-    light_scene: &IndicatorScene,
-    light_appearance: &NSAppearance,
-    dark_scene: &IndicatorScene,
-    dark_appearance: &NSAppearance,
+    light_colors: &[[f64; 3]],
+    dark_colors: &[[f64; 3]],
 ) -> PreviewContrastWarnings {
-    let light_colors = resolved_scene_srgb_colors(light_scene, light_appearance);
-    let dark_colors = resolved_scene_srgb_colors(dark_scene, dark_appearance);
     PreviewContrastWarnings {
-        light: has_low_text_contrast(&light_colors, PreviewBackground::Light),
-        dark: has_low_text_contrast(&dark_colors, PreviewBackground::Dark),
+        light: has_low_text_contrast(light_colors, PreviewBackground::Light),
+        dark: has_low_text_contrast(dark_colors, PreviewBackground::Dark),
     }
 }
 
@@ -793,9 +798,9 @@ mod tests {
 
     use super::{
         coalesce_redraw_effects_owned_by_cycle, decision_for, execute_redraw_reason,
-        preview_contrast_warnings, save_preferences, PreferencesStore, PreviewContrastWarnings,
-        RedrawReason, RuntimeDecision, RuntimeRedrawTarget, RuntimeSamplers, StatletCore,
-        VisualEnvironment, VisualEnvironmentState,
+        preview_contrast_warnings, resolved_scene_srgb_colors, save_preferences, PreferencesStore,
+        PreviewContrastWarnings, RedrawReason, RuntimeDecision, RuntimeRedrawTarget,
+        RuntimeSamplers, StatletCore, VisualEnvironment, VisualEnvironmentState,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1097,7 +1102,9 @@ mod tests {
     ) -> PreviewContrastWarnings {
         let light = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameAqua }).unwrap();
         let dark = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }).unwrap();
-        preview_contrast_warnings(light_scene, &light, dark_scene, &dark)
+        let light_colors = resolved_scene_srgb_colors(light_scene, &light);
+        let dark_colors = resolved_scene_srgb_colors(dark_scene, &dark);
+        preview_contrast_warnings(&light_colors, &dark_colors)
     }
 
     struct DeadlineTarget<'a> {

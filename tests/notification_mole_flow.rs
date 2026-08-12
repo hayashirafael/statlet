@@ -71,6 +71,7 @@ fn opening_free_space_rechecks_mole_without_blocking_the_window() {
     assert_eq!(
         app.handle(AppEvent::ReviewSpace),
         vec![
+            AppEffect::RedrawIndicator,
             AppEffect::CheckMoleCompatibility,
             AppEffect::ShowWindow(WindowKind::FreeSpace),
         ]
@@ -114,6 +115,67 @@ fn missing_or_incompatible_mole_uses_a_red_symbolic_badge() {
             .accessibility_label
             .contains("Mole indisponível"));
     }
+}
+
+#[test]
+fn asynchronous_mole_error_redraws_once_before_recording_history() {
+    let mut app = StatletCore::with_preferences(Preferences {
+        mole_integration_enabled: true,
+        ..Preferences::default()
+    })
+    .0;
+
+    let effects = app.handle(AppEvent::MoleStatusObserved(MoleStatus::Missing));
+
+    assert_eq!(app.state().status.disk_badge, Some(DiskBadge::Error));
+    assert_eq!(
+        effects,
+        vec![
+            AppEffect::RedrawIndicator,
+            AppEffect::RecordHistory(HistoryEventKind::MoleMissing),
+        ]
+    );
+}
+
+#[test]
+fn asynchronous_compatible_mole_status_redraws_once_when_it_clears_the_error_badge() {
+    let mut app = StatletCore::with_preferences(Preferences {
+        mole_integration_enabled: true,
+        ..Preferences::default()
+    })
+    .0;
+    app.handle(AppEvent::MoleStatusObserved(MoleStatus::Missing));
+    assert_eq!(app.state().status.disk_badge, Some(DiskBadge::Error));
+
+    let effects = app.handle(AppEvent::MoleStatusObserved(MoleStatus::Compatible(
+        MoleVersion::new(1, 49, 2),
+    )));
+
+    assert_eq!(app.state().status.disk_badge, None);
+    assert_eq!(effects, vec![AppEffect::RedrawIndicator]);
+}
+
+#[test]
+fn disabling_mole_with_an_active_badge_redraws_before_saving_and_stopping_sampling() {
+    let mut app = StatletCore::with_preferences(Preferences {
+        mole_integration_enabled: true,
+        ..Preferences::default()
+    })
+    .0;
+    app.handle(AppEvent::MoleStatusObserved(MoleStatus::Missing));
+    assert_eq!(app.state().status.disk_badge, Some(DiskBadge::Error));
+
+    let effects = app.handle(AppEvent::SetMoleIntegrationEnabled(false));
+
+    assert_eq!(app.state().status.disk_badge, None);
+    assert_eq!(
+        effects,
+        vec![
+            AppEffect::RedrawIndicator,
+            AppEffect::SavePreferences(Preferences::default()),
+            AppEffect::SetDiskSamplingEnabled(false),
+        ]
+    );
 }
 
 #[test]

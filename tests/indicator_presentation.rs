@@ -1,5 +1,7 @@
 use statlet::core::{DiskBadge, MetricContent, MetricSeverity, StatusContent};
-use statlet::indicator::{compose_indicator, SegmentColor, SemanticColor};
+use statlet::indicator::{
+    compose_indicator, preview_accessibility_summary, SegmentColor, SemanticColor,
+};
 use statlet::indicator_preferences::{
     IndicatorAppearance, IndicatorPreferences, LabelColorMode, MetricColorMode, SrgbColor,
 };
@@ -192,4 +194,44 @@ fn disk_badges_keep_their_symbols_and_semantic_colors() {
         error_badge.color,
         SegmentColor::Semantic(SemanticColor::DiskError)
     );
+}
+
+#[test]
+fn light_preview_summary_describes_metrics_visible_labels_resolved_colors_and_badge() {
+    let mut status = status();
+    status.disk_badge = Some(DiskBadge::Warning);
+    let scene = compose_indicator(
+        &status,
+        &IndicatorPreferences::default(),
+        IndicatorAppearance::Light,
+    );
+    let colors = [
+        rgb(0x11, 0x11, 0x11),
+        rgb(0x22, 0x22, 0x22),
+        rgb(0x33, 0x33, 0x33),
+        rgb(0x44, 0x44, 0x44),
+        rgb(0x55, 0x55, 0x55),
+    ];
+
+    assert_eq!(
+        preview_accessibility_summary(&scene, &colors, IndicatorAppearance::Light),
+        "Prévia clara: CPU 42%, rótulo #111111 e valor #222222; RAM 68%, rótulo #333333 e valor #444444; rótulos exibidos; badge de atenção presente na cor #555555."
+    );
+}
+
+#[test]
+fn dark_preview_summary_keeps_value_colors_when_labels_are_hidden_and_badge_is_absent() {
+    let mut preferences = IndicatorPreferences::default();
+    preferences.labels.visible = false;
+    let scene = compose_indicator(&status(), &preferences, IndicatorAppearance::Dark);
+    let colors = [rgb(0xAA, 0xBB, 0xCC), rgb(0xDD, 0xEE, 0xFF)];
+
+    assert_eq!(
+        preview_accessibility_summary(&scene, &colors, IndicatorAppearance::Dark),
+        "Prévia escura: CPU 42%, valor #AABBCC; RAM 68%, valor #DDEEFF; rótulos ocultos; badge ausente."
+    );
+}
+
+fn rgb(red: u8, green: u8, blue: u8) -> [f64; 3] {
+    [red, green, blue].map(|component| f64::from(component) / 255.0)
 }

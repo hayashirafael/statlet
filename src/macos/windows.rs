@@ -44,8 +44,14 @@ pub struct IndicatorSurfaceUpdate {
     pub previews: PreviewImages,
     pub font_fallback: Option<IndicatorFontFallback>,
     pub contrast_warnings: PreviewContrastWarnings,
+    pub summaries: PreviewSummaries,
     pub layout: IndicatorLayoutDiagnostics,
     pub environment: VisualEnvironment,
+}
+
+pub struct PreviewSummaries {
+    pub light: String,
+    pub dark: String,
 }
 
 pub struct WindowManager {

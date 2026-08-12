@@ -8,9 +8,8 @@ use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
 use statlet::indicator::{LayoutDiagnostics, PreviewBackground};
 use statlet::indicator_preferences::FontFamilyPreference;
 
-use super::super::{IndicatorFontFallback, PreviewContrastWarnings};
+use super::super::{IndicatorFontFallback, PreviewContrastWarnings, PreviewSummaries};
 use crate::macos::environment::VisualEnvironment;
-use crate::macos::fonts::FontResolution;
 use crate::macos::renderer::PreviewImages;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +39,8 @@ const fn warning_region_contract() -> WarningRegionContract {
 }
 
 fn preview_text(
+    light_summary: &str,
+    dark_summary: &str,
     layout: &LayoutDiagnostics,
     fallback: Option<PreviewFallback<'_>>,
     environment: &VisualEnvironment,
@@ -92,14 +93,10 @@ fn preview_text(
     );
 
     PreviewText {
-        light_description: appearance_description("clara"),
-        dark_description: appearance_description("escura"),
+        light_description: light_summary.to_owned(),
+        dark_description: dark_summary.to_owned(),
         shared_warnings,
     }
-}
-
-fn appearance_description(appearance: &str) -> String {
-    format!("Prévia {appearance} do indicador em escala aproximada da menu bar.")
 }
 
 pub(super) struct PreviewPane {
@@ -208,27 +205,6 @@ impl PreviewPane {
         &self.view
     }
 
-    #[allow(dead_code)]
-    pub(super) fn apply(
-        &self,
-        images: &PreviewImages,
-        layout: &LayoutDiagnostics,
-        fallback: Option<&FontResolution>,
-        environment: &VisualEnvironment,
-    ) {
-        let fallback = fallback.map(|fallback| PreviewFallback {
-            requested_family: family_name(&fallback.requested_family),
-            resolved_family: &fallback.resolved_family,
-        });
-        self.apply_text(
-            images,
-            layout,
-            fallback,
-            environment,
-            PreviewContrastWarnings::default(),
-        );
-    }
-
     pub(super) fn apply_with_contrast(
         &self,
         images: &PreviewImages,
@@ -236,12 +212,13 @@ impl PreviewPane {
         fallback: Option<&IndicatorFontFallback>,
         environment: &VisualEnvironment,
         contrast: PreviewContrastWarnings,
+        summaries: &PreviewSummaries,
     ) {
         let fallback = fallback.map(|fallback| PreviewFallback {
             requested_family: family_name(&fallback.requested_family),
             resolved_family: &fallback.resolved_family,
         });
-        self.apply_text(images, layout, fallback, environment, contrast);
+        self.apply_text(images, layout, fallback, environment, contrast, summaries);
     }
 
     fn apply_text(
@@ -251,6 +228,7 @@ impl PreviewPane {
         fallback: Option<PreviewFallback<'_>>,
         environment: &VisualEnvironment,
         contrast: PreviewContrastWarnings,
+        summaries: &PreviewSummaries,
     ) {
         let preview_plan = environment.preview_plan();
         apply_preview_background(
@@ -265,7 +243,14 @@ impl PreviewPane {
         );
         self.light_image.setImage(Some(&images.light));
         self.dark_image.setImage(Some(&images.dark));
-        let text = preview_text(layout, fallback, environment, contrast);
+        let text = preview_text(
+            &summaries.light,
+            &summaries.dark,
+            layout,
+            fallback,
+            environment,
+            contrast,
+        );
         set_preview_text(&self.light_description, &text.light_description);
         set_preview_text(&self.dark_description, &text.dark_description);
         set_warning_text(&self.warnings, &self.warnings_scroll, &text.shared_warnings);
@@ -364,6 +349,8 @@ mod tests {
     #[test]
     fn preview_text_keeps_appearance_descriptions_separate_from_shared_warnings() {
         let text = preview_text(
+            "Prévia clara resumida.",
+            "Prévia escura resumida.",
             &LayoutDiagnostics {
                 exceeds_menu_bar_height: true,
                 exceeds_curated_width: true,
@@ -427,6 +414,8 @@ mod tests {
     #[test]
     fn preview_text_routes_each_appearance_contrast_warning_once_to_scrollable_region() {
         let text = preview_text(
+            "Prévia clara resumida.",
+            "Prévia escura resumida.",
             &LayoutDiagnostics {
                 exceeds_menu_bar_height: false,
                 exceeds_curated_width: false,

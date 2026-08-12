@@ -420,6 +420,7 @@ impl PreferencesWindow {
             previews,
             font_fallback,
             contrast_warnings,
+            summaries,
             layout,
             environment,
         } = surfaces;
@@ -429,6 +430,7 @@ impl PreferencesWindow {
             font_fallback.as_ref(),
             &environment,
             contrast_warnings,
+            &summaries,
         );
         self.indicator
             .controls

@@ -276,10 +276,12 @@ impl StatletCore {
             }
             AppEvent::OpenHistory => vec![AppEffect::ShowWindow(WindowKind::History)],
             AppEvent::ReviewSpace | AppEvent::NotificationActivated => {
-                let mut effects = Vec::with_capacity(2);
+                let mut effects = Vec::with_capacity(3);
                 if self.state.preferences.mole_integration_enabled {
                     self.state.mole_status = MoleStatus::Unknown;
-                    self.refresh_status();
+                    if self.refresh_status() {
+                        effects.push(AppEffect::RedrawIndicator);
+                    }
                     effects.push(AppEffect::CheckMoleCompatibility);
                 }
                 effects.push(AppEffect::ShowWindow(WindowKind::FreeSpace));
@@ -291,18 +293,23 @@ impl StatletCore {
                     return Vec::new();
                 }
                 self.state.preferences.mole_integration_enabled = enabled;
-                if !enabled {
+                let disk_badge_changed = if !enabled {
                     self.disk_episode = DiskEpisode::default();
                     self.state.latest_disk_observation = None;
                     self.state.mole_status = MoleStatus::Unknown;
                     self.last_mole_block = None;
                     self.monitoring_failure_active = false;
-                    self.refresh_status();
-                }
+                    self.refresh_status()
+                } else {
+                    false
+                };
                 let mut effects = vec![
                     AppEffect::SavePreferences(self.state.preferences.clone()),
                     AppEffect::SetDiskSamplingEnabled(enabled),
                 ];
+                if disk_badge_changed {
+                    effects.insert(0, AppEffect::RedrawIndicator);
+                }
                 if enabled {
                     effects.push(AppEffect::RequestNotificationAuthorization);
                     effects.push(AppEffect::CheckMoleCompatibility);
@@ -351,7 +358,7 @@ impl StatletCore {
                     return Vec::new();
                 }
                 self.state.mole_status = status;
-                self.refresh_status();
+                let disk_badge_changed = self.refresh_status();
                 let block = match status {
                     MoleStatus::Missing => Some(HistoryEventKind::MoleMissing),
                     MoleStatus::Unavailable => Some(HistoryEventKind::MoleUnavailable),
@@ -362,13 +369,17 @@ impl StatletCore {
                     }
                     MoleStatus::Unknown => None,
                 };
-                match block {
+                let mut effects = match block {
                     Some(block) if Some(block) != self.last_mole_block => {
                         self.last_mole_block = Some(block);
                         vec![AppEffect::RecordHistory(block)]
                     }
                     _ => Vec::new(),
+                };
+                if disk_badge_changed {
+                    effects.insert(0, AppEffect::RedrawIndicator);
                 }
+                effects
             }
             AppEvent::OpenMoleInTerminal => {
                 if self.state.preferences.mole_integration_enabled
@@ -446,7 +457,8 @@ impl StatletCore {
         effects
     }
 
-    fn refresh_status(&mut self) {
+    fn refresh_status(&mut self) -> bool {
+        let previous_disk_badge = self.state.status.disk_badge;
         let disk_badge = if self.state.preferences.mole_integration_enabled
             && self.state.mole_status.is_error()
         {
@@ -455,6 +467,7 @@ impl StatletCore {
             self.disk_episode.is_active().then_some(DiskBadge::Warning)
         };
         self.state.status = present(self.system_snapshot, disk_badge);
+        disk_badge != previous_disk_badge
     }
 }
 

@@ -1,6 +1,3 @@
-// Task 6 exposes this adapter for the runtime wiring deliberately deferred to Task 7.
-#![allow(dead_code)]
-
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSFont, NSFontManager, NSFontTraitMask};

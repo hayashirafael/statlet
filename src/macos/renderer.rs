@@ -3,9 +3,6 @@
 //! Derived and modified from featherbar commit 90ab504, Apache-2.0:
 //! https://github.com/nim444/featherbar/tree/90ab504b025db15665ce5d97b8ae4d4cdeb47dc3
 
-// Task 6 exposes the shared renderer APIs before Task 7 replaces the legacy runtime call site.
-#![allow(dead_code)]
-
 use std::cell::RefCell;
 
 use block2::StackBlock;
@@ -19,7 +16,6 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSDictionary, NSMutableAttributedString, NSPoint, NSSize, NSString};
 
-use statlet::core::{DiskBadge, MetricContent, MetricSeverity, StatusContent};
 use statlet::indicator::{
     measure_stable_layout, IndicatorRun, IndicatorScene, LayoutDiagnostics, SegmentColor,
     SemanticColor, StableLayout, TextMeasurer,
@@ -28,7 +24,6 @@ use statlet::indicator_preferences::{FontWeight, TypographyPreferences};
 
 use super::fonts::{FontCatalog, FontResolution};
 
-const FONT_SIZE: f64 = 12.0;
 const LINE_GAP: f64 = 2.0;
 const HEIGHT: f64 = 22.0;
 
@@ -68,10 +63,6 @@ impl<T> SlotMap<T> {
 
     fn get(&self, slot: RenderSlot) -> Option<&T> {
         self.entries[slot.index()].as_ref()
-    }
-
-    fn len(&self) -> usize {
-        self.entries.iter().flatten().count()
     }
 
     fn clear(&mut self) {
@@ -251,10 +242,6 @@ impl<I: Clone> SurfaceCache<I> {
         );
     }
 
-    fn len(&self) -> usize {
-        self.slots.len()
-    }
-
     fn clear(&mut self) {
         self.slots.clear();
     }
@@ -282,25 +269,7 @@ fn line_has_label(runs: &[IndicatorRun], label: &str) -> bool {
         .is_some_and(char::is_whitespace)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Level {
-    Neutral,
-    Good,
-    Warning,
-    Critical,
-    DiskWarning,
-    DiskError,
-}
-
-struct Segment {
-    text: String,
-    level: Level,
-}
-
 pub struct Renderer {
-    attributes: [Retained<NSDictionary<NSString, AnyObject>>; 6],
-    top_y: f64,
-    bottom_y: f64,
     font_catalog: FontCatalog,
     cache: SurfaceCache<Retained<NSImage>>,
     default_width: f64,
@@ -313,32 +282,6 @@ impl Renderer {
     }
 
     pub fn with_main_thread_marker(marker: MainThreadMarker) -> Self {
-        let font = NSFont::monospacedSystemFontOfSize_weight(FONT_SIZE, unsafe {
-            objc2_app_kit::NSFontWeightMedium
-        });
-        let attributes = [
-            Level::Neutral,
-            Level::Good,
-            Level::Warning,
-            Level::Critical,
-            Level::DiskWarning,
-            Level::DiskError,
-        ]
-        .map(|level| {
-            NSDictionary::from_retained_objects(
-                &[unsafe { NSFontAttributeName }, unsafe {
-                    NSForegroundColorAttributeName
-                }],
-                &[
-                    Retained::into_super(Retained::into_super(font.retain())),
-                    Retained::into_super(Retained::into_super(color(level))),
-                ],
-            )
-        });
-
-        let cap_height = font.capHeight();
-        let descent = -font.descender();
-        let margin = (HEIGHT - 2.0 * cap_height - LINE_GAP) / 2.0;
         let font_catalog = FontCatalog::new(marker);
         let default_typography =
             statlet::indicator_preferences::IndicatorPreferences::default().typography;
@@ -347,9 +290,6 @@ impl Renderer {
         let default_width =
             measure_stable_layout(&default_measurer, true, f64::INFINITY).base_width();
         Self {
-            attributes,
-            bottom_y: margin - descent,
-            top_y: margin + cap_height + LINE_GAP - descent,
             font_catalog,
             cache: SurfaceCache::default(),
             default_width,
@@ -396,38 +336,6 @@ impl Renderer {
         }
     }
 
-    pub fn render_previews(
-        &mut self,
-        light_scene: &IndicatorScene,
-        dark_scene: &IndicatorScene,
-        typography: &TypographyPreferences,
-    ) -> PreviewImages {
-        let light_appearance =
-            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameAqua })
-                .expect("Aqua appearance is available on macOS");
-        let dark_appearance =
-            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameDarkAqua })
-                .expect("Dark Aqua appearance is available on macOS");
-        PreviewImages {
-            light: self
-                .render(
-                    RenderSlot::PreviewLight,
-                    light_scene,
-                    typography,
-                    &light_appearance,
-                )
-                .image,
-            dark: self
-                .render(
-                    RenderSlot::PreviewDark,
-                    dark_scene,
-                    typography,
-                    &dark_appearance,
-                )
-                .image,
-        }
-    }
-
     pub fn apply_status(
         &mut self,
         button: &NSStatusBarButton,
@@ -441,14 +349,6 @@ impl Renderer {
         output.layout
     }
 
-    pub fn cached_slot_count(&self) -> usize {
-        self.cache.len()
-    }
-
-    pub fn font_families(&self) -> &[String] {
-        self.font_catalog.families()
-    }
-
     pub fn refresh_fonts(&mut self) {
         self.font_catalog.refresh();
         self.invalidate();
@@ -456,57 +356,6 @@ impl Renderer {
 
     pub fn invalidate(&mut self) {
         self.cache.clear();
-    }
-
-    pub fn set_status(&self, button: &NSStatusBarButton, status: &StatusContent) {
-        let top_segments = segments(&status.cpu);
-        let top = if let Some(badge) = disk_badge_segment(status.disk_badge) {
-            let [label, value] = top_segments;
-            self.attributed_line(&[label, value, badge])
-        } else {
-            self.attributed_line(&top_segments)
-        };
-        let bottom = self.attributed_line(&segments(&status.ram));
-        let width = top.size().width.max(bottom.size().width).ceil();
-        let image = NSImage::initWithSize(
-            NSImage::alloc(),
-            NSSize {
-                width,
-                height: HEIGHT,
-            },
-        );
-
-        #[allow(deprecated)]
-        {
-            image.lockFocus();
-            bottom.drawAtPoint(NSPoint {
-                x: 0.0,
-                y: self.bottom_y,
-            });
-            top.drawAtPoint(NSPoint {
-                x: 0.0,
-                y: self.top_y,
-            });
-            image.unlockFocus();
-        }
-
-        button.setImage(Some(&image));
-        button.setAccessibilityLabel(Some(&NSString::from_str(&status.accessibility_label)));
-        button.setToolTip(Some(&NSString::from_str(&status.accessibility_label)));
-    }
-
-    fn attributed_line(&self, segments: &[Segment]) -> Retained<NSMutableAttributedString> {
-        let line = NSMutableAttributedString::new();
-        for segment in segments {
-            let run = unsafe {
-                objc2_foundation::NSAttributedString::new_with_attributes(
-                    &NSString::from_str(&segment.text),
-                    &self.attributes[segment.level as usize],
-                )
-            };
-            line.appendAttributedString(&run);
-        }
-        line
     }
 }
 
@@ -552,8 +401,6 @@ fn draw_image(
 ) -> Retained<NSImage> {
     let rendered = RefCell::new(None);
     let draw = StackBlock::new(|| {
-        let top = attributed_scene_line(font, scene.top.iter().chain(scene.disk_badge.iter()));
-        let bottom = attributed_scene_line(font, scene.bottom.iter());
         let badge = scene.disk_badge.as_ref().map(|run| run.text.as_str());
         let width = layout.width_for_badge(badge).ceil();
         let image = NSImage::initWithSize(
@@ -566,18 +413,33 @@ fn draw_image(
         let cap_height = font.capHeight();
         let descent = -font.descender();
         let margin = (HEIGHT - 2.0 * cap_height - LINE_GAP) / 2.0;
+        let measurer = FontTextMeasurer::new(font);
 
         #[allow(deprecated)]
         {
             image.lockFocus();
-            bottom.drawAtPoint(NSPoint {
-                x: 0.0,
-                y: margin - descent,
-            });
-            top.drawAtPoint(NSPoint {
-                x: 0.0,
-                y: margin + cap_height + LINE_GAP - descent,
-            });
+            draw_metric_line(
+                &scene.bottom,
+                margin - descent,
+                font,
+                &measurer,
+                layout,
+                layout.ram_width,
+            );
+            draw_metric_line(
+                &scene.top,
+                margin + cap_height + LINE_GAP - descent,
+                font,
+                &measurer,
+                layout,
+                layout.cpu_width,
+            );
+            if let Some(badge) = &scene.disk_badge {
+                attributed_scene_run(font, badge).drawAtPoint(NSPoint {
+                    x: layout.base_width(),
+                    y: margin + cap_height + LINE_GAP - descent,
+                });
+            }
             image.unlockFocus();
         }
         rendered.replace(Some(image));
@@ -593,29 +455,59 @@ fn draw_image(
         .expect("drawing appearance executes its block synchronously")
 }
 
+fn draw_metric_line(
+    runs: &[IndicatorRun],
+    y: f64,
+    font: &NSFont,
+    measurer: &impl TextMeasurer,
+    layout: StableLayout,
+    line_width: f64,
+) {
+    match runs {
+        [value] => attributed_scene_run(font, value).drawAtPoint(NSPoint {
+            x: layout.value_origin(measurer, line_width, &value.text),
+            y,
+        }),
+        [label, value] => {
+            attributed_scene_run(font, label).drawAtPoint(NSPoint { x: 0.0, y });
+            attributed_scene_run(font, value).drawAtPoint(NSPoint {
+                x: layout.value_origin(measurer, line_width, &value.text),
+                y,
+            });
+        }
+        _ => attributed_scene_line(font, runs.iter()).drawAtPoint(NSPoint { x: 0.0, y }),
+    }
+}
+
+fn attributed_scene_run(
+    font: &NSFont,
+    run: &IndicatorRun,
+) -> Retained<objc2_foundation::NSAttributedString> {
+    let color = resolve_color(run.color);
+    let attributes = NSDictionary::from_retained_objects(
+        &[unsafe { NSFontAttributeName }, unsafe {
+            NSForegroundColorAttributeName
+        }],
+        &[
+            Retained::into_super(Retained::into_super(font.retain())),
+            Retained::into_super(Retained::into_super(color)),
+        ],
+    );
+    unsafe {
+        objc2_foundation::NSAttributedString::new_with_attributes(
+            &NSString::from_str(&run.text),
+            &attributes,
+        )
+    }
+}
+
 fn attributed_scene_line<'a>(
     font: &NSFont,
     runs: impl Iterator<Item = &'a IndicatorRun>,
 ) -> Retained<NSMutableAttributedString> {
     let line = NSMutableAttributedString::new();
     for run in runs {
-        let color = resolve_color(run.color);
-        let attributes = NSDictionary::from_retained_objects(
-            &[unsafe { NSFontAttributeName }, unsafe {
-                NSForegroundColorAttributeName
-            }],
-            &[
-                Retained::into_super(Retained::into_super(font.retain())),
-                Retained::into_super(Retained::into_super(color)),
-            ],
-        );
-        let attributed = unsafe {
-            objc2_foundation::NSAttributedString::new_with_attributes(
-                &NSString::from_str(&run.text),
-                &attributes,
-            )
-        };
-        line.appendAttributedString(&attributed);
+        line.appendAttributedString(&attributed_scene_run(font, run));
     }
     line
 }
@@ -707,47 +599,6 @@ fn find_button(view: &NSView) -> Option<Retained<NSStatusBarButton>> {
     None
 }
 
-fn segments(metric: &MetricContent) -> [Segment; 2] {
-    [
-        Segment {
-            text: metric.label.to_owned(),
-            level: Level::Neutral,
-        },
-        Segment {
-            text: format!("{:>3}%", metric.percent),
-            level: match metric.severity {
-                MetricSeverity::Good => Level::Good,
-                MetricSeverity::Warning => Level::Warning,
-                MetricSeverity::Critical => Level::Critical,
-            },
-        },
-    ]
-}
-
-fn disk_badge_segment(badge: Option<DiskBadge>) -> Option<Segment> {
-    badge.map(|badge| match badge {
-        DiskBadge::Warning => Segment {
-            text: " !".to_owned(),
-            level: Level::DiskWarning,
-        },
-        DiskBadge::Error => Segment {
-            text: " ×".to_owned(),
-            level: Level::DiskError,
-        },
-    })
-}
-
-fn color(level: Level) -> Retained<NSColor> {
-    match level {
-        Level::Neutral => NSColor::labelColor(),
-        Level::Good => NSColor::systemGreenColor(),
-        Level::Warning => NSColor::systemOrangeColor(),
-        Level::Critical => NSColor::systemRedColor(),
-        Level::DiskWarning => NSColor::systemYellowColor(),
-        Level::DiskError => NSColor::systemRedColor(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -759,57 +610,6 @@ mod tests {
     use statlet::indicator_preferences::{FontWeight, SrgbColor};
 
     use super::*;
-
-    fn cpu_metric() -> MetricContent {
-        MetricContent {
-            label: "C",
-            percent: 42,
-            severity: MetricSeverity::Warning,
-        }
-    }
-
-    #[test]
-    fn disk_warning_appends_a_symbolic_yellow_segment() {
-        let segment = disk_badge_segment(Some(DiskBadge::Warning)).unwrap();
-
-        assert_eq!(segment.text, " !");
-        assert_eq!(segment.level, Level::DiskWarning);
-    }
-
-    #[test]
-    fn no_disk_badge_preserves_the_compact_cpu_line() {
-        let segments = segments(&cpu_metric());
-
-        assert_eq!(segments.len(), 2);
-        assert_eq!(
-            segments
-                .iter()
-                .map(|segment| segment.text.as_str())
-                .collect::<String>(),
-            "C 42%"
-        );
-        assert!(disk_badge_segment(None).is_none());
-    }
-
-    #[test]
-    fn legacy_renderer_keeps_values_padded_to_three_digits() {
-        let cases = [(0, "  0%"), (9, "  9%"), (10, " 10%"), (100, "100%")];
-
-        for (percent, expected) in cases {
-            let mut metric = cpu_metric();
-            metric.percent = percent;
-
-            assert_eq!(segments(&metric)[1].text, expected);
-        }
-    }
-
-    #[test]
-    fn mole_error_appends_a_symbolic_red_segment() {
-        let segment = disk_badge_segment(Some(DiskBadge::Error)).unwrap();
-
-        assert_eq!(segment.text, " ×");
-        assert_eq!(segment.level, Level::DiskError);
-    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct TestEntry(u8);
@@ -829,7 +629,7 @@ mod tests {
             layout_key("Menlo", true),
             "NSAppearanceNameAqua".to_owned(),
         );
-        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.slots.entries.iter().flatten().count(), 3);
         assert_eq!(
             cache.reused_image(RenderSlot::Status, &key),
             Some(TestEntry(4))
@@ -1051,7 +851,7 @@ mod tests {
         renderer.render(RenderSlot::Status, &scene, &typography, &aqua);
 
         assert!(status.image.size().width > 0.0);
-        assert_eq!(renderer.cached_slot_count(), 3);
+        assert_eq!(renderer.cache.slots.entries.iter().flatten().count(), 3);
 
         let button = NSStatusBarButton::new(marker);
         renderer.apply_status(&button, &scene, &typography);
