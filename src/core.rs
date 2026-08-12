@@ -43,16 +43,16 @@ pub enum MetricSeverity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MetricPresentation {
+pub struct MetricContent {
     pub label: &'static str,
-    pub value: String,
+    pub percent: u8,
     pub severity: MetricSeverity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StatusPresentation {
-    pub top: MetricPresentation,
-    pub bottom: MetricPresentation,
+pub struct StatusContent {
+    pub cpu: MetricContent,
+    pub ram: MetricContent,
     pub disk_badge: Option<DiskBadge>,
     pub accessibility_label: String,
 }
@@ -65,7 +65,7 @@ pub enum DiskBadge {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppState {
-    pub status: StatusPresentation,
+    pub status: StatusContent,
     pub preferences: Preferences,
     pub latest_disk_observation: Option<DiskObservation>,
     pub mole_status: MoleStatus,
@@ -418,7 +418,7 @@ impl DiskEpisode {
     }
 }
 
-fn present(snapshot: SystemSnapshot, disk_badge: Option<DiskBadge>) -> StatusPresentation {
+fn present(snapshot: SystemSnapshot, disk_badge: Option<DiskBadge>) -> StatusContent {
     let cpu = rounded_percent(snapshot.cpu_percent);
     let ram = rounded_percent(snapshot.ram_percent);
     let (memory_severity, pressure_description) =
@@ -428,15 +428,15 @@ fn present(snapshot: SystemSnapshot, disk_badge: Option<DiskBadge>) -> StatusPre
         Some(DiskBadge::Error) => ", Mole indisponível",
         None => "",
     };
-    StatusPresentation {
-        top: MetricPresentation {
+    StatusContent {
+        cpu: MetricContent {
             label: "C",
-            value: format!("{cpu:>3}%"),
+            percent: cpu,
             severity: cpu_severity(snapshot.cpu_percent),
         },
-        bottom: MetricPresentation {
+        ram: MetricContent {
             label: "R",
-            value: format!("{ram:>3}%"),
+            percent: ram,
             severity: memory_severity,
         },
         disk_badge,

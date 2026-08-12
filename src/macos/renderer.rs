@@ -12,7 +12,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSDictionary, NSMutableAttributedString, NSPoint, NSSize, NSString};
 
-use statlet::core::{DiskBadge, MetricPresentation, MetricSeverity, StatusPresentation};
+use statlet::core::{DiskBadge, MetricContent, MetricSeverity, StatusContent};
 
 const FONT_SIZE: f64 = 12.0;
 const LINE_GAP: f64 = 2.0;
@@ -74,15 +74,15 @@ impl Renderer {
         }
     }
 
-    pub fn set_status(&self, button: &NSStatusBarButton, status: &StatusPresentation) {
-        let top_segments = segments(&status.top);
+    pub fn set_status(&self, button: &NSStatusBarButton, status: &StatusContent) {
+        let top_segments = segments(&status.cpu);
         let top = if let Some(badge) = disk_badge_segment(status.disk_badge) {
             let [label, value] = top_segments;
             self.attributed_line(&[label, value, badge])
         } else {
             self.attributed_line(&top_segments)
         };
-        let bottom = self.attributed_line(&segments(&status.bottom));
+        let bottom = self.attributed_line(&segments(&status.ram));
         let width = top.size().width.max(bottom.size().width).ceil();
         let image = NSImage::initWithSize(
             NSImage::alloc(),
@@ -152,14 +152,14 @@ fn find_button(view: &NSView) -> Option<Retained<NSStatusBarButton>> {
     None
 }
 
-fn segments(metric: &MetricPresentation) -> [Segment; 2] {
+fn segments(metric: &MetricContent) -> [Segment; 2] {
     [
         Segment {
             text: metric.label.to_owned(),
             level: Level::Neutral,
         },
         Segment {
-            text: metric.value.clone(),
+            text: format!("{:>3}%", metric.percent),
             level: match metric.severity {
                 MetricSeverity::Good => Level::Good,
                 MetricSeverity::Warning => Level::Warning,
@@ -197,10 +197,10 @@ fn color(level: Level) -> Retained<NSColor> {
 mod tests {
     use super::*;
 
-    fn cpu_metric() -> MetricPresentation {
-        MetricPresentation {
+    fn cpu_metric() -> MetricContent {
+        MetricContent {
             label: "C",
-            value: " 42%".to_owned(),
+            percent: 42,
             severity: MetricSeverity::Warning,
         }
     }
@@ -218,7 +218,26 @@ mod tests {
         let segments = segments(&cpu_metric());
 
         assert_eq!(segments.len(), 2);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>(),
+            "C 42%"
+        );
         assert!(disk_badge_segment(None).is_none());
+    }
+
+    #[test]
+    fn legacy_renderer_keeps_values_padded_to_three_digits() {
+        let cases = [(0, "  0%"), (9, "  9%"), (10, " 10%"), (100, "100%")];
+
+        for (percent, expected) in cases {
+            let mut metric = cpu_metric();
+            metric.percent = percent;
+
+            assert_eq!(segments(&metric)[1].text, expected);
+        }
     }
 
     #[test]
