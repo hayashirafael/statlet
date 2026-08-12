@@ -24,13 +24,23 @@ A v1 roda em Macs com Apple Silicon e macOS 14 ou mais recente.
 
 ## Experiência principal
 
-CPU e RAM ficam sempre visíveis, nessa ordem, no preset compacto. O clique abre um menu nativo com acesso a preferências, histórico e, quando habilitado, ao estado do disco.
+CPU e RAM continuam visíveis simultaneamente, nessa ordem, no indicador compacto. O clique abre um menu nativo com acesso a preferências, histórico e, quando habilitado, ao estado do disco.
 
 - CPU: uso global normalizado entre 0 e 100%;
 - RAM: memória de apps, wired e comprimida sobre a memória física, sem contar cache recuperável;
-- atualização de CPU e RAM: a cada 2 segundos;
+- atualização de CPU e RAM: a cada 2 segundos por padrão;
 - cor da CPU: verde de 0–39%, laranja de 40–69% e vermelho de 70–100%;
 - cor da RAM: segue o memory pressure do macOS.
+
+A personalização implementada para a próxima versão adiciona a área **Indicador** às preferências, com opções para:
+
+- manter as cores dinâmicas ou escolher cores fixas em hexadecimal `#RRGGBB`, com variantes opcionais para Light e Dark;
+- manter, ocultar em conjunto ou recolorir os rótulos `C` e `R`, sem reduzir a descrição acessível de CPU e RAM;
+- escolher qualquer família instalada, tamanho inteiro de 9 a 14 pt e peso regular, médio ou negrito; uma fonte ausente usa fallback sem apagar a escolha;
+- escolher um intervalo compartilhado de 1 a 60 segundos para CPU e RAM; o padrão continua em 2 segundos e a amostragem de disco continua independente em 60 segundos;
+- comparar prévias clara e escura, receber avisos não bloqueantes de contraste e dimensões, restaurar cada grupo ou todos os padrões e desfazer a restauração global uma vez.
+
+Alterações válidas são aplicadas imediatamente e salvas em preferências versionadas. Entrada inválida não substitui o último valor válido; uma falha de escrita permanece visível e pode ser tentada novamente. As prévias usam fundos representativos e não garantem o contraste contra todo wallpaper, transparência ou estado da menu bar.
 
 ## Disco e Mole
 
@@ -117,5 +127,6 @@ Statlet é distribuído sob a licença [Apache 2.0](LICENSE). Código derivado d
 - [Decisões arquiteturais](docs/adr/)
 - [Pesquisa de UI/UX e mercado](docs/research/disk-cleanup-ui-market.md)
 - [Validação de acessibilidade e ciclo de vida](docs/validation/accessibility-lifecycle.md)
+- [Validação da personalização do indicador](docs/validation/indicator-customization.md)
 - [Assinatura e notarização](docs/release/signing-and-notarization.md)
 - [Notas da v1.0.0](docs/release/v1.0.0.md)

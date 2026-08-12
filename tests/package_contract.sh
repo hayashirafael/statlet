@@ -34,6 +34,15 @@ if HOME="$fake_home" "$repo_root/scripts/measure-soak.sh" "$test_root/Statlet.ap
     exit 1
 fi
 
+fake_v2_home="$test_root/home-with-nondefault-refresh"
+mkdir -p "$fake_v2_home/Library/Application Support/Statlet"
+printf '%s\n' '{"version":2,"moleIntegrationEnabled":false,"warningThreshold":90,"indicator":{"refreshInterval":1}}' \
+    >"$fake_v2_home/Library/Application Support/Statlet/preferences.json"
+if HOME="$fake_v2_home" "$repo_root/scripts/measure-soak.sh" "$test_root/Statlet.app" 1 1 "$test_root/invalid-v2-soak" >/dev/null 2>&1; then
+    echo "measure-soak.sh accepted a v2 default baseline with a nondefault refresh interval" >&2
+    exit 1
+fi
+
 archive="$test_root/$archive_name"
 checksum="$archive.sha256"
 

@@ -20,13 +20,42 @@ if [[ ! -x "$executable" ]]; then
     echo "Missing Statlet executable at $executable" >&2
     exit 1
 fi
-if [[ -f "$preferences_path" ]] && grep -Eq '"moleIntegrationEnabled"[[:space:]]*:[[:space:]]*true' "$preferences_path"; then
-    echo "Mole integration is enabled in $preferences_path; refusing to label this as an idle baseline" >&2
-    exit 1
-fi
+preference_schema="defaults (preferences file absent)"
 mole_preference="disabled (default; preferences file absent)"
+metric_refresh_interval="2 seconds (default; preferences file absent)"
 if [[ -f "$preferences_path" ]]; then
-    mole_preference="disabled (verified in preferences.json)"
+    preference_value() {
+        /usr/bin/plutil -extract "$1" raw -o - "$preferences_path" 2>/dev/null
+    }
+
+    preference_version="$(preference_value version || true)"
+    mole_enabled="$(preference_value moleIntegrationEnabled || true)"
+    if [[ "$mole_enabled" != "false" ]]; then
+        echo "Mole integration is enabled or unreadable in $preferences_path; refusing to label this as an idle baseline" >&2
+        exit 1
+    fi
+
+    case "$preference_version" in
+        1)
+            preference_schema="v1 (verified in preferences.json)"
+            mole_preference="disabled (verified in v1 preferences.json)"
+            metric_refresh_interval="2 seconds (v1 migration default)"
+            ;;
+        2)
+            refresh_interval="$(preference_value indicator.refreshInterval || true)"
+            if [[ "$refresh_interval" != "2" ]]; then
+                echo "Metric refresh interval is not exactly 2 seconds in $preferences_path; refusing the default baseline" >&2
+                exit 1
+            fi
+            preference_schema="v2 (verified in preferences.json)"
+            mole_preference="disabled (verified in v2 preferences.json)"
+            metric_refresh_interval="2 seconds (verified in v2 preferences.json)"
+            ;;
+        *)
+            echo "Unsupported or unreadable preferences schema in $preferences_path; refusing the baseline" >&2
+            exit 1
+            ;;
+    esac
 fi
 if ! [[ "$duration" =~ ^[0-9]+$ && "$interval" =~ ^[0-9]+$ && "$duration" -ge "$interval" && "$interval" -gt 0 ]]; then
     echo "Duration and interval must be positive integers, with duration >= interval" >&2
@@ -68,14 +97,16 @@ signature_info="$(codesign --display --verbose=4 "$app" 2>&1)"
 signature="$(awk -F= '/^Signature=/ { print $2; exit }' <<<"$signature_info")"
 signature_flags="$(sed -n 's/^CodeDirectory .* flags=\([^ ]*\).*/flags=\1/p' <<<"$signature_info")"
 
-open -n "$app"
-pid=""
+"$executable" >/dev/null 2>&1 &
+pid="$!"
 for _ in {1..50}; do
-    pid="$(find_exact_process || true)"
-    [[ -n "$pid" ]] && break
+    if kill -0 "$pid" 2>/dev/null; then
+        command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+        [[ "$command" == "$executable" ]] && break
+    fi
     sleep 0.1
 done
-if [[ -z "$pid" ]]; then
+if ! kill -0 "$pid" 2>/dev/null || [[ "${command:-}" != "$executable" ]]; then
     echo "Statlet did not start" >&2
     exit 1
 fi
@@ -138,14 +169,16 @@ physical_end="$(awk '/^[[:space:]]+phys_footprint:/ { print $2; exit }' "$footpr
 physical_peak="$(awk '/^[[:space:]]+phys_footprint_peak:/ { print $2; exit }' "$footprint_end")"
 
 {
-    echo "# Statlet v1 production-bundle soak"
+    echo "# Statlet production-bundle soak"
     echo
     echo "- Started: ${started_utc}"
     echo "- Bundle: Statlet ${bundle_version}; executable SHA-256 \`${executable_sha256}\`"
     echo "- Signature: ${signature}; ${signature_flags}"
     echo "- Host: ${hardware_model}, ${processor}, ${architecture}, macOS ${os_version} (${os_build})"
     echo "- Scenario: ${scenario}"
+    echo "- Preferences schema: ${preference_schema}"
     echo "- Mole integration: ${mole_preference}"
+    echo "- Metric refresh interval: ${metric_refresh_interval}"
     echo "- Requested duration: ${duration} seconds; observed duration: ${elapsed_last} seconds"
     echo "- Warm-up excluded from samples: ${warmup_seconds} seconds"
     echo "- Requested sampling interval: ${interval} seconds"
@@ -159,7 +192,7 @@ physical_peak="$(awk '/^[[:space:]]+phys_footprint_peak:/ { print $2; exit }' "$
     echo "- Detailed physical-footprint snapshots: footprint-start.txt and footprint-end.txt"
     echo "- Raw samples: samples.csv"
     echo
-    echo "The run passes the v1 bounded-growth guard when final RSS growth stays below 10 MiB, peak RSS stays below 20 MiB above the first post-warm-up sample, and mean sampled CPU stays below 1%. The full observed range remains informational because releasing memory increases that range without indicating a leak."
+    echo "The run passes the bounded-growth guard when final RSS growth stays below 10 MiB, peak RSS stays below 20 MiB above the first post-warm-up sample, and mean sampled CPU stays below 1%. The full observed range remains informational because releasing memory increases that range without indicating a leak."
 } >"$report"
 
 if ((rss_growth_kib > 10240 || rss_peak_growth_kib > 20480)); then
