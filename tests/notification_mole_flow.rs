@@ -212,6 +212,7 @@ fn threshold_crossing_and_opening_the_window_never_launch_mole() {
     assert_eq!(
         app.handle(AppEvent::DiskObserved(alert)),
         vec![
+            AppEffect::RequestIndicatorRedraw,
             AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
             AppEffect::DiskPressureAlert(alert),
         ]

@@ -30,6 +30,7 @@ fn active_disk_episode_records_start_and_recovery_once() {
     assert_eq!(
         app.handle(AppEvent::DiskObserved(started)),
         vec![
+            AppEffect::RequestIndicatorRedraw,
             AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
             AppEffect::DiskPressureAlert(started),
         ]
@@ -39,9 +40,10 @@ fn active_disk_episode_records_start_and_recovery_once() {
         .is_empty());
     assert_eq!(
         app.handle(AppEvent::DiskObserved(observation(89, 7))),
-        vec![AppEffect::RecordHistory(
-            HistoryEventKind::DiskPressureRecovered
-        )]
+        vec![
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::RecordHistory(HistoryEventKind::DiskPressureRecovered),
+        ]
     );
     assert!(app
         .handle(AppEvent::DiskObserved(observation(88, 8)))

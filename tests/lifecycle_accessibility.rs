@@ -180,6 +180,7 @@ fn an_active_episode_survives_sleep_without_duplicate_alerts() {
     assert_eq!(
         app.handle(AppEvent::DiskObserved(first_alert)),
         vec![
+            AppEffect::RequestIndicatorRedraw,
             AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
             AppEffect::DiskPressureAlert(first_alert),
         ]
@@ -194,9 +195,10 @@ fn an_active_episode_survives_sleep_without_duplicate_alerts() {
 
     assert_eq!(
         app.handle(AppEvent::DiskObserved(observation(89, 127))),
-        vec![AppEffect::RecordHistory(
-            HistoryEventKind::DiskPressureRecovered
-        )]
+        vec![
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::RecordHistory(HistoryEventKind::DiskPressureRecovered),
+        ]
     );
     assert!(app
         .handle(AppEvent::DiskObserved(observation(88, 128)))

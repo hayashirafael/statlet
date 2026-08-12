@@ -339,8 +339,8 @@ impl StatletCore {
                 let transition = self
                     .disk_episode
                     .observe(observation, self.state.preferences.warning_threshold);
-                self.refresh_status();
-                match transition {
+                let status_changed = self.refresh_status();
+                let mut effects = match transition {
                     DiskEpisodeTransition::Started => vec![
                         AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
                         AppEffect::DiskPressureAlert(observation),
@@ -349,7 +349,11 @@ impl StatletCore {
                         HistoryEventKind::DiskPressureRecovered,
                     )],
                     DiskEpisodeTransition::None => Vec::new(),
+                };
+                if status_changed {
+                    effects.insert(0, AppEffect::RequestIndicatorRedraw);
                 }
+                effects
             }
             AppEvent::DiskMonitoringFailed => {
                 if !self.state.preferences.mole_integration_enabled
@@ -470,7 +474,7 @@ impl StatletCore {
     }
 
     fn refresh_status(&mut self) -> bool {
-        let previous_disk_badge = self.state.status.disk_badge;
+        let previous_status = self.state.status.clone();
         let disk_badge = if self.state.preferences.mole_integration_enabled
             && self.state.mole_status.is_error()
         {
@@ -479,7 +483,7 @@ impl StatletCore {
             self.disk_episode.is_active().then_some(DiskBadge::Warning)
         };
         self.state.status = present(self.system_snapshot, disk_badge);
-        disk_badge != previous_disk_badge
+        self.state.status != previous_status
     }
 }
 
