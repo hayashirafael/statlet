@@ -5,7 +5,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 output_dir="${1:-$repo_root/dist}"
 app="$output_dir/Statlet.app"
-archive="$output_dir/Statlet-v1.0.0-macos-arm64.zip"
+version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo_root/Cargo.toml" | head -1)"
+archive="$output_dir/Statlet-v${version}-macos-arm64.zip"
 checksum="$archive.sha256"
 
 : "${STATLET_SIGNING_IDENTITY:?Set STATLET_SIGNING_IDENTITY to a Developer ID Application identity}"

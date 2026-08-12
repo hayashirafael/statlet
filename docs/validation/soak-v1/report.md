@@ -5,6 +5,7 @@
 - Signature: adhoc; flags=0x10002(adhoc,runtime)
 - Host: Mac16,1, Apple M4, arm64, macOS 26.5.2 (25F84)
 - Scenario: Idle menu-bar sampling; Mole integration disabled; no UI interaction during samples
+- Mole integration: disabled (verified in preferences.json)
 - Requested duration: 1800 seconds; observed duration: 1810 seconds
 - Warm-up excluded from samples: 10 seconds
 - Requested sampling interval: 10 seconds

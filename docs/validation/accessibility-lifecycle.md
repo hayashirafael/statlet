@@ -22,16 +22,19 @@ Checklist da v1 para os comportamentos que dependem de AppKit, configurações d
 - [x] Cada tipo de janela é retido em um único slot e atualizado antes de voltar à frente.
 - [x] Falha ao criar o item da menu bar não encerra o app nem impede o evento que abre Preferências.
 
-## Execução manual antes da release
+## Execução manual e validações residuais
 
 - [x] Abrir o bundle local com Launch Services mostra Preferências mesmo sem interação com o item da menu bar.
 - [x] Conferir Preferências em Light Mode: conteúdo, estados desabilitados e hierarquia permanecem legíveis.
 - [x] Conferir Preferências em Dark Mode: conteúdo, estados desabilitados e hierarquia permanecem legíveis.
+- [x] Inspecionar a árvore de acessibilidade da janela real: checkbox, seletor, rótulos e estados habilitado/desabilitado foram expostos; `AXPress` alternou a preferência e a integração foi restaurada para desativada.
 - [ ] Com Full Keyboard Access ativo, percorrer checkbox, seletor, botão do Mole e botão de apagar histórico; confirmar foco visível e acionamento por teclado.
 - [ ] Com VoiceOver, percorrer indicador, Preferências, Liberar espaço, Histórico e o alerta de confirmação; confirmar papel, nome, valor, ajuda e ordem.
 - [ ] Em Increase Contrast, conferir indicador e as três janelas em Light e Dark.
 - [ ] Com dois monitores, mover uma janela, desconectar o monitor e reabrir cada entrada; confirmar uma única janela visível e estado preservado.
 - [ ] Fechar Preferências com o app ainda rodando e reabrir o bundle pelo Finder e pelo Spotlight; confirmar reutilização e foco.
 - [ ] Suspender o Mac durante debounce e durante episódio ativo; após wake, confirmar ausência de alerta falso ou duplicado.
+
+Os itens abertos acima registram o limite real do ambiente de release — macOS 26.5.2, um único display interno e sem sessão de validação assistida por VoiceOver — e não são alegações de execução. Os contratos automatizados cobrem as transições de estado; hardware e tecnologias assistivas ainda pedem uma rodada manual dedicada.
 
 As verificações seguem as orientações da Apple para [acessibilidade](https://developer.apple.com/design/human-interface-guidelines/accessibility/), [cores semânticas](https://developer.apple.com/design/human-interface-guidelines/color/) e [interação por teclado no macOS](https://developer.apple.com/design/human-interface-guidelines/designing-for-macos/).

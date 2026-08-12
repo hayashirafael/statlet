@@ -5,7 +5,6 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 output_dir="${1:-$repo_root/dist}"
 target="${STATLET_TARGET:-aarch64-apple-darwin}"
-version="1.0.0"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 
 if [[ -z "$output_dir" || "$output_dir" == "/" ]]; then
@@ -19,11 +18,18 @@ fi
 
 staging="$(mktemp -d "${TMPDIR:-/tmp}/statlet-release.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
+cargo_target="$staging/cargo-target"
+version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo_root/Cargo.toml" | head -1)"
+if [[ -z "$version" ]]; then
+    echo "Could not read the Statlet version from Cargo.toml" >&2
+    exit 1
+fi
 
 cargo build \
     --manifest-path "$repo_root/Cargo.toml" \
     --release \
     --locked \
+    --target-dir "$cargo_target" \
     --target "$target"
 
 app="$staging/Statlet.app"
@@ -32,7 +38,7 @@ resources="$contents/Resources"
 iconset="$staging/AppIcon.iconset"
 
 mkdir -p "$contents/MacOS" "$resources" "$iconset"
-install -m 0755 "$repo_root/target/$target/release/statlet" "$contents/MacOS/Statlet"
+install -m 0755 "$cargo_target/$target/release/statlet" "$contents/MacOS/Statlet"
 install -m 0644 "$repo_root/packaging/Info.plist" "$contents/Info.plist"
 install -m 0644 "$repo_root/packaging/PrivacyInfo.xcprivacy" "$resources/PrivacyInfo.xcprivacy"
 install -m 0644 "$repo_root/LICENSE" "$resources/LICENSE"

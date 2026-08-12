@@ -9,6 +9,7 @@ interval="${3:-10}"
 output_dir="${4:-$(pwd)/dist/soak}"
 executable="$app/Contents/MacOS/Statlet"
 scenario="${STATLET_SOAK_SCENARIO:-Idle menu-bar sampling; Mole integration disabled; no UI interaction during samples}"
+preferences_path="$HOME/Library/Application Support/Statlet/preferences.json"
 
 if [[ -z "$output_dir" || "$output_dir" == "/" ]]; then
     echo "Refusing unsafe soak output directory: '$output_dir'" >&2
@@ -18,6 +19,14 @@ fi
 if [[ ! -x "$executable" ]]; then
     echo "Missing Statlet executable at $executable" >&2
     exit 1
+fi
+if [[ -f "$preferences_path" ]] && grep -Eq '"moleIntegrationEnabled"[[:space:]]*:[[:space:]]*true' "$preferences_path"; then
+    echo "Mole integration is enabled in $preferences_path; refusing to label this as an idle baseline" >&2
+    exit 1
+fi
+mole_preference="disabled (default; preferences file absent)"
+if [[ -f "$preferences_path" ]]; then
+    mole_preference="disabled (verified in preferences.json)"
 fi
 if ! [[ "$duration" =~ ^[0-9]+$ && "$interval" =~ ^[0-9]+$ && "$duration" -ge "$interval" && "$interval" -gt 0 ]]; then
     echo "Duration and interval must be positive integers, with duration >= interval" >&2
@@ -136,6 +145,7 @@ physical_peak="$(awk '/^[[:space:]]+phys_footprint_peak:/ { print $2; exit }' "$
     echo "- Signature: ${signature}; ${signature_flags}"
     echo "- Host: ${hardware_model}, ${processor}, ${architecture}, macOS ${os_version} (${os_build})"
     echo "- Scenario: ${scenario}"
+    echo "- Mole integration: ${mole_preference}"
     echo "- Requested duration: ${duration} seconds; observed duration: ${elapsed_last} seconds"
     echo "- Warm-up excluded from samples: ${warmup_seconds} seconds"
     echo "- Requested sampling interval: ${interval} seconds"
