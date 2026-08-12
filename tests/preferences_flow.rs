@@ -1,4 +1,21 @@
-use statlet::core::{AppEffect, AppEvent, Preferences, StatletCore, WarningThreshold, WindowKind};
+use statlet::core::{
+    AppEffect, AppEvent, IndicatorPreferenceChange, Preferences, PreferencesSaveResult,
+    PreferencesSaveStatus, StatletCore, WarningThreshold, WindowKind,
+};
+use statlet::indicator_preferences::{MetricKind, MetricsRefreshInterval, SrgbColor};
+
+fn change_color(hex: &str) -> IndicatorPreferenceChange {
+    IndicatorPreferenceChange::SetMetricSharedColor {
+        metric: MetricKind::Cpu,
+        color: SrgbColor::parse_hex(hex).unwrap(),
+    }
+}
+
+fn change_interval(seconds: u8) -> IndicatorPreferenceChange {
+    IndicatorPreferenceChange::SetRefreshInterval(
+        MetricsRefreshInterval::try_from(seconds).unwrap(),
+    )
+}
 
 #[test]
 fn defaults_keep_disk_sampling_inactive() {
@@ -116,4 +133,35 @@ fn warning_threshold_accepts_only_five_point_steps_from_70_to_95() {
     for invalid in [0, 69, 71, 94, 96, 100] {
         assert!(WarningThreshold::try_from(invalid).is_err());
     }
+}
+
+#[test]
+fn save_failure_keeps_session_state_and_retry_uses_the_latest_document() {
+    let mut app = StatletCore::new();
+    app.handle(AppEvent::UpdateIndicator(change_color("#AF52DE")));
+
+    app.handle(AppEvent::PreferencesSaveFinished(
+        PreferencesSaveResult::Failed,
+    ));
+
+    assert_eq!(
+        app.state().preferences_save_status,
+        PreferencesSaveStatus::Failed
+    );
+
+    app.handle(AppEvent::UpdateIndicator(change_interval(9)));
+
+    assert_eq!(
+        app.handle(AppEvent::RetrySavePreferences),
+        vec![AppEffect::SavePreferences(app.state().preferences.clone())]
+    );
+
+    app.handle(AppEvent::PreferencesSaveFinished(
+        PreferencesSaveResult::Saved,
+    ));
+
+    assert_eq!(
+        app.state().preferences_save_status,
+        PreferencesSaveStatus::Saved
+    );
 }

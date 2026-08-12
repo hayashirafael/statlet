@@ -2,7 +2,11 @@ use std::time::Duration;
 
 use crate::disk::DiskObservation;
 use crate::history::HistoryEventKind;
-use crate::indicator_preferences::IndicatorPreferences;
+use crate::indicator_preferences::{
+    AppearanceColors, FontFamilyPreference, FontSize, FontWeight, IndicatorAppearance,
+    IndicatorPreferenceGroup, IndicatorPreferences, LabelColorMode, MetricColorMode,
+    MetricColorPreferences, MetricKind, MetricsRefreshInterval, SrgbColor,
+};
 use crate::mole::MoleStatus;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,9 +73,11 @@ pub struct AppState {
     pub preferences: Preferences,
     pub latest_disk_observation: Option<DiskObservation>,
     pub mole_status: MoleStatus,
+    pub can_undo_indicator_reset: bool,
+    pub preferences_save_status: PreferencesSaveStatus,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AppEvent {
     ApplicationLaunched,
     ApplicationReopened { has_visible_windows: bool },
@@ -88,6 +94,58 @@ pub enum AppEvent {
     MoleStatusObserved(MoleStatus),
     OpenMoleInTerminal,
     ClearHistoryConfirmed,
+    UpdateIndicator(IndicatorPreferenceChange),
+    ResetIndicatorGroup(IndicatorPreferenceGroup),
+    ResetIndicatorConfirmed,
+    UndoIndicatorReset,
+    PreferencesWindowClosed,
+    RetrySavePreferences,
+    PreferencesSaveFinished(PreferencesSaveResult),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreferencesSaveStatus {
+    Saved,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreferencesSaveResult {
+    Saved,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndicatorPreferenceChange {
+    SetMetricColorMode {
+        metric: MetricKind,
+        mode: MetricColorMode,
+    },
+    SetMetricSharedColor {
+        metric: MetricKind,
+        color: SrgbColor,
+    },
+    SetMetricVariantsEnabled {
+        metric: MetricKind,
+        enabled: bool,
+    },
+    SetMetricAppearanceColor {
+        metric: MetricKind,
+        appearance: IndicatorAppearance,
+        color: SrgbColor,
+    },
+    SetLabelsVisible(bool),
+    SetLabelColorMode(LabelColorMode),
+    SetLabelSharedColor(SrgbColor),
+    SetLabelVariantsEnabled(bool),
+    SetLabelAppearanceColor {
+        appearance: IndicatorAppearance,
+        color: SrgbColor,
+    },
+    SetFontFamily(FontFamilyPreference),
+    SetFontWeight(FontWeight),
+    SetRefreshInterval(MetricsRefreshInterval),
+    SetFontSize(FontSize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,6 +157,8 @@ pub enum WindowKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppEffect {
+    RedrawIndicator,
+    SetMetricsSamplingInterval(MetricsRefreshInterval),
     ShowWindow(WindowKind),
     SavePreferences(Preferences),
     SetDiskSamplingEnabled(bool),
@@ -154,6 +214,7 @@ pub struct StatletCore {
     disk_episode: DiskEpisode,
     last_mole_block: Option<HistoryEventKind>,
     monitoring_failure_active: bool,
+    indicator_reset_undo: Option<IndicatorPreferences>,
 }
 
 impl StatletCore {
@@ -174,11 +235,14 @@ impl StatletCore {
                 preferences,
                 latest_disk_observation: None,
                 mole_status: MoleStatus::Unknown,
+                can_undo_indicator_reset: false,
+                preferences_save_status: PreferencesSaveStatus::Saved,
             },
             system_snapshot,
             disk_episode: DiskEpisode::default(),
             last_mole_block: None,
             monitoring_failure_active: false,
+            indicator_reset_undo: None,
         };
         let mut effects = vec![AppEffect::SetDiskSamplingEnabled(disk_sampling_enabled)];
         if disk_sampling_enabled {
@@ -316,7 +380,70 @@ impl StatletCore {
                 }
             }
             AppEvent::ClearHistoryConfirmed => vec![AppEffect::ClearHistory],
+            AppEvent::UpdateIndicator(change) => {
+                let previous_interval = self.state.preferences.indicator.refresh_interval;
+                if !change.apply(&mut self.state.preferences.indicator) {
+                    return Vec::new();
+                }
+                self.indicator_effects(previous_interval)
+            }
+            AppEvent::ResetIndicatorGroup(group) => {
+                let previous = self.state.preferences.indicator.clone();
+                self.state.preferences.indicator.reset(group);
+                if self.state.preferences.indicator == previous {
+                    return Vec::new();
+                }
+                self.indicator_effects(previous.refresh_interval)
+            }
+            AppEvent::ResetIndicatorConfirmed => {
+                let previous = self.state.preferences.indicator.clone();
+                self.indicator_reset_undo = Some(previous.clone());
+                self.state.can_undo_indicator_reset = true;
+                self.state.preferences.indicator = IndicatorPreferences::default();
+                if self.state.preferences.indicator == previous {
+                    return Vec::new();
+                }
+                self.indicator_effects(previous.refresh_interval)
+            }
+            AppEvent::UndoIndicatorReset => {
+                let Some(previous) = self.indicator_reset_undo.take() else {
+                    return Vec::new();
+                };
+                self.state.can_undo_indicator_reset = false;
+                let current_interval = self.state.preferences.indicator.refresh_interval;
+                if self.state.preferences.indicator == previous {
+                    return Vec::new();
+                }
+                self.state.preferences.indicator = previous;
+                self.indicator_effects(current_interval)
+            }
+            AppEvent::PreferencesWindowClosed => {
+                self.indicator_reset_undo = None;
+                self.state.can_undo_indicator_reset = false;
+                Vec::new()
+            }
+            AppEvent::RetrySavePreferences => {
+                vec![AppEffect::SavePreferences(self.state.preferences.clone())]
+            }
+            AppEvent::PreferencesSaveFinished(result) => {
+                self.state.preferences_save_status = match result {
+                    PreferencesSaveResult::Saved => PreferencesSaveStatus::Saved,
+                    PreferencesSaveResult::Failed => PreferencesSaveStatus::Failed,
+                };
+                Vec::new()
+            }
         }
+    }
+
+    fn indicator_effects(&self, previous_interval: MetricsRefreshInterval) -> Vec<AppEffect> {
+        let mut effects = Vec::with_capacity(3);
+        let current_interval = self.state.preferences.indicator.refresh_interval;
+        if current_interval != previous_interval {
+            effects.push(AppEffect::SetMetricsSamplingInterval(current_interval));
+        }
+        effects.push(AppEffect::RedrawIndicator);
+        effects.push(AppEffect::SavePreferences(self.state.preferences.clone()));
+        effects
     }
 
     fn refresh_status(&mut self) {
@@ -329,6 +456,104 @@ impl StatletCore {
         };
         self.state.status = present(self.system_snapshot, disk_badge);
     }
+}
+
+impl IndicatorPreferenceChange {
+    fn apply(self, indicator: &mut IndicatorPreferences) -> bool {
+        match self {
+            Self::SetMetricColorMode { metric, mode } => {
+                replace_if_changed(&mut metric_colors(indicator, metric).mode, mode)
+            }
+            Self::SetMetricSharedColor { metric, color } => {
+                replace_if_changed(&mut metric_colors(indicator, metric).fixed.shared, color)
+            }
+            Self::SetMetricVariantsEnabled { metric, enabled } => {
+                let fixed = &mut metric_colors(indicator, metric).fixed;
+                let before = *fixed;
+                fixed.set_variants_enabled(enabled);
+                *fixed != before
+            }
+            Self::SetMetricAppearanceColor {
+                metric,
+                appearance,
+                color,
+            } => {
+                let fixed = &mut metric_colors(indicator, metric).fixed;
+                set_appearance_color(fixed.shared, &mut fixed.variants, appearance, color)
+            }
+            Self::SetLabelsVisible(visible) => {
+                replace_if_changed(&mut indicator.labels.visible, visible)
+            }
+            Self::SetLabelColorMode(mode) => {
+                replace_if_changed(&mut indicator.labels.color_mode, mode)
+            }
+            Self::SetLabelSharedColor(color) => {
+                replace_if_changed(&mut indicator.labels.fixed.shared, color)
+            }
+            Self::SetLabelVariantsEnabled(enabled) => {
+                let fixed = &mut indicator.labels.fixed;
+                let before = *fixed;
+                fixed.set_variants_enabled(enabled);
+                *fixed != before
+            }
+            Self::SetLabelAppearanceColor { appearance, color } => {
+                let fixed = &mut indicator.labels.fixed;
+                set_appearance_color(fixed.shared, &mut fixed.variants, appearance, color)
+            }
+            Self::SetFontFamily(family) => {
+                replace_if_changed(&mut indicator.typography.family, family)
+            }
+            Self::SetFontWeight(weight) => {
+                replace_if_changed(&mut indicator.typography.weight, weight)
+            }
+            Self::SetRefreshInterval(interval) => {
+                replace_if_changed(&mut indicator.refresh_interval, interval)
+            }
+            Self::SetFontSize(size) => replace_if_changed(&mut indicator.typography.size, size),
+        }
+    }
+}
+
+fn metric_colors(
+    indicator: &mut IndicatorPreferences,
+    metric: MetricKind,
+) -> &mut MetricColorPreferences {
+    match metric {
+        MetricKind::Cpu => &mut indicator.cpu_color,
+        MetricKind::Ram => &mut indicator.ram_color,
+    }
+}
+
+fn replace_if_changed<T: PartialEq>(target: &mut T, value: T) -> bool {
+    if *target == value {
+        return false;
+    }
+    *target = value;
+    true
+}
+
+fn set_appearance_color(
+    shared: SrgbColor,
+    variants: &mut Option<AppearanceColors>,
+    appearance: IndicatorAppearance,
+    color: SrgbColor,
+) -> bool {
+    if variants.is_none() && color == shared {
+        return false;
+    }
+    let variants = variants.get_or_insert(AppearanceColors {
+        light: shared,
+        dark: shared,
+    });
+    let target = match appearance {
+        IndicatorAppearance::Light => &mut variants.light,
+        IndicatorAppearance::Dark => &mut variants.dark,
+    };
+    if *target == color {
+        return false;
+    }
+    *target = color;
+    true
 }
 
 impl Default for StatletCore {

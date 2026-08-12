@@ -194,6 +194,7 @@ impl RuntimeAdapters {
         let mut pending = effects.iter().cloned().collect::<VecDeque<_>>();
         while let Some(effect) = pending.pop_front() {
             match effect {
+                AppEffect::RedrawIndicator | AppEffect::SetMetricsSamplingInterval(_) => {}
                 AppEffect::ShowWindow(kind) => {
                     if let Some(windows) = &mut self.windows {
                         windows.show(kind, core.state(), &self.history);
