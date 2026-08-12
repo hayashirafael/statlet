@@ -4,5 +4,6 @@ pub mod history;
 pub mod indicator;
 pub mod indicator_preferences;
 pub mod metrics;
+pub mod metrics_schedule;
 pub mod mole;
 pub mod preferences;

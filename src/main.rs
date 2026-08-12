@@ -14,6 +14,8 @@ use statlet::core::{AppEffect, AppEvent, Preferences, PreferencesSaveResult, Sta
 use statlet::disk::macos::{ContinuousClock, StartupVolumeSampler};
 use statlet::disk::DiskSamplingSchedule;
 use statlet::history::{History, HistoryStore};
+use statlet::indicator_preferences::MetricsRefreshInterval;
+use statlet::metrics_schedule::MetricsSamplingSchedule;
 use statlet::mole::{MoleDetection, MoleDetector, MoleInstallation, MoleStatus};
 use statlet::preferences::PreferencesStore;
 use tao::event::{Event, StartCause};
@@ -27,8 +29,6 @@ use macos::renderer::Renderer;
 use macos::sampler::MacSampler;
 use macos::windows::WindowManager;
 use macos::RuntimeEvent;
-
-const METRICS_REFRESH: Duration = Duration::from_secs(2);
 
 fn main() {
     let mut event_loop = EventLoopBuilder::<RuntimeEvent>::with_user_event().build();
@@ -73,6 +73,7 @@ fn main() {
         HistoryStore::for_current_user().expect("resolve the current user's history directory");
     let history = history_store.load();
     let initial_preferences = preferences_store.load();
+    let initial_metrics_interval = initial_preferences.indicator.refresh_interval;
     let (mut core, startup_effects) = StatletCore::with_preferences(initial_preferences);
     let mut runtime = RuntimeAdapters::new(
         preferences_store,
@@ -80,6 +81,7 @@ fn main() {
         history,
         review_space_item,
         proxy.clone(),
+        initial_metrics_interval,
     );
     let renderer = Renderer::new();
     // tray-icon removes the status item when its owner is dropped.
@@ -103,22 +105,20 @@ fn main() {
             runtime.initialize_native(marker, proxy.clone());
             let _ = proxy.send_event(RuntimeEvent::App(AppEvent::ApplicationLaunched));
             let _ = runtime.apply_effects(&startup_effects, &mut core);
-            let disk_effects = runtime
-                .samplers
-                .refresh(&mut core, &renderer, button.as_deref());
-            let _ = runtime.apply_effects(&disk_effects, &mut core);
-            *control_flow = ControlFlow::WaitUntil(Instant::now() + METRICS_REFRESH);
+            let sampling_effects =
+                poll_due_and_render(&mut runtime, &mut core, &renderer, button.as_deref());
+            let _ = runtime.apply_effects(&sampling_effects, &mut core);
+            set_next_wakeup(control_flow, &runtime.samplers);
         }
         Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
             if button.is_none() {
                 let marker = MainThreadMarker::new().expect("main-thread event loop");
                 button = macos::renderer::status_button(marker);
             }
-            let disk_effects = runtime
-                .samplers
-                .refresh(&mut core, &renderer, button.as_deref());
-            let _ = runtime.apply_effects(&disk_effects, &mut core);
-            *control_flow = ControlFlow::WaitUntil(Instant::now() + METRICS_REFRESH);
+            let sampling_effects =
+                poll_due_and_render(&mut runtime, &mut core, &renderer, button.as_deref());
+            let _ = runtime.apply_effects(&sampling_effects, &mut core);
+            set_next_wakeup(control_flow, &runtime.samplers);
         }
         Event::UserEvent(runtime_event) => {
             let effects = match runtime_event {
@@ -134,6 +134,8 @@ fn main() {
             };
             if runtime.apply_effects(&effects, &mut core) {
                 *control_flow = ControlFlow::Exit;
+            } else {
+                set_next_wakeup(control_flow, &runtime.samplers);
             }
         }
         Event::Reopen {
@@ -147,6 +149,25 @@ fn main() {
         }
         _ => {}
     });
+}
+
+fn poll_due_and_render(
+    runtime: &mut RuntimeAdapters,
+    core: &mut StatletCore,
+    renderer: &Renderer,
+    button: Option<&objc2_app_kit::NSStatusBarButton>,
+) -> Vec<AppEffect> {
+    objc2::rc::autoreleasepool(|_| {
+        let effects = runtime.samplers.poll_due(core);
+        if let Some(button) = button {
+            renderer.set_status(button, &core.state().status);
+        }
+        effects
+    })
+}
+
+fn set_next_wakeup(control_flow: &mut ControlFlow, samplers: &RuntimeSamplers) {
+    *control_flow = ControlFlow::WaitUntil(Instant::now() + samplers.next_wakeup_in());
 }
 
 struct RuntimeAdapters {
@@ -167,13 +188,14 @@ impl RuntimeAdapters {
         history: History,
         review_space_item: MenuItem,
         proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
+        metrics_interval: MetricsRefreshInterval,
     ) -> Self {
         Self {
             preferences_store,
             history_store,
             history,
             windows: None,
-            samplers: RuntimeSamplers::new(),
+            samplers: RuntimeSamplers::new(metrics_interval),
             mole: RuntimeMole::new(proxy),
             notifications: None,
             review_space_item,
@@ -194,7 +216,10 @@ impl RuntimeAdapters {
         let mut pending = effects.iter().cloned().collect::<VecDeque<_>>();
         while let Some(effect) = pending.pop_front() {
             match effect {
-                AppEffect::RedrawIndicator | AppEffect::SetMetricsSamplingInterval(_) => {}
+                AppEffect::RedrawIndicator => {}
+                AppEffect::SetMetricsSamplingInterval(interval) => {
+                    self.samplers.reschedule_metrics(interval);
+                }
                 AppEffect::ShowWindow(kind) => {
                     if let Some(windows) = &mut self.windows {
                         windows.show(kind, core.state(), &self.history);
@@ -272,7 +297,7 @@ fn save_preferences(
     preferences: Preferences,
     core: &mut StatletCore,
 ) -> Vec<AppEffect> {
-    let result = match store.save(preferences) {
+    let result = match store.save(preferences.clone()) {
         Ok(()) => PreferencesSaveResult::Saved,
         Err(error) => {
             eprintln!("Statlet could not save preferences: {error}");
@@ -365,20 +390,23 @@ impl RuntimeMole {
 
 struct RuntimeSamplers {
     metrics: MacSampler,
+    metrics_schedule: MetricsSamplingSchedule,
     disk: StartupVolumeSampler,
     disk_schedule: DiskSamplingSchedule,
     clock: ContinuousClock,
 }
 
 impl RuntimeSamplers {
-    fn new() -> Self {
+    fn new(metrics_interval: MetricsRefreshInterval) -> Self {
         let mut metrics = MacSampler::new();
         metrics.prime_cpu();
+        let clock = ContinuousClock::new().expect("initialize the macOS continuous clock");
         Self {
             metrics,
+            metrics_schedule: MetricsSamplingSchedule::new_due_now(clock.now(), metrics_interval),
             disk: StartupVolumeSampler::new(),
             disk_schedule: DiskSamplingSchedule::new(),
-            clock: ContinuousClock::new().expect("initialize the macOS continuous clock"),
+            clock,
         }
     }
 
@@ -386,45 +414,92 @@ impl RuntimeSamplers {
         self.disk_schedule.set_enabled(enabled, self.clock.now());
     }
 
-    fn refresh(
-        &mut self,
-        core: &mut StatletCore,
-        renderer: &Renderer,
-        button: Option<&objc2_app_kit::NSStatusBarButton>,
-    ) -> Vec<AppEffect> {
-        objc2::rc::autoreleasepool(|_| {
+    fn poll_due(&mut self, core: &mut StatletCore) -> Vec<AppEffect> {
+        let now = self.clock.now();
+        if self.metrics_schedule.take_due(now) {
             if let Some(snapshot) = self.metrics.sample() {
                 core.handle(AppEvent::MetricsSample(snapshot));
             }
-            let now = self.clock.now();
-            let effects = if self.disk_schedule.take_due(now) {
-                match self.disk.sample(now) {
-                    Ok(observation) => core.handle(AppEvent::DiskObserved(observation)),
-                    Err(error) => {
-                        eprintln!("Statlet could not sample the startup volume: {error:?}");
-                        core.handle(AppEvent::DiskMonitoringFailed)
-                    }
+        }
+        if self.disk_schedule.take_due(now) {
+            match self.disk.sample(now) {
+                Ok(observation) => core.handle(AppEvent::DiskObserved(observation)),
+                Err(error) => {
+                    eprintln!("Statlet could not sample the startup volume: {error:?}");
+                    core.handle(AppEvent::DiskMonitoringFailed)
                 }
-            } else {
-                Vec::new()
-            };
-            let state = core.state();
-            if let Some(button) = button {
-                renderer.set_status(button, &state.status);
             }
-            effects
-        })
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn reschedule_metrics(&mut self, interval: MetricsRefreshInterval) {
+        self.metrics_schedule.reschedule(self.clock.now(), interval);
+    }
+
+    fn next_wakeup_in(&self) -> Duration {
+        let now = self.clock.now();
+        let metrics = self.metrics_schedule.remaining(now);
+        self.disk_schedule
+            .remaining(now)
+            .map_or(metrics, |disk| disk.min(metrics))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::Duration;
 
     use statlet::core::{Preferences, PreferencesSaveStatus};
+    use statlet::indicator_preferences::MetricsRefreshInterval;
     use tempfile::tempdir;
 
-    use super::{save_preferences, PreferencesStore, StatletCore};
+    use super::{save_preferences, PreferencesStore, RuntimeSamplers, StatletCore};
+
+    #[test]
+    fn runtime_constructor_uses_the_loaded_metrics_interval() {
+        let mut samplers = RuntimeSamplers::new(MetricsRefreshInterval::try_from(60).unwrap());
+        let now = samplers.clock.now();
+
+        assert!(samplers.metrics_schedule.take_due(now));
+        assert_eq!(
+            samplers.metrics_schedule.remaining(now),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn next_wakeup_uses_disk_when_it_is_due_before_metrics() {
+        let mut samplers = RuntimeSamplers::new(MetricsRefreshInterval::try_from(60).unwrap());
+        samplers.reschedule_metrics(MetricsRefreshInterval::try_from(60).unwrap());
+        samplers.set_disk_sampling_enabled(true);
+
+        assert_eq!(samplers.next_wakeup_in(), Duration::ZERO);
+    }
+
+    #[test]
+    fn runtime_reschedules_metrics_without_moving_the_disk_deadline() {
+        let mut samplers = RuntimeSamplers::new(MetricsRefreshInterval::try_from(2).unwrap());
+        let before_reschedule = samplers.clock.now();
+        samplers.disk_schedule.set_enabled(true, before_reschedule);
+        assert!(samplers.disk_schedule.take_due(before_reschedule));
+        let disk_deadline = samplers.disk_schedule.remaining(Duration::ZERO);
+
+        samplers.reschedule_metrics(MetricsRefreshInterval::try_from(30).unwrap());
+
+        let after_reschedule = samplers.clock.now();
+        let metrics_deadline = samplers.metrics_schedule.remaining(Duration::ZERO);
+        assert!(
+            metrics_deadline >= before_reschedule + Duration::from_secs(30)
+                && metrics_deadline <= after_reschedule + Duration::from_secs(30)
+        );
+        assert_eq!(
+            samplers.disk_schedule.remaining(Duration::ZERO),
+            disk_deadline
+        );
+    }
 
     #[test]
     fn runtime_save_reports_real_failure_and_later_success_to_the_reducer() {

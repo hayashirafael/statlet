@@ -193,6 +193,12 @@ impl MetricsRefreshInterval {
     }
 }
 
+impl Default for MetricsRefreshInterval {
+    fn default() -> Self {
+        Self(2)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndicatorPreferences {
     pub cpu_color: MetricColorPreferences,
@@ -260,7 +266,7 @@ impl Default for IndicatorPreferences {
                 size: FontSize(12),
                 weight: FontWeight::Medium,
             },
-            refresh_interval: MetricsRefreshInterval(2),
+            refresh_interval: MetricsRefreshInterval::default(),
         }
     }
 }
