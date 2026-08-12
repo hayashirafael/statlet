@@ -28,6 +28,21 @@ pub struct VisualEnvironment {
     pub reduce_transparency: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreviewAppearanceName {
+    Aqua,
+    DarkAqua,
+    HighContrastAqua,
+    HighContrastDarkAqua,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreviewVisualPlan {
+    pub light_appearance: PreviewAppearanceName,
+    pub dark_appearance: PreviewAppearanceName,
+    pub background_opacity: f64,
+}
+
 impl VisualEnvironment {
     pub fn current(button: Option<&NSStatusBarButton>, marker: MainThreadMarker) -> Self {
         let appearance = button.map_or_else(
@@ -46,6 +61,22 @@ impl VisualEnvironment {
             differentiate_without_color: workspace
                 .accessibilityDisplayShouldDifferentiateWithoutColor(),
             reduce_transparency: workspace.accessibilityDisplayShouldReduceTransparency(),
+        }
+    }
+
+    pub fn preview_plan(self) -> PreviewVisualPlan {
+        let (light_appearance, dark_appearance) = if self.increase_contrast {
+            (
+                PreviewAppearanceName::HighContrastAqua,
+                PreviewAppearanceName::HighContrastDarkAqua,
+            )
+        } else {
+            (PreviewAppearanceName::Aqua, PreviewAppearanceName::DarkAqua)
+        };
+        PreviewVisualPlan {
+            light_appearance,
+            dark_appearance,
+            background_opacity: if self.reduce_transparency { 1.0 } else { 0.82 },
         }
     }
 }
@@ -300,9 +331,11 @@ mod tests {
 
     use super::{
         enqueue_visual_event, notification_center_for, NotificationCenterKind, ObservationBackend,
-        ObserverTokens, VisualEnvironmentSignal, VisualEventSink,
+        ObserverTokens, PreviewAppearanceName, VisualEnvironment, VisualEnvironmentSignal,
+        VisualEventSink,
     };
     use crate::macos::RuntimeEvent;
+    use statlet::indicator_preferences::IndicatorAppearance;
 
     #[derive(Default)]
     struct FakeState {
@@ -412,6 +445,38 @@ mod tests {
                 NotificationCenterKind::Default
             );
         }
+    }
+
+    #[test]
+    fn preview_visual_plan_derives_appearances_and_background_opacity_from_accessibility() {
+        let standard = VisualEnvironment {
+            appearance: IndicatorAppearance::Light,
+            increase_contrast: false,
+            differentiate_without_color: false,
+            reduce_transparency: false,
+        }
+        .preview_plan();
+        assert_eq!(
+            [standard.light_appearance, standard.dark_appearance],
+            [PreviewAppearanceName::Aqua, PreviewAppearanceName::DarkAqua]
+        );
+        assert_eq!(standard.background_opacity, 0.82);
+
+        let accessible = VisualEnvironment {
+            appearance: IndicatorAppearance::Dark,
+            increase_contrast: true,
+            differentiate_without_color: true,
+            reduce_transparency: true,
+        }
+        .preview_plan();
+        assert_eq!(
+            [accessible.light_appearance, accessible.dark_appearance],
+            [
+                PreviewAppearanceName::HighContrastAqua,
+                PreviewAppearanceName::HighContrastDarkAqua,
+            ]
+        );
+        assert_eq!(accessible.background_opacity, 1.0);
     }
 
     #[test]

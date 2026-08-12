@@ -89,8 +89,8 @@ define_class!(
             let alert = NSAlert::new(mtm);
             alert.setAlertStyle(NSAlertStyle::Warning);
             alert.setMessageText(ns_string!("Restaurar o indicador aos padrões?"));
-            alert.setInformativeText(ns_string!(
-                "Somente as preferências do indicador serão restauradas. Disco e Mole não serão alterados."
+            alert.setInformativeText(&objc2_foundation::NSString::from_str(
+                indicator_reset_confirmation(),
             ));
             let destructive = alert.addButtonWithTitle(ns_string!("Restaurar indicador"));
             destructive.setHasDestructiveAction(true);
@@ -206,6 +206,10 @@ pub(super) fn should_intercept_indicator_undo(
     can_undo_indicator_reset && command_only && characters_ignoring_modifiers == "z"
 }
 
+fn indicator_reset_confirmation() -> &'static str {
+    "CPU/RAM, rótulos, tipografia e intervalo serão restaurados aos padrões. Disco e Mole não serão alterados."
+}
+
 pub(super) fn create_window(
     mtm: MainThreadMarker,
     title: &str,
@@ -243,4 +247,19 @@ pub(super) fn text_label(
 
 pub(super) fn threshold_title(threshold: WarningThreshold) -> Retained<objc2_foundation::NSString> {
     objc2_foundation::NSString::from_str(&format!("{}%", threshold.get()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::indicator_reset_confirmation;
+
+    #[test]
+    fn global_reset_confirmation_summarizes_every_indicator_group_and_safety_boundary() {
+        let summary = indicator_reset_confirmation();
+
+        for group in ["CPU/RAM", "rótulos", "tipografia", "intervalo"] {
+            assert!(summary.contains(group), "missing {group} in {summary}");
+        }
+        assert!(summary.contains("Disco e Mole não serão alterados"));
+    }
 }

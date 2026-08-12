@@ -1,33 +1,17 @@
 use objc2::rc::Retained;
 use objc2::MainThreadOnly;
 use objc2_app_kit::{
-    NSAccessibility, NSColor, NSFont, NSImageScaling, NSImageView, NSStackView, NSTextField, NSView,
+    NSAccessibility, NSColor, NSFont, NSImageScaling, NSImageView, NSLineBreakMode, NSScrollView,
+    NSStackView, NSTextField, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
-use statlet::indicator::LayoutDiagnostics;
-use statlet::indicator_preferences::{FontFamilyPreference, SrgbColor};
+use statlet::indicator::{LayoutDiagnostics, PreviewBackground};
+use statlet::indicator_preferences::FontFamilyPreference;
 
 use super::super::{IndicatorFontFallback, PreviewContrastWarnings};
 use crate::macos::environment::VisualEnvironment;
 use crate::macos::fonts::FontResolution;
 use crate::macos::renderer::PreviewImages;
-
-const SMALL_TEXT_CONTRAST_THRESHOLD: f64 = 4.5;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PreviewBackground {
-    Light,
-    Dark,
-}
-
-impl PreviewBackground {
-    const fn components(self) -> [f64; 3] {
-        match self {
-            Self::Light => [1.0, 1.0, 1.0],
-            Self::Dark => [30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0],
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PreviewFallback<'a> {
@@ -37,8 +21,22 @@ struct PreviewFallback<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PreviewText {
-    summary: String,
-    warnings: String,
+    light_description: String,
+    dark_description: String,
+    shared_warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WarningRegionContract {
+    maximum_number_of_lines: isize,
+    scrollable: bool,
+}
+
+const fn warning_region_contract() -> WarningRegionContract {
+    WarningRegionContract {
+        maximum_number_of_lines: 0,
+        scrollable: true,
+    }
 }
 
 fn preview_text(
@@ -47,95 +45,72 @@ fn preview_text(
     environment: &VisualEnvironment,
     contrast: PreviewContrastWarnings,
 ) -> PreviewText {
-    let mut warnings = Vec::new();
-    if contrast.light {
-        warnings.push("O contraste da prévia clara pode ficar abaixo de 4,5:1.".to_owned());
-    }
-    if contrast.dark {
-        warnings.push("O contraste da prévia escura pode ficar abaixo de 4,5:1.".to_owned());
-    }
+    let mut shared_warnings = Vec::new();
     match (layout.exceeds_menu_bar_height, layout.exceeds_curated_width) {
-        (true, true) => warnings.push(
+        (true, true) => shared_warnings.push(
             "A tipografia pode cortar as linhas na altura e ocupar largura excessiva.".to_owned(),
         ),
-        (true, false) => {
-            warnings.push("A tipografia pode cortar as linhas na altura da menu bar.".to_owned())
-        }
-        (false, true) => {
-            warnings.push("A tipografia pode ocupar largura excessiva na menu bar.".to_owned())
-        }
+        (true, false) => shared_warnings
+            .push("A tipografia pode cortar as linhas na altura da menu bar.".to_owned()),
+        (false, true) => shared_warnings
+            .push("A tipografia pode ocupar largura excessiva na menu bar.".to_owned()),
         (false, false) => {}
     }
     if let Some(fallback) = fallback {
-        warnings.push(format!(
+        shared_warnings.push(format!(
             "A fonte {} não está disponível; usando {} sem alterar sua escolha.",
             fallback.requested_family, fallback.resolved_family
         ));
     }
     if environment.increase_contrast {
-        warnings.push(
-            "Aumentar Contraste está ativo; as cores semânticas foram resolvidas novamente."
+        shared_warnings.push(
+            "Aumentar Contraste está ativo; as cores semânticas das prévias usam as aparências de alto contraste do macOS."
                 .to_owned(),
         );
     }
     if environment.differentiate_without_color {
-        warnings.push(
+        shared_warnings.push(
             "Diferenciar Sem Cor está ativo; valores e badges com símbolos permanecem visíveis."
                 .to_owned(),
         );
     }
     if environment.reduce_transparency {
-        warnings.push(
-            "Reduzir Transparência está ativo; o fundo representativo da prévia foi atualizado."
+        shared_warnings.push(
+            "Reduzir Transparência está ativo; os fundos representativos usam preenchimento opaco."
                 .to_owned(),
         );
     }
-    warnings.push(
+    shared_warnings.push(
         "As prévias não reproduzem papel de parede, transparência nem todo estado real da menu bar."
             .to_owned(),
     );
 
     PreviewText {
-        summary: "Prévias Claro e Escuro do indicador em escala aproximada da menu bar.".to_owned(),
-        warnings: warnings.join(" "),
+        light_description: appearance_description("clara", contrast.light),
+        dark_description: appearance_description("escura", contrast.dark),
+        shared_warnings,
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn contrast_warning(
-    foreground: SrgbColor,
-    background: PreviewBackground,
-) -> Option<f64> {
-    let foreground = foreground
-        .components()
-        .map(|component| f64::from(component) / 255.0);
-    let ratio = contrast_ratio(foreground, background.components());
-    (ratio < SMALL_TEXT_CONTRAST_THRESHOLD).then_some(ratio)
-}
-
-fn contrast_ratio(left: [f64; 3], right: [f64; 3]) -> f64 {
-    let left = relative_luminance(left);
-    let right = relative_luminance(right);
-    (left.max(right) + 0.05) / (left.min(right) + 0.05)
-}
-
-fn relative_luminance(color: [f64; 3]) -> f64 {
-    let [red, green, blue] = color.map(|component| {
-        if component <= 0.04045 {
-            component / 12.92
-        } else {
-            ((component + 0.055) / 1.055).powf(2.4)
-        }
-    });
-    0.2126 * red + 0.7152 * green + 0.0722 * blue
+fn appearance_description(appearance: &str, low_contrast: bool) -> String {
+    let mut description =
+        format!("Prévia {appearance} do indicador em escala aproximada da menu bar.");
+    if low_contrast {
+        description.push_str(" Aviso: o contraste pode ficar abaixo de 4,5:1.");
+    }
+    description
 }
 
 pub(super) struct PreviewPane {
     view: Retained<NSStackView>,
+    light_background: Retained<NSTextField>,
+    dark_background: Retained<NSTextField>,
     light_image: Retained<NSImageView>,
     dark_image: Retained<NSImageView>,
-    summary: Retained<NSTextField>,
+    light_description: Retained<NSTextField>,
+    dark_description: Retained<NSTextField>,
     warnings: Retained<NSTextField>,
+    warnings_scroll: Retained<NSScrollView>,
 }
 
 impl PreviewPane {
@@ -165,24 +140,41 @@ impl PreviewPane {
             mtm,
             NSRect::new(NSPoint::new(320.0, 94.0), NSSize::new(292.0, 22.0)),
         );
-        let summary = preview_label(
+        let light_description = wrapped_preview_label(
             mtm,
-            "Prévias Claro e Escuro do indicador em escala aproximada da menu bar.",
-            NSRect::new(NSPoint::new(0.0, 58.0), NSSize::new(616.0, 20.0)),
+            "Prévia clara do indicador em escala aproximada da menu bar.",
+            NSRect::new(NSPoint::new(0.0, 56.0), NSSize::new(300.0, 32.0)),
         );
-        summary.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(
+        light_description.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(
             accessibility_identifiers[0],
         )));
-        let warnings = preview_label(
+        let dark_description = wrapped_preview_label(
             mtm,
-            "As prévias não reproduzem papel de parede, transparência nem todo estado real da menu bar.",
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(616.0, 54.0)),
+            "Prévia escura do indicador em escala aproximada da menu bar.",
+            NSRect::new(NSPoint::new(316.0, 56.0), NSSize::new(300.0, 32.0)),
         );
-        warnings.setMaximumNumberOfLines(3);
-        warnings.setTextColor(Some(&NSColor::secondaryLabelColor()));
-        warnings.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(
+        dark_description.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(
             accessibility_identifiers[1],
         )));
+        let warnings_scroll = NSScrollView::initWithFrame(
+            NSScrollView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(616.0, 52.0)),
+        );
+        let warning_contract = warning_region_contract();
+        warnings_scroll.setHasVerticalScroller(warning_contract.scrollable);
+        warnings_scroll.setAutohidesScrollers(true);
+        warnings_scroll.setDrawsBackground(false);
+        let warnings = wrapped_preview_label(
+            mtm,
+            "• As prévias não reproduzem papel de parede, transparência nem todo estado real da menu bar.",
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(598.0, 52.0)),
+        );
+        warnings.setMaximumNumberOfLines(warning_contract.maximum_number_of_lines);
+        warnings.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        warnings.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(
+            "indicator.preview.warnings",
+        )));
+        warnings_scroll.setDocumentView(Some(&warnings));
 
         for child in [
             &*light_background as &NSView,
@@ -191,18 +183,23 @@ impl PreviewPane {
             &*dark_heading,
             &*light_image,
             &*dark_image,
-            &*summary,
-            &*warnings,
+            &*light_description,
+            &*dark_description,
+            &*warnings_scroll,
         ] {
             view.addSubview(child);
         }
 
         Self {
             view,
+            light_background,
+            dark_background,
             light_image,
             dark_image,
-            summary,
+            light_description,
+            dark_description,
             warnings,
+            warnings_scroll,
         }
     }
 
@@ -254,11 +251,23 @@ impl PreviewPane {
         environment: &VisualEnvironment,
         contrast: PreviewContrastWarnings,
     ) {
+        let preview_plan = environment.preview_plan();
+        apply_preview_background(
+            &self.light_background,
+            PreviewBackground::Light,
+            preview_plan.background_opacity,
+        );
+        apply_preview_background(
+            &self.dark_background,
+            PreviewBackground::Dark,
+            preview_plan.background_opacity,
+        );
         self.light_image.setImage(Some(&images.light));
         self.dark_image.setImage(Some(&images.dark));
         let text = preview_text(layout, fallback, environment, contrast);
-        set_preview_text(&self.summary, &text.summary);
-        set_preview_text(&self.warnings, &text.warnings);
+        set_preview_text(&self.light_description, &text.light_description);
+        set_preview_text(&self.dark_description, &text.dark_description);
+        set_warning_text(&self.warnings, &self.warnings_scroll, &text.shared_warnings);
     }
 }
 
@@ -268,13 +277,17 @@ fn preview_background(
     background: PreviewBackground,
 ) -> Retained<NSTextField> {
     let field = preview_label(mtm, "", frame);
-    let [red, green, blue] = background.components();
     field.setDrawsBackground(true);
-    field.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
-        red, green, blue, 1.0,
-    )));
+    apply_preview_background(&field, background, 0.82);
     field.setAccessibilityElement(false);
     field
+}
+
+fn apply_preview_background(field: &NSTextField, background: PreviewBackground, opacity: f64) {
+    let [red, green, blue] = background.components();
+    field.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+        red, green, blue, opacity,
+    )));
 }
 
 fn preview_heading(mtm: MainThreadMarker, title: &str, x: f64) -> Retained<NSTextField> {
@@ -300,10 +313,37 @@ fn preview_label(mtm: MainThreadMarker, text: &str, frame: NSRect) -> Retained<N
     field
 }
 
+fn wrapped_preview_label(
+    mtm: MainThreadMarker,
+    text: &str,
+    frame: NSRect,
+) -> Retained<NSTextField> {
+    let field = preview_label(mtm, text, frame);
+    field.setUsesSingleLineMode(false);
+    field.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+    field.setMaximumNumberOfLines(0);
+    field
+}
+
 fn set_preview_text(field: &NSTextField, text: &str) {
     let text = objc2_foundation::NSString::from_str(text);
     field.setStringValue(&text);
     field.setAccessibilityLabel(Some(&text));
+}
+
+fn set_warning_text(field: &NSTextField, scroll: &NSScrollView, warnings: &[String]) {
+    let text = warnings
+        .iter()
+        .map(|warning| format!("• {warning}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    set_preview_text(field, &text);
+    let viewport = scroll.contentSize();
+    let measured = field.sizeThatFits(NSSize::new(viewport.width, f64::MAX));
+    field.setFrameSize(NSSize::new(
+        viewport.width,
+        measured.height.max(viewport.height),
+    ));
 }
 
 fn family_name(family: &FontFamilyPreference) -> &str {
@@ -315,37 +355,13 @@ fn family_name(family: &FontFamilyPreference) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use super::{preview_text, warning_region_contract, PreviewContrastWarnings, PreviewFallback};
+    use crate::macos::environment::VisualEnvironment;
     use statlet::indicator::LayoutDiagnostics;
     use statlet::indicator_preferences::IndicatorAppearance;
-    use statlet::indicator_preferences::SrgbColor;
-
-    use super::{
-        contrast_warning, preview_text, PreviewBackground, PreviewContrastWarnings, PreviewFallback,
-    };
-    use crate::macos::environment::VisualEnvironment;
 
     #[test]
-    fn small_text_below_four_point_five_to_one_warns_without_replacing_color() {
-        let chosen = SrgbColor::parse_hex("#777777").unwrap();
-
-        let warning = contrast_warning(chosen, PreviewBackground::Light);
-
-        assert!(warning.is_some());
-        assert_eq!(chosen.to_hex(), "#777777");
-    }
-
-    #[test]
-    fn high_contrast_small_text_on_the_dark_preview_does_not_warn() {
-        let chosen = SrgbColor::parse_hex("#FFFFFF").unwrap();
-
-        let warning = contrast_warning(chosen, PreviewBackground::Dark);
-
-        assert!(warning.is_none());
-        assert_eq!(chosen.to_hex(), "#FFFFFF");
-    }
-
-    #[test]
-    fn preview_text_exposes_accessibility_states_and_real_world_limitations() {
+    fn preview_text_keeps_appearance_descriptions_separate_from_shared_warnings() {
         let text = preview_text(
             &LayoutDiagnostics {
                 exceeds_menu_bar_height: true,
@@ -367,15 +383,43 @@ mod tests {
             },
         );
 
-        assert!(text.summary.contains("Claro e Escuro"));
-        assert!(text.warnings.contains("contraste da prévia clara"));
-        assert!(text.warnings.contains("altura"));
-        assert!(text.warnings.contains("largura"));
-        assert!(text.warnings.contains("Fonte ausente"));
-        assert!(text.warnings.contains("Aumentar Contraste"));
-        assert!(text.warnings.contains("símbolos"));
-        assert!(text.warnings.contains("Reduzir Transparência"));
-        assert!(text.warnings.contains("papel de parede"));
-        assert!(text.warnings.contains("estado real"));
+        assert!(text.light_description.contains("Prévia clara"));
+        assert!(text.light_description.contains("contraste"));
+        assert!(!text.light_description.contains("Prévia escura"));
+        assert!(text.dark_description.contains("Prévia escura"));
+        assert!(!text.dark_description.contains("contraste"));
+        assert!(!text.dark_description.contains("Prévia clara"));
+        assert!(text
+            .shared_warnings
+            .iter()
+            .any(|warning| warning.contains("altura") && warning.contains("largura")));
+        assert!(text
+            .shared_warnings
+            .iter()
+            .any(|warning| warning.contains("Fonte ausente")));
+        assert!(text
+            .shared_warnings
+            .iter()
+            .any(|warning| warning.contains("Aumentar Contraste")));
+        assert!(text
+            .shared_warnings
+            .iter()
+            .any(|warning| warning.contains("símbolos")));
+        assert!(text
+            .shared_warnings
+            .iter()
+            .any(|warning| warning.contains("Reduzir Transparência")));
+        assert!(text
+            .shared_warnings
+            .iter()
+            .any(|warning| warning.contains("papel de parede") && warning.contains("estado real")));
+    }
+
+    #[test]
+    fn warning_region_is_scrollable_and_never_limits_visible_lines() {
+        let contract = warning_region_contract();
+
+        assert_eq!(contract.maximum_number_of_lines, 0);
+        assert!(contract.scrollable);
     }
 }

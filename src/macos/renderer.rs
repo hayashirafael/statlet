@@ -753,8 +753,8 @@ mod tests {
     use std::cell::Cell;
 
     use statlet::indicator::{
-        measure_stable_layout, IndicatorRun, IndicatorScene, SegmentColor, SemanticColor,
-        TextMeasurer,
+        has_low_text_contrast, measure_stable_layout, IndicatorRun, IndicatorScene,
+        PreviewBackground, SegmentColor, SemanticColor, TextMeasurer,
     };
     use statlet::indicator_preferences::{FontWeight, SrgbColor};
 
@@ -952,23 +952,6 @@ mod tests {
         }
     }
 
-    fn test_contrast_ratio(left: [f64; 3], right: [f64; 3]) -> f64 {
-        fn luminance(color: [f64; 3]) -> f64 {
-            let [red, green, blue] = color.map(|component| {
-                if component <= 0.04045 {
-                    component / 12.92
-                } else {
-                    ((component + 0.055) / 1.055).powf(2.4)
-                }
-            });
-            0.2126 * red + 0.7152 * green + 0.0722 * blue
-        }
-
-        let left = luminance(left);
-        let right = luminance(right);
-        (left.max(right) + 0.05) / (left.min(right) + 0.05)
-    }
-
     #[test]
     fn aqua_semantic_runs_resolve_to_srgb_before_contrast_diagnostics() {
         let appearance =
@@ -977,9 +960,7 @@ mod tests {
         let colors = resolved_scene_srgb_colors(&semantic_warning_scene(), &appearance);
 
         assert_eq!(colors.len(), 2);
-        assert!(colors
-            .into_iter()
-            .all(|color| test_contrast_ratio(color, [1.0, 1.0, 1.0]) < 4.5));
+        assert!(has_low_text_contrast(&colors, PreviewBackground::Light));
     }
 
     #[test]
@@ -987,15 +968,10 @@ mod tests {
         let appearance =
             NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameDarkAqua })
                 .unwrap();
-        let dark_background = 30.0 / 255.0;
-
         let colors = resolved_scene_srgb_colors(&semantic_warning_scene(), &appearance);
 
         assert_eq!(colors.len(), 2);
-        assert!(colors.into_iter().all(|color| test_contrast_ratio(
-            color,
-            [dark_background, dark_background, dark_background]
-        ) >= 4.5));
+        assert!(!has_low_text_contrast(&colors, PreviewBackground::Dark));
     }
 
     #[test]

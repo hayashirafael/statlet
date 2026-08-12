@@ -10,12 +10,18 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
+use objc2_app_kit::{
+    NSAppearance, NSAppearanceNameAccessibilityHighContrastAqua,
+    NSAppearanceNameAccessibilityHighContrastDarkAqua, NSAppearanceNameAqua,
+    NSAppearanceNameDarkAqua,
+};
 use statlet::core::{AppEffect, AppEvent, Preferences, PreferencesSaveResult, StatletCore};
 use statlet::disk::macos::{ContinuousClock, StartupVolumeSampler};
 use statlet::disk::DiskSamplingSchedule;
 use statlet::history::{History, HistoryStore};
-use statlet::indicator::{compose_indicator, IndicatorScene};
+use statlet::indicator::{
+    compose_indicator, has_low_text_contrast, IndicatorScene, PreviewBackground,
+};
 use statlet::indicator_preferences::{IndicatorAppearance, MetricsRefreshInterval};
 use statlet::metrics_schedule::MetricsSamplingSchedule;
 use statlet::mole::{MoleDetection, MoleDetector, MoleInstallation, MoleStatus};
@@ -26,7 +32,7 @@ use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-use macos::environment::{VisualEnvironment, VisualEnvironmentObserver};
+use macos::environment::{PreviewAppearanceName, VisualEnvironment, VisualEnvironmentObserver};
 use macos::notifications::NotificationManager;
 use macos::renderer::{resolved_scene_srgb_colors, PreviewImages, RenderSlot, Renderer};
 use macos::sampler::MacSampler;
@@ -520,10 +526,9 @@ impl RuntimeAdapters {
         );
         let dark_scene =
             compose_indicator(&core.state().status, preferences, IndicatorAppearance::Dark);
-        let light_appearance = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameAqua })
-            .expect("Aqua appearance is available on macOS");
-        let dark_appearance = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua })
-            .expect("Dark Aqua appearance is available on macOS");
+        let preview_plan = environment.preview_plan();
+        let light_appearance = preview_appearance(preview_plan.light_appearance);
+        let dark_appearance = preview_appearance(preview_plan.dark_appearance);
         let light = renderer.render(
             RenderSlot::PreviewLight,
             &light_scene,
@@ -563,6 +568,22 @@ impl RuntimeAdapters {
     }
 }
 
+fn preview_appearance(name: PreviewAppearanceName) -> objc2::rc::Retained<NSAppearance> {
+    let name = unsafe {
+        match name {
+            PreviewAppearanceName::Aqua => NSAppearanceNameAqua,
+            PreviewAppearanceName::DarkAqua => NSAppearanceNameDarkAqua,
+            PreviewAppearanceName::HighContrastAqua => {
+                NSAppearanceNameAccessibilityHighContrastAqua
+            }
+            PreviewAppearanceName::HighContrastDarkAqua => {
+                NSAppearanceNameAccessibilityHighContrastDarkAqua
+            }
+        }
+    };
+    NSAppearance::appearanceNamed(name).expect("named preview appearance is available on macOS")
+}
+
 fn preview_contrast_warnings(
     light_scene: &IndicatorScene,
     light_appearance: &NSAppearance,
@@ -571,37 +592,10 @@ fn preview_contrast_warnings(
 ) -> PreviewContrastWarnings {
     let light_colors = resolved_scene_srgb_colors(light_scene, light_appearance);
     let dark_colors = resolved_scene_srgb_colors(dark_scene, dark_appearance);
-    let dark_background = 30.0 / 255.0;
     PreviewContrastWarnings {
-        light: colors_have_low_contrast(&light_colors, [1.0, 1.0, 1.0]),
-        dark: colors_have_low_contrast(
-            &dark_colors,
-            [dark_background, dark_background, dark_background],
-        ),
+        light: has_low_text_contrast(&light_colors, PreviewBackground::Light),
+        dark: has_low_text_contrast(&dark_colors, PreviewBackground::Dark),
     }
-}
-
-fn colors_have_low_contrast(colors: &[[f64; 3]], background: [f64; 3]) -> bool {
-    colors
-        .iter()
-        .any(|color| contrast_ratio(*color, background) < 4.5)
-}
-
-fn contrast_ratio(left: [f64; 3], right: [f64; 3]) -> f64 {
-    let left = relative_luminance(left);
-    let right = relative_luminance(right);
-    (left.max(right) + 0.05) / (left.min(right) + 0.05)
-}
-
-fn relative_luminance(color: [f64; 3]) -> f64 {
-    let [red, green, blue] = color.map(|component| {
-        if component <= 0.04045 {
-            component / 12.92
-        } else {
-            ((component + 0.055) / 1.055).powf(2.4)
-        }
-    });
-    0.2126 * red + 0.7152 * green + 0.0722 * blue
 }
 
 fn save_preferences(

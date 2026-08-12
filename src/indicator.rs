@@ -34,6 +34,44 @@ pub struct IndicatorScene {
     pub accessibility_label: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreviewBackground {
+    Light,
+    Dark,
+}
+
+impl PreviewBackground {
+    pub const fn components(self) -> [f64; 3] {
+        match self {
+            Self::Light => [1.0, 1.0, 1.0],
+            Self::Dark => [30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0],
+        }
+    }
+}
+
+pub fn has_low_text_contrast(colors: &[[f64; 3]], background: PreviewBackground) -> bool {
+    const SMALL_TEXT_CONTRAST_THRESHOLD: f64 = 4.5;
+
+    colors.iter().any(|color| {
+        let foreground_luminance = relative_luminance(*color);
+        let background_luminance = relative_luminance(background.components());
+        let ratio = (foreground_luminance.max(background_luminance) + 0.05)
+            / (foreground_luminance.min(background_luminance) + 0.05);
+        ratio < SMALL_TEXT_CONTRAST_THRESHOLD
+    })
+}
+
+fn relative_luminance(color: [f64; 3]) -> f64 {
+    let [red, green, blue] = color.map(|component| {
+        if component <= 0.04045 {
+            component / 12.92
+        } else {
+            ((component + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    0.2126 * red + 0.7152 * green + 0.0722 * blue
+}
+
 pub fn compose_indicator(
     status: &StatusContent,
     preferences: &IndicatorPreferences,
@@ -168,4 +206,22 @@ fn widest_metric_width(measurer: &impl TextMeasurer, label: &str, labels_visible
             measurer.width(&text)
         })
         .fold(0.0, f64::max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_low_text_contrast, PreviewBackground};
+
+    #[test]
+    fn shared_contrast_function_applies_wcag_small_text_threshold_to_both_backgrounds() {
+        let gray = 119.0 / 255.0;
+        assert!(has_low_text_contrast(
+            &[[gray, gray, gray]],
+            PreviewBackground::Light
+        ));
+        assert!(!has_low_text_contrast(
+            &[[1.0, 1.0, 1.0]],
+            PreviewBackground::Dark
+        ));
+    }
 }
