@@ -91,6 +91,10 @@ impl ControlTarget {
         let this = Self::alloc(mtm).set_ivars(ControlTargetIvars { proxy });
         unsafe { msg_send![super(this), init] }
     }
+
+    pub(super) fn event_proxy(&self) -> EventLoopProxy<RuntimeEvent> {
+        self.ivars().proxy.clone()
+    }
 }
 
 pub(super) fn create_window(

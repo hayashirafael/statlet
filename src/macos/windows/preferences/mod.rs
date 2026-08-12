@@ -4,12 +4,13 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAccessibility, NSButton, NSControlStateValueOn, NSImageView, NSLayoutConstraint,
+    NSAccessibility, NSButton, NSColorWell, NSControlStateValueOn, NSImageView, NSLayoutConstraint,
     NSPopUpButton, NSScrollView, NSSegmentSwitchTracking, NSSegmentedControl, NSStackView,
     NSTextField, NSView, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    ns_string, MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint,
+    NSRect, NSSize,
 };
 use statlet::core::{AppState, WarningThreshold};
 
@@ -20,6 +21,11 @@ use super::{
 };
 use crate::macos::environment::VisualEnvironment;
 use crate::macos::renderer::PreviewImages;
+
+mod color_editor;
+mod indicator;
+
+use indicator::IndicatorControls;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum PreferencesArea {
@@ -115,6 +121,7 @@ struct PreferencesControlTargetIvars {
     state: RefCell<PreferencesAreaState>,
     indicator: Retained<NSView>,
     disk_and_mole: Retained<NSView>,
+    color_wells: Vec<Retained<NSColorWell>>,
 }
 
 define_class!(
@@ -136,6 +143,11 @@ define_class!(
             let state = self.ivars().state.borrow().select(area);
             self.ivars().state.replace(state);
             let visible = state.visible();
+            if visible == PreferencesArea::DiskAndMole {
+                for well in &self.ivars().color_wells {
+                    well.deactivate();
+                }
+            }
             self.ivars()
                 .indicator
                 .setHidden(!state.is_visible(PreferencesArea::Indicator));
@@ -151,11 +163,13 @@ impl PreferencesControlTarget {
         mtm: MainThreadMarker,
         indicator: Retained<NSView>,
         disk_and_mole: Retained<NSView>,
+        color_wells: Vec<Retained<NSColorWell>>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(PreferencesControlTargetIvars {
             state: RefCell::new(PreferencesAreaState::new()),
             indicator,
             disk_and_mole,
+            color_wells,
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -164,16 +178,27 @@ impl PreferencesControlTarget {
 define_class!(
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
-    #[ivars = ()]
+    #[ivars = PreferencesWindowDelegateIvars]
     struct PreferencesWindowDelegate;
 
     unsafe impl NSObjectProtocol for PreferencesWindowDelegate {}
-    unsafe impl NSWindowDelegate for PreferencesWindowDelegate {}
+    unsafe impl NSWindowDelegate for PreferencesWindowDelegate {
+        #[unsafe(method(windowWillClose:))]
+        fn window_will_close(&self, _notification: &NSNotification) {
+            for well in &self.ivars().color_wells {
+                well.deactivate();
+            }
+        }
+    }
 );
 
+struct PreferencesWindowDelegateIvars {
+    color_wells: Vec<Retained<NSColorWell>>,
+}
+
 impl PreferencesWindowDelegate {
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(());
+    fn new(mtm: MainThreadMarker, color_wells: Vec<Retained<NSColorWell>>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(PreferencesWindowDelegateIvars { color_wells });
         unsafe { msg_send![super(this), init] }
     }
 }
@@ -184,6 +209,7 @@ struct IndicatorPage {
     dark_image: Retained<NSImageView>,
     light_description: Retained<NSTextField>,
     dark_description: Retained<NSTextField>,
+    controls: IndicatorControls,
     _groups_scroll: Retained<NSScrollView>,
     _groups_stack: Retained<NSStackView>,
     _preview_stack: Retained<NSStackView>,
@@ -226,14 +252,18 @@ impl PreferencesWindow {
             .contentView()
             .expect("preferences window content view");
 
-        let indicator = create_indicator_page(mtm, contract);
+        let indicator = create_indicator_page(mtm, contract, target.event_proxy());
         let disk_and_mole = create_disk_and_mole_page(mtm, target);
         disk_and_mole.root.setHidden(true);
         content.addSubview(&indicator.root);
         content.addSubview(&disk_and_mole.root);
 
-        let area_target =
-            PreferencesControlTarget::new(mtm, indicator.root.clone(), disk_and_mole.root.clone());
+        let area_target = PreferencesControlTarget::new(
+            mtm,
+            indicator.root.clone(),
+            disk_and_mole.root.clone(),
+            indicator.controls.wells(),
+        );
         let labels = contract.selector_labels();
         let label_strings = [
             objc2_foundation::NSString::from_str(labels[0]),
@@ -268,8 +298,11 @@ impl PreferencesWindow {
         NSLayoutConstraint::activateConstraints(&constraints);
 
         let footer = create_footer(mtm, contract, &indicator.root);
+        unsafe {
+            area_selector.setNextKeyView(Some(indicator.controls.first_key_view()));
+        }
         window.setInitialFirstResponder(Some(&area_selector));
-        let delegate = PreferencesWindowDelegate::new(mtm);
+        let delegate = PreferencesWindowDelegate::new(mtm, indicator.controls.wells());
         window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
         Self {
@@ -302,6 +335,7 @@ impl PreferencesWindow {
         self.disk_and_mole
             .warning_threshold
             .setEnabled(state.preferences.mole_integration_enabled);
+        self.indicator.controls.apply(&state.preferences.indicator);
         if let Some(previews) = previews {
             self.set_preview_images(previews);
         }
@@ -357,6 +391,7 @@ impl PreferencesWindow {
 fn create_indicator_page(
     mtm: MainThreadMarker,
     contract: PreferencesShellContract,
+    proxy: tao::event_loop::EventLoopProxy<crate::macos::RuntimeEvent>,
 ) -> IndicatorPage {
     let root = NSView::initWithFrame(
         NSView::alloc(mtm),
@@ -417,20 +452,16 @@ fn create_indicator_page(
     groups_scroll.setAccessibilityLabel(Some(ns_string!("Grupos de preferências do indicador")));
     let groups_document = NSView::initWithFrame(
         NSView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(612.0, 520.0)),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(612.0, 860.0)),
     );
     let groups_stack = NSStackView::initWithFrame(
         NSStackView::alloc(mtm),
-        NSRect::new(NSPoint::new(16.0, 16.0), NSSize::new(580.0, 488.0)),
+        NSRect::new(NSPoint::new(16.0, 16.0), NSSize::new(580.0, 828.0)),
     );
     let _: () = unsafe { msg_send![&*groups_stack, setOrientation: 1isize] };
     groups_stack.setSpacing(24.0);
-    for title in ["CPU e RAM", "Rótulos", "Tipografia", "Atualização"] {
-        let heading =
-            NSTextField::labelWithString(&objc2_foundation::NSString::from_str(title), mtm);
-        heading.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(15.0)));
-        groups_stack.addArrangedSubview(&heading);
-    }
+    let controls = IndicatorControls::new(mtm, proxy);
+    groups_stack.addSubview(controls.view());
     groups_document.addSubview(&groups_stack);
     groups_scroll.setDocumentView(Some(&groups_document));
     root.addSubview(&groups_scroll);
@@ -441,6 +472,7 @@ fn create_indicator_page(
         dark_image,
         light_description,
         dark_description,
+        controls,
         _groups_scroll: groups_scroll,
         _groups_stack: groups_stack,
         _preview_stack: preview_stack,

@@ -7,3 +7,4 @@ pub mod metrics;
 pub mod metrics_schedule;
 pub mod mole;
 pub mod preferences;
+pub mod preferences_view;
