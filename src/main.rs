@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use objc2::MainThreadMarker;
+use objc2::{rc::Retained, MainThreadMarker};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAccessibilityHighContrastAqua,
     NSAppearanceNameAccessibilityHighContrastDarkAqua, NSAppearanceNameAqua,
@@ -188,27 +188,41 @@ fn main() {
     });
 }
 
-#[derive(Default)]
-struct VisualEnvironmentState {
+struct VisualEnvironmentState<A> {
     last: Option<VisualEnvironment>,
+    status_appearance: Option<A>,
 }
 
-impl VisualEnvironmentState {
-    fn refresh_with(&mut self, read: impl FnOnce() -> VisualEnvironment) -> bool {
-        self.record(read())
-    }
-
-    fn record(&mut self, current: VisualEnvironment) -> bool {
-        if self.last == Some(current) {
-            return false;
+impl<A> Default for VisualEnvironmentState<A> {
+    fn default() -> Self {
+        Self {
+            last: None,
+            status_appearance: None,
         }
-        self.last = Some(current);
-        true
+    }
+}
+
+impl<A> VisualEnvironmentState<A> {
+    fn refresh_with(&mut self, read: impl FnOnce() -> (VisualEnvironment, A)) -> bool {
+        let (current, status_appearance) = read();
+        self.record(current, status_appearance)
     }
 
-    fn current(&self) -> VisualEnvironment {
-        self.last
-            .expect("visual environment is captured during native initialization")
+    fn record(&mut self, current: VisualEnvironment, status_appearance: A) -> bool {
+        let changed = self.last != Some(current);
+        self.last = Some(current);
+        self.status_appearance = Some(status_appearance);
+        changed
+    }
+
+    fn current(&self) -> (VisualEnvironment, &A) {
+        (
+            self.last
+                .expect("visual environment is captured during native initialization"),
+            self.status_appearance
+                .as_ref()
+                .expect("status appearance is captured during native initialization"),
+        )
     }
 }
 
@@ -245,7 +259,7 @@ struct RuntimeAdapters {
     mole: RuntimeMole,
     notifications: Option<NotificationManager>,
     visual_environment_observer: Option<VisualEnvironmentObserver>,
-    visual_environment: VisualEnvironmentState,
+    visual_environment: VisualEnvironmentState<Retained<NSAppearance>>,
     schedule: RuntimeSchedule<Preferences>,
     review_space_item: MenuItem,
 }
@@ -487,12 +501,18 @@ impl RuntimeAdapters {
         button: Option<&objc2_app_kit::NSStatusBarButton>,
         include_previews: bool,
     ) {
-        let environment = self.visual_environment.current();
+        let (environment, status_appearance) = self.visual_environment.current();
         let preferences = &core.state().preferences.indicator;
         let status_scene =
             compose_indicator(&core.state().status, preferences, environment.appearance);
-        let status_layout = button
-            .map(|button| renderer.apply_status(button, &status_scene, &preferences.typography));
+        let status_layout = button.map(|button| {
+            renderer.apply_status(
+                button,
+                &status_scene,
+                &preferences.typography,
+                status_appearance,
+            )
+        });
 
         if !include_previews {
             return;
@@ -774,12 +794,15 @@ mod tests {
         };
         let mut state = VisualEnvironmentState::default();
 
-        assert!(state.record(standard));
-        assert!(!state.record(standard));
-        assert!(state.record(VisualEnvironment {
-            increase_contrast: true,
-            ..standard
-        }));
+        assert!(state.record(standard, "standard-aqua"));
+        assert!(!state.record(standard, "refreshed-aqua"));
+        assert!(state.record(
+            VisualEnvironment {
+                increase_contrast: true,
+                ..standard
+            },
+            "high-contrast-aqua",
+        ));
     }
 
     #[test]
@@ -791,21 +814,25 @@ mod tests {
             differentiate_without_color: false,
             reduce_transparency: false,
         };
-        let mut state = VisualEnvironmentState::default();
+        let mut state = VisualEnvironmentState::<&str>::default();
 
         assert!(state.refresh_with(|| {
             reads.set(reads.get() + 1);
-            standard
+            (standard, "retained-aqua")
         }));
         for _ in 0..10 {
-            assert_eq!(state.current(), standard);
+            let (environment, status_appearance) = state.current();
+            assert_eq!(environment, standard);
+            assert_eq!(*status_appearance, "retained-aqua");
         }
         assert_eq!(reads.get(), 1);
 
         assert!(!state.refresh_with(|| {
             reads.set(reads.get() + 1);
-            standard
+            (standard, "refreshed-aqua")
         }));
+        let (_, status_appearance) = state.current();
+        assert_eq!(*status_appearance, "refreshed-aqua");
         assert_eq!(reads.get(), 2);
     }
 

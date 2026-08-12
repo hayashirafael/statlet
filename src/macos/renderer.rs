@@ -10,9 +10,9 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread, MainThreadMarker, Message};
 use objc2_app_kit::{
-    NSAccessibility, NSAppearance, NSAppearanceCustomization, NSApplication,
-    NSAttributedStringNSStringDrawing, NSColor, NSColorSpace, NSFont, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSImage, NSStatusBarButton, NSView,
+    NSAccessibility, NSAppearance, NSApplication, NSAttributedStringNSStringDrawing, NSColor,
+    NSColorSpace, NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSImage,
+    NSStatusBarButton, NSView,
 };
 use objc2_foundation::{NSDictionary, NSMutableAttributedString, NSPoint, NSSize, NSString};
 
@@ -97,9 +97,13 @@ fn paint_identity(color: SegmentColor, appearance: &str) -> PaintIdentity {
     }
 }
 
-trait StatusMetadataTarget {
+pub(crate) trait StatusMetadataTarget {
     fn set_accessibility_label(&self, value: &str);
     fn set_tooltip(&self, value: &str);
+}
+
+pub(crate) trait StatusRenderTarget: StatusMetadataTarget {
+    fn set_status_image(&self, image: &NSImage);
 }
 
 impl StatusMetadataTarget for NSStatusBarButton {
@@ -109,6 +113,12 @@ impl StatusMetadataTarget for NSStatusBarButton {
 
     fn set_tooltip(&self, value: &str) {
         self.setToolTip(Some(&NSString::from_str(value)));
+    }
+}
+
+impl StatusRenderTarget for NSStatusBarButton {
+    fn set_status_image(&self, image: &NSImage) {
+        self.setImage(Some(image));
     }
 }
 
@@ -477,16 +487,16 @@ impl Renderer {
         }
     }
 
-    pub fn apply_status(
+    pub(crate) fn apply_status(
         &mut self,
-        button: &NSStatusBarButton,
+        target: &impl StatusRenderTarget,
         scene: &IndicatorScene,
         typography: &TypographyPreferences,
+        appearance: &NSAppearance,
     ) -> LayoutDiagnostics {
-        let appearance = button.effectiveAppearance();
-        let output = self.render(RenderSlot::Status, scene, typography, &appearance);
-        button.setImage(Some(&output.image));
-        apply_status_metadata(button, scene);
+        let output = self.render(RenderSlot::Status, scene, typography, appearance);
+        target.set_status_image(&output.image);
+        apply_status_metadata(target, scene);
         output.layout
     }
 
@@ -1035,6 +1045,7 @@ mod tests {
     struct FakeStatusTarget {
         accessibility_label: std::cell::RefCell<Option<String>>,
         tooltip: std::cell::RefCell<Option<String>>,
+        image_width: Cell<Option<f64>>,
     }
 
     impl StatusMetadataTarget for FakeStatusTarget {
@@ -1045,6 +1056,34 @@ mod tests {
         fn set_tooltip(&self, value: &str) {
             self.tooltip.replace(Some(value.to_owned()));
         }
+    }
+
+    impl StatusRenderTarget for FakeStatusTarget {
+        fn set_status_image(&self, image: &NSImage) {
+            self.image_width.set(Some(image.size().width));
+        }
+    }
+
+    #[test]
+    fn status_rendering_uses_explicit_appearance_without_a_status_button_source() {
+        let Some(marker) = MainThreadMarker::new() else {
+            eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
+            return;
+        };
+        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
+        let scene = scene_with_color(SegmentColor::Semantic(SemanticColor::Warning));
+        let aqua =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameAqua }).unwrap();
+        let target = FakeStatusTarget::default();
+
+        renderer.apply_status(&target, &scene, &typography, &aqua);
+
+        assert!(target.image_width.get().is_some_and(|width| width > 0.0));
+        assert_eq!(
+            target.accessibility_label.borrow().as_deref(),
+            Some(scene.accessibility_label.as_str())
+        );
     }
 
     #[test]
@@ -1082,7 +1121,7 @@ mod tests {
         assert_eq!(renderer.cache.slots.entries.iter().flatten().count(), 3);
 
         let button = NSStatusBarButton::new(marker);
-        renderer.apply_status(&button, &scene, &typography);
+        renderer.apply_status(&*button, &scene, &typography, &aqua);
         assert_eq!(
             button.accessibilityLabel().unwrap().to_string(),
             scene.accessibility_label

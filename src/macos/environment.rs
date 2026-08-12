@@ -44,24 +44,30 @@ pub struct PreviewVisualPlan {
 }
 
 impl VisualEnvironment {
-    pub fn current(button: Option<&NSStatusBarButton>, marker: MainThreadMarker) -> Self {
+    pub fn current(
+        button: Option<&NSStatusBarButton>,
+        marker: MainThreadMarker,
+    ) -> (Self, Retained<objc2_app_kit::NSAppearance>) {
         let appearance = button.map_or_else(
             || NSApplication::sharedApplication(marker).effectiveAppearance(),
             |button| button.effectiveAppearance(),
         );
-        let appearance = if appearance.name().to_string().contains("Dark") {
+        let indicator_appearance = if appearance.name().to_string().contains("Dark") {
             IndicatorAppearance::Dark
         } else {
             IndicatorAppearance::Light
         };
         let workspace = NSWorkspace::sharedWorkspace();
-        Self {
+        (
+            Self {
+                appearance: indicator_appearance,
+                increase_contrast: workspace.accessibilityDisplayShouldIncreaseContrast(),
+                differentiate_without_color: workspace
+                    .accessibilityDisplayShouldDifferentiateWithoutColor(),
+                reduce_transparency: workspace.accessibilityDisplayShouldReduceTransparency(),
+            },
             appearance,
-            increase_contrast: workspace.accessibilityDisplayShouldIncreaseContrast(),
-            differentiate_without_color: workspace
-                .accessibilityDisplayShouldDifferentiateWithoutColor(),
-            reduce_transparency: workspace.accessibilityDisplayShouldReduceTransparency(),
-        }
+        )
     }
 
     pub fn preview_plan(self) -> PreviewVisualPlan {
