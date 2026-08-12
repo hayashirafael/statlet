@@ -1,11 +1,11 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAccessibility, NSControlTextEditingDelegate, NSFont, NSFontManager, NSFontTraitMask,
+    NSAccessibility, NSControlTextEditingDelegate, NSEvent, NSFont, NSFontManager, NSFontTraitMask,
     NSScrollView, NSSearchField, NSTableColumn, NSTableView, NSTableViewDataSource,
     NSTableViewDelegate, NSTextField, NSUserInterfaceItemIdentifier, NSView, NSWindow,
 };
@@ -15,19 +15,46 @@ use objc2_foundation::{
 };
 use statlet::core::{AppEvent, IndicatorPreferenceChange};
 use statlet::indicator_preferences::FontFamilyPreference;
-use statlet::preferences_view::{filter_font_families, FontRow};
+use statlet::preferences_view::{filter_font_families, FontPickerInteraction, FontRow};
 use tao::event_loop::EventLoopProxy;
 
 use super::super::common::create_window;
 use crate::macos::fonts::FontCatalog;
 use crate::macos::RuntimeEvent;
 
+define_class!(
+    #[unsafe(super = NSTableView)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = ()]
+    struct KeyboardFontTable;
+
+    unsafe impl NSObjectProtocol for KeyboardFontTable {}
+
+    impl KeyboardFontTable {
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            let activates = event
+                .charactersIgnoringModifiers()
+                .is_some_and(|characters| matches!(characters.to_string().as_str(), "\r" | "\n" | "\u{3}"));
+            if activates {
+                let target = self.target();
+                unsafe {
+                    self.sendAction_to(self.action(), target.as_deref());
+                }
+            } else {
+                unsafe {
+                    let _: () = msg_send![super(self), keyDown: event];
+                }
+            }
+        }
+    }
+);
+
 struct FontPickerDataSourceIvars {
     rows: Rc<RefCell<Vec<FontRow>>>,
     families: RefCell<Vec<String>>,
     missing_selection: RefCell<Option<String>>,
     table: Retained<NSTableView>,
-    suppress_selection: Rc<Cell<bool>>,
 }
 
 define_class!(
@@ -58,14 +85,12 @@ impl FontPickerDataSource {
         mtm: MainThreadMarker,
         rows: Rc<RefCell<Vec<FontRow>>>,
         table: Retained<NSTableView>,
-        suppress_selection: Rc<Cell<bool>>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(FontPickerDataSourceIvars {
             rows,
             families: RefCell::new(Vec::new()),
             missing_selection: RefCell::new(None),
             table,
-            suppress_selection,
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -89,12 +114,10 @@ impl FontPickerDataSource {
         self.ivars()
             .rows
             .replace(filter_font_families(&families, query, missing.as_deref()));
-        self.ivars().suppress_selection.set(true);
         self.ivars().table.reloadData();
         unsafe {
             self.ivars().table.deselectAll(None);
         }
-        self.ivars().suppress_selection.set(false);
     }
 }
 
@@ -103,7 +126,6 @@ struct FontPickerDelegateIvars {
     table: Retained<NSTableView>,
     sheet: Retained<NSWindow>,
     proxy: RefCell<EventLoopProxy<RuntimeEvent>>,
-    suppress_selection: Rc<Cell<bool>>,
 }
 
 define_class!(
@@ -129,42 +151,56 @@ define_class!(
 
         #[unsafe(method(tableViewSelectionDidChange:))]
         fn table_view_selection_did_change(&self, _notification: &NSNotification) {
-            if self.ivars().suppress_selection.get() {
-                return;
-            }
             let Ok(index) = usize::try_from(self.ivars().table.selectedRow()) else {
                 return;
             };
-            let Some(row) = self.ivars().rows.borrow().get(index).cloned() else {
+            self.handle_interaction(FontPickerInteraction::NavigateTo(index));
+        }
+    }
+
+    impl FontPickerDelegate {
+        #[unsafe(method(activateFontSelection:))]
+        fn activate_font_selection(&self, sender: &NSTableView) {
+            let Ok(index) = usize::try_from(sender.selectedRow()) else {
                 return;
             };
-            let _ = self.ivars().proxy.borrow().send_event(RuntimeEvent::App(
-                AppEvent::UpdateIndicator(IndicatorPreferenceChange::SetFontFamily(
-                    row.family_preference(),
-                )),
-            ));
-            if let Some(parent) = self.ivars().sheet.sheetParent() {
-                parent.endSheet(&self.ivars().sheet);
-            }
+            self.handle_interaction(FontPickerInteraction::Activate(index));
         }
     }
 );
 
 impl FontPickerDelegate {
+    fn handle_interaction(&self, interaction: FontPickerInteraction) {
+        let Some(index) = interaction.confirmed_row() else {
+            return;
+        };
+        let Some(row) = self.ivars().rows.borrow().get(index).cloned() else {
+            return;
+        };
+        let _ =
+            self.ivars()
+                .proxy
+                .borrow()
+                .send_event(RuntimeEvent::App(AppEvent::UpdateIndicator(
+                    IndicatorPreferenceChange::SetFontFamily(row.family_preference()),
+                )));
+        if let Some(parent) = self.ivars().sheet.sheetParent() {
+            parent.endSheet(&self.ivars().sheet);
+        }
+    }
+
     fn new(
         mtm: MainThreadMarker,
         rows: Rc<RefCell<Vec<FontRow>>>,
         table: Retained<NSTableView>,
         sheet: Retained<NSWindow>,
         proxy: EventLoopProxy<RuntimeEvent>,
-        suppress_selection: Rc<Cell<bool>>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(FontPickerDelegateIvars {
             rows,
             table,
             sheet,
             proxy: RefCell::new(proxy),
-            suppress_selection,
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -199,10 +235,16 @@ impl FontPicker {
             NSRect::new(NSPoint::new(20.0, 20.0), NSSize::new(480.0, 350.0)),
         );
         scroll.setHasVerticalScroller(true);
-        let table = NSTableView::initWithFrame(
-            NSTableView::alloc(mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(480.0, 350.0)),
-        );
+        let table: Retained<KeyboardFontTable> = unsafe {
+            msg_send![
+                KeyboardFontTable::alloc(mtm),
+                initWithFrame: NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(480.0, 350.0)
+                )
+            ]
+        };
+        let table: Retained<NSTableView> = Retained::into_super(table);
         table.setAllowsMultipleSelection(false);
         table.setAllowsEmptySelection(true);
         table.setRowHeight(42.0);
@@ -217,20 +259,14 @@ impl FontPicker {
         content.addSubview(&scroll);
 
         let rows = Rc::new(RefCell::new(Vec::new()));
-        let suppress_selection = Rc::new(Cell::new(false));
-        let data_source =
-            FontPickerDataSource::new(mtm, rows.clone(), table.clone(), suppress_selection.clone());
-        let delegate = FontPickerDelegate::new(
-            mtm,
-            rows,
-            table.clone(),
-            sheet.clone(),
-            proxy.clone(),
-            suppress_selection,
-        );
+        let data_source = FontPickerDataSource::new(mtm, rows.clone(), table.clone());
+        let delegate =
+            FontPickerDelegate::new(mtm, rows, table.clone(), sheet.clone(), proxy.clone());
         unsafe {
             table.setDataSource(Some(ProtocolObject::from_ref(&*data_source)));
             table.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+            table.setTarget(Some(&*delegate as &AnyObject));
+            table.setAction(Some(sel!(activateFontSelection:)));
             search.setTarget(Some(&*data_source as &AnyObject));
             search.setAction(Some(sel!(filterFonts:)));
             search.setNextKeyView(Some(&table));
@@ -259,7 +295,6 @@ impl FontPicker {
         self.data_source
             .update(catalog.families(), missing.as_deref(), "");
 
-        self.delegate.ivars().suppress_selection.set(true);
         if let Some(index) = selected_row(&self.delegate.ivars().rows.borrow(), selected) {
             self.table.selectRowIndexes_byExtendingSelection(
                 &NSIndexSet::indexSetWithIndex(index),
@@ -267,7 +302,6 @@ impl FontPicker {
             );
             self.table.scrollRowToVisible(index as NSInteger);
         }
-        self.delegate.ivars().suppress_selection.set(false);
 
         parent.beginSheet_completionHandler(&self.sheet, None);
         self.sheet.makeFirstResponder(Some(&self.search));

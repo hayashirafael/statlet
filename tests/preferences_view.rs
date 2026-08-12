@@ -3,8 +3,8 @@ use statlet::indicator_preferences::{
 };
 use statlet::preferences_view::{
     color_well_configuration, filter_font_families, ColorEditorFocusTarget, ColorEditorRows,
-    ColorEditorState, ColorWellPresentation, FontRow, HexDraft, HexDraftError, HexEdit,
-    IntervalDraft,
+    ColorEditorState, ColorWellPresentation, FontPickerInteraction, FontRow, HexDraft,
+    HexDraftError, HexEdit, IntervalDraft,
 };
 
 #[test]
@@ -21,6 +21,20 @@ fn font_filter_is_case_insensitive_sorted_and_keeps_missing_selection_visible() 
             FontRow::Missing("Missing Family".into()),
             FontRow::Available("Avenir Next".into()),
         ]
+    );
+}
+
+#[test]
+fn font_picker_only_confirms_explicit_activation_of_the_selected_row() {
+    let preselected_row = 4;
+
+    assert_eq!(
+        FontPickerInteraction::NavigateTo(preselected_row + 1).confirmed_row(),
+        None
+    );
+    assert_eq!(
+        FontPickerInteraction::Activate(preselected_row).confirmed_row(),
+        Some(preselected_row)
     );
 }
 

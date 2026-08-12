@@ -35,6 +35,21 @@ impl FontRow {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FontPickerInteraction {
+    NavigateTo(usize),
+    Activate(usize),
+}
+
+impl FontPickerInteraction {
+    pub const fn confirmed_row(self) -> Option<usize> {
+        match self {
+            Self::NavigateTo(_) => None,
+            Self::Activate(row) => Some(row),
+        }
+    }
+}
+
 pub fn filter_font_families(
     families: &[String],
     query: &str,
