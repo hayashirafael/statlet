@@ -55,6 +55,55 @@ pub struct WindowManager {
     free_space: Option<FreeSpaceWindow>,
 }
 
+trait RetainedStateConsumer {
+    fn apply_retained_state(&self, state: &AppState);
+}
+
+impl RetainedStateConsumer for PreferencesWindow {
+    fn apply_retained_state(&self, state: &AppState) {
+        self.apply(state, None);
+    }
+}
+
+impl RetainedStateConsumer for FreeSpaceWindow {
+    fn apply_retained_state(&self, state: &AppState) {
+        self.apply(state);
+    }
+}
+
+fn prepare_preferences_for_show<'a, P, F>(
+    preferences: &'a mut Option<P>,
+    free_space: Option<&F>,
+    state: &AppState,
+    create: impl FnOnce() -> P,
+) -> &'a P
+where
+    P: RetainedStateConsumer,
+    F: RetainedStateConsumer,
+{
+    get_or_create_window(preferences, create);
+    apply_state_to_retained_windows(preferences.as_ref(), free_space, state);
+    preferences
+        .as_ref()
+        .expect("preferences window was created before applying state")
+}
+
+fn apply_state_to_retained_windows<P, F>(
+    preferences: Option<&P>,
+    free_space: Option<&F>,
+    state: &AppState,
+) where
+    P: RetainedStateConsumer,
+    F: RetainedStateConsumer,
+{
+    if let Some(window) = preferences {
+        window.apply_retained_state(state);
+    }
+    if let Some(window) = free_space {
+        window.apply_retained_state(state);
+    }
+}
+
 impl WindowManager {
     pub fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Self {
         let control_target = ControlTarget::new(mtm, proxy);
@@ -71,10 +120,12 @@ impl WindowManager {
         let window = match kind {
             WindowKind::Preferences => {
                 let target = self.control_target.clone();
-                let preferences = get_or_create_window(&mut self.preferences, || {
-                    PreferencesWindow::new(mtm, &target)
-                });
-                preferences.apply(state, None);
+                let preferences = prepare_preferences_for_show(
+                    &mut self.preferences,
+                    self.free_space.as_ref(),
+                    state,
+                    || PreferencesWindow::new(mtm, &target),
+                );
                 &preferences.window
             }
             WindowKind::History => {
@@ -110,12 +161,7 @@ impl WindowManager {
     }
 
     pub fn update_state(&self, state: &AppState) {
-        if let Some(window) = &self.preferences {
-            window.apply(state, None);
-        }
-        if let Some(window) = &self.free_space {
-            window.apply(state);
-        }
+        apply_state_to_retained_windows(self.preferences.as_ref(), self.free_space.as_ref(), state);
     }
 
     pub fn update_history(&self, history: &History) {
@@ -134,5 +180,49 @@ impl WindowManager {
         if let Some(window) = &self.preferences {
             window.apply_surfaces(surfaces);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use statlet::core::{AppState, StatletCore};
+
+    use super::{prepare_preferences_for_show, RetainedStateConsumer};
+
+    #[derive(Default)]
+    struct RecordingStateConsumer {
+        applications: RefCell<Vec<AppState>>,
+    }
+
+    impl RetainedStateConsumer for RecordingStateConsumer {
+        fn apply_retained_state(&self, state: &AppState) {
+            self.applications.borrow_mut().push(state.clone());
+        }
+    }
+
+    #[test]
+    fn opening_preferences_refreshes_a_retained_free_space_window() {
+        let state = StatletCore::new().state().clone();
+        let mut preferences = None;
+        let free_space = RecordingStateConsumer::default();
+
+        let preferences = prepare_preferences_for_show(
+            &mut preferences,
+            Some(&free_space),
+            &state,
+            RecordingStateConsumer::default,
+        );
+
+        assert_eq!(
+            preferences.applications.borrow().as_slice(),
+            std::slice::from_ref(&state)
+        );
+        assert_eq!(free_space.applications.borrow().len(), 1);
+        assert_eq!(
+            free_space.applications.borrow().as_slice(),
+            std::slice::from_ref(&state)
+        );
     }
 }
