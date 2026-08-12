@@ -23,6 +23,7 @@ use crate::macos::environment::VisualEnvironment;
 use crate::macos::renderer::PreviewImages;
 
 mod color_editor;
+mod font_picker;
 mod indicator;
 
 use indicator::IndicatorControls;
@@ -352,6 +353,9 @@ impl PreferencesWindow {
         self.set_preview_images(&previews);
         self.update_preview_description(true, contrast_warnings.light);
         self.update_preview_description(false, contrast_warnings.dark);
+        self.indicator
+            .controls
+            .apply_diagnostics(font_fallback.as_ref(), &layout);
         self.indicator_previews.replace(Some(previews));
         self.indicator_font_fallback.replace(font_fallback);
         self.indicator_contrast_warnings
@@ -452,11 +456,11 @@ fn create_indicator_page(
     groups_scroll.setAccessibilityLabel(Some(ns_string!("Grupos de preferências do indicador")));
     let groups_document = NSView::initWithFrame(
         NSView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(612.0, 860.0)),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(612.0, 1200.0)),
     );
     let groups_stack = NSStackView::initWithFrame(
         NSStackView::alloc(mtm),
-        NSRect::new(NSPoint::new(16.0, 16.0), NSSize::new(580.0, 828.0)),
+        NSRect::new(NSPoint::new(16.0, 16.0), NSSize::new(580.0, 1168.0)),
     );
     let _: () = unsafe { msg_send![&*groups_stack, setOrientation: 1isize] };
     groups_stack.setSpacing(24.0);

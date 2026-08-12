@@ -1,28 +1,43 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAccessibility, NSButton, NSColorWell, NSControlStateValueOn, NSFont, NSSegmentSwitchTracking,
-    NSSegmentedControl, NSStackView, NSTextField, NSView,
+    NSAccessibility, NSButton, NSColor, NSColorWell, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSFont, NSSegmentSwitchTracking, NSSegmentedControl, NSStackView,
+    NSStepper, NSTextField, NSTextFieldDelegate, NSView,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    ns_string, MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint,
+    NSRect, NSSize,
 };
 use statlet::core::{AppEvent, IndicatorPreferenceChange};
 use statlet::indicator_preferences::{
-    IndicatorPreferences, LabelColorMode, MetricColorMode, MetricKind,
+    FontFamilyPreference, FontSize, FontWeight, IndicatorPreferenceGroup, IndicatorPreferences,
+    LabelColorMode, MetricColorMode, MetricKind, TypographyPreferences,
 };
-use statlet::preferences_view::ColorEditorState;
+use statlet::preferences_view::{ColorEditorState, IntervalDraft};
 use tao::event_loop::EventLoopProxy;
 
 use super::color_editor::{ColorBinding, ColorEditor};
+use super::font_picker::FontPicker;
+use super::{IndicatorFontFallback, IndicatorLayoutDiagnostics};
+use crate::macos::fonts::FontCatalog;
 use crate::macos::RuntimeEvent;
 
 struct IndicatorControlsTargetIvars {
     proxy: EventLoopProxy<RuntimeEvent>,
     applying: Cell<bool>,
+    selected_family: RefCell<FontFamilyPreference>,
+    selected_font_size: Cell<FontSize>,
+    interval_draft: RefCell<IntervalDraft>,
+    font_picker: RefCell<FontPicker>,
+    font_catalog: RefCell<FontCatalog>,
+    font_size: Retained<NSTextField>,
+    interval_field: Retained<NSTextField>,
+    interval_stepper: Retained<NSStepper>,
+    interval_error: Retained<NSTextField>,
 }
 
 define_class!(
@@ -66,15 +81,86 @@ define_class!(
             };
             self.send(IndicatorPreferenceChange::SetLabelColorMode(mode));
         }
+
+        #[unsafe(method(openFontPicker:))]
+        fn open_font_picker(&self, sender: &NSButton) {
+            let Some(parent) = sender.window() else {
+                return;
+            };
+            let mut catalog = self.ivars().font_catalog.borrow_mut();
+            catalog.refresh();
+            let selected = self.ivars().selected_family.borrow().clone();
+            let mut picker = self.ivars().font_picker.borrow_mut();
+            picker.refresh_catalog(&catalog);
+            picker.present(&parent, &catalog, &selected);
+        }
+
+        #[unsafe(method(commitFontSize:))]
+        fn commit_font_size_action(&self, sender: &NSTextField) {
+            self.commit_font_size(sender);
+        }
+
+        #[unsafe(method(changeFontWeight:))]
+        fn change_font_weight(&self, sender: &NSSegmentedControl) {
+            if self.ivars().applying.get() {
+                return;
+            }
+            let weight = match sender.selectedSegment() {
+                0 => FontWeight::Regular,
+                2 => FontWeight::Bold,
+                _ => FontWeight::Medium,
+            };
+            self.send(IndicatorPreferenceChange::SetFontWeight(weight));
+        }
+
+        #[unsafe(method(resetTypography:))]
+        fn reset_typography(&self, _sender: &NSButton) {
+            if self.ivars().applying.get() {
+                return;
+            }
+            self.send_event(AppEvent::ResetIndicatorGroup(
+                IndicatorPreferenceGroup::Typography,
+            ));
+        }
+
+        #[unsafe(method(commitRefreshInterval:))]
+        fn commit_refresh_interval_action(&self, sender: &NSTextField) {
+            self.commit_refresh_interval(sender);
+        }
+
+        #[unsafe(method(stepRefreshInterval:))]
+        fn step_refresh_interval(&self, sender: &NSStepper) {
+            if self.ivars().applying.get() {
+                return;
+            }
+            let text = sender.integerValue().to_string();
+            self.commit_refresh_interval_text(&text);
+        }
     }
+
+    unsafe impl NSControlTextEditingDelegate for IndicatorControlsTarget {
+        #[unsafe(method(controlTextDidEndEditing:))]
+        fn control_text_did_end_editing(&self, notification: &NSNotification) {
+            if self.ivars().applying.get() {
+                return;
+            }
+            let Some(field) = notification_text_field(notification) else {
+                return;
+            };
+            if std::ptr::eq(&*field, &*self.ivars().font_size) {
+                self.commit_font_size(&field);
+            } else if std::ptr::eq(&*field, &*self.ivars().interval_field) {
+                self.commit_refresh_interval(&field);
+            }
+        }
+    }
+
+    unsafe impl NSTextFieldDelegate for IndicatorControlsTarget {}
 );
 
 impl IndicatorControlsTarget {
-    fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(IndicatorControlsTargetIvars {
-            proxy,
-            applying: Cell::new(false),
-        });
+    fn new(mtm: MainThreadMarker, ivars: IndicatorControlsTargetIvars) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ivars);
         unsafe { msg_send![super(this), init] }
     }
 
@@ -91,10 +177,62 @@ impl IndicatorControlsTarget {
     }
 
     fn send(&self, change: IndicatorPreferenceChange) {
-        let _ = self
-            .ivars()
-            .proxy
-            .send_event(RuntimeEvent::App(AppEvent::UpdateIndicator(change)));
+        self.send_event(AppEvent::UpdateIndicator(change));
+    }
+
+    fn send_event(&self, event: AppEvent) {
+        let _ = self.ivars().proxy.send_event(RuntimeEvent::App(event));
+    }
+
+    fn commit_font_size(&self, field: &NSTextField) {
+        if self.ivars().applying.get() {
+            return;
+        }
+        let size = field
+            .stringValue()
+            .to_string()
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .and_then(|points| FontSize::try_from(points).ok());
+        let Some(size) = size else {
+            field.setStringValue(&objc2_foundation::NSString::from_str(
+                &self.ivars().selected_font_size.get().points().to_string(),
+            ));
+            return;
+        };
+        field.setStringValue(&objc2_foundation::NSString::from_str(
+            &size.points().to_string(),
+        ));
+        if size != self.ivars().selected_font_size.replace(size) {
+            self.send(IndicatorPreferenceChange::SetFontSize(size));
+        }
+    }
+
+    fn commit_refresh_interval(&self, field: &NSTextField) {
+        self.commit_refresh_interval_text(&field.stringValue().to_string());
+    }
+
+    fn commit_refresh_interval_text(&self, text: &str) {
+        let previous = self.ivars().interval_draft.borrow().valid_interval();
+        let result = self.ivars().interval_draft.borrow_mut().commit(text);
+        match result {
+            Ok(interval) => {
+                self.ivars()
+                    .interval_field
+                    .setStringValue(&objc2_foundation::NSString::from_str(
+                        &interval.seconds().to_string(),
+                    ));
+                self.ivars()
+                    .interval_stepper
+                    .setIntegerValue(interval.seconds().into());
+                set_inline_error(&self.ivars().interval_error, None);
+                if interval != previous {
+                    self.send(IndicatorPreferenceChange::SetRefreshInterval(interval));
+                }
+            }
+            Err(error) => set_inline_error(&self.ivars().interval_error, Some(error.message())),
+        }
     }
 }
 
@@ -104,6 +242,15 @@ pub(super) struct IndicatorControls {
     ram_mode: Retained<NSSegmentedControl>,
     labels_visible: Retained<NSButton>,
     labels_mode: Retained<NSSegmentedControl>,
+    font_family: Retained<NSButton>,
+    font_size: Retained<NSTextField>,
+    font_weight: Retained<NSSegmentedControl>,
+    font_fallback_warning: Retained<NSTextField>,
+    layout_warning: Retained<NSTextField>,
+    reset_typography: Retained<NSButton>,
+    interval_field: Retained<NSTextField>,
+    interval_stepper: Retained<NSStepper>,
+    interval_error: Retained<NSTextField>,
     cpu_editor: ColorEditor,
     ram_editor: ColorEditor,
     labels_editor: ColorEditor,
@@ -114,18 +261,18 @@ impl IndicatorControls {
     pub(super) fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Self {
         let view = NSStackView::initWithFrame(
             NSStackView::alloc(mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 820.0)),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 1160.0)),
         );
-        let target = IndicatorControlsTarget::new(mtm, proxy.clone());
 
-        let cpu_heading = heading(mtm, "CPU", 790.0);
+        let cpu_heading = heading(mtm, "CPU", 1130.0);
+        let placeholder_target = None;
         let cpu_mode = segmented(
             mtm,
             &["Dinâmica", "Fixa"],
             "indicator.cpu.mode",
-            NSRect::new(NSPoint::new(100.0, 756.0), NSSize::new(240.0, 28.0)),
-            &target,
-            sel!(changeCpuColorMode:),
+            NSRect::new(NSPoint::new(100.0, 1096.0), NSSize::new(240.0, 28.0)),
+            placeholder_target,
+            None,
         );
         let cpu_editor = ColorEditor::new(
             mtm,
@@ -133,18 +280,18 @@ impl IndicatorControls {
             proxy.clone(),
         );
         cpu_editor.view().setFrame(NSRect::new(
-            NSPoint::new(0.0, 588.0),
+            NSPoint::new(0.0, 928.0),
             NSSize::new(540.0, 160.0),
         ));
 
-        let ram_heading = heading(mtm, "RAM", 558.0);
+        let ram_heading = heading(mtm, "RAM", 898.0);
         let ram_mode = segmented(
             mtm,
             &["Dinâmica", "Fixa"],
             "indicator.ram.mode",
-            NSRect::new(NSPoint::new(100.0, 524.0), NSSize::new(240.0, 28.0)),
-            &target,
-            sel!(changeRamColorMode:),
+            NSRect::new(NSPoint::new(100.0, 864.0), NSSize::new(240.0, 28.0)),
+            placeholder_target,
+            None,
         );
         let ram_editor = ColorEditor::new(
             mtm,
@@ -152,21 +299,21 @@ impl IndicatorControls {
             proxy.clone(),
         );
         ram_editor.view().setFrame(NSRect::new(
-            NSPoint::new(0.0, 356.0),
+            NSPoint::new(0.0, 696.0),
             NSSize::new(540.0, 160.0),
         ));
 
-        let labels_heading = heading(mtm, "Rótulos", 326.0);
+        let labels_heading = heading(mtm, "Rótulos", 666.0);
         let labels_visible = unsafe {
             NSButton::checkboxWithTitle_target_action(
                 ns_string!("Mostrar rótulos C/R"),
-                Some(&*target as &AnyObject),
-                Some(sel!(toggleLabelsVisible:)),
+                None,
+                None,
                 mtm,
             )
         };
         labels_visible.setFrame(NSRect::new(
-            NSPoint::new(0.0, 292.0),
+            NSPoint::new(0.0, 632.0),
             NSSize::new(220.0, 24.0),
         ));
         labels_visible.setAccessibilityIdentifier(Some(ns_string!("indicator.labels.visible")));
@@ -174,15 +321,127 @@ impl IndicatorControls {
             mtm,
             &["Neutra", "Igual ao valor", "Personalizada"],
             "indicator.labels.mode",
-            NSRect::new(NSPoint::new(100.0, 254.0), NSSize::new(390.0, 28.0)),
-            &target,
-            sel!(changeLabelColorMode:),
+            NSRect::new(NSPoint::new(100.0, 594.0), NSSize::new(390.0, 28.0)),
+            placeholder_target,
+            None,
         );
-        let labels_editor = ColorEditor::new(mtm, ColorBinding::LabelShared, proxy);
+        let labels_editor = ColorEditor::new(mtm, ColorBinding::LabelShared, proxy.clone());
         labels_editor.view().setFrame(NSRect::new(
-            NSPoint::new(0.0, 86.0),
+            NSPoint::new(0.0, 426.0),
             NSSize::new(540.0, 160.0),
         ));
+
+        let typography_heading = heading(mtm, "Tipografia", 396.0);
+        let family_label = text_label(mtm, "Família", 356.0);
+        let font_family = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("System Monospaced"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        font_family.setFrame(NSRect::new(
+            NSPoint::new(100.0, 352.0),
+            NSSize::new(300.0, 30.0),
+        ));
+        font_family.setAccessibilityIdentifier(Some(ns_string!("indicator.font.family")));
+
+        let size_label = text_label(mtm, "Tamanho", 316.0);
+        let font_size = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(100.0, 312.0), NSSize::new(58.0, 26.0)),
+        );
+        font_size.setStringValue(ns_string!("12"));
+        font_size.setAccessibilityLabel(Some(ns_string!("Tamanho da fonte em pontos")));
+        font_size.setAccessibilityIdentifier(Some(ns_string!("indicator.font.size")));
+        let points_label = text_label(mtm, "pt", 316.0);
+        points_label.setFrameOrigin(NSPoint::new(166.0, 316.0));
+
+        let weight_label = text_label(mtm, "Peso", 276.0);
+        let font_weight = segmented(
+            mtm,
+            &["Regular", "Médio", "Negrito"],
+            "indicator.font.weight",
+            NSRect::new(NSPoint::new(100.0, 272.0), NSSize::new(300.0, 28.0)),
+            placeholder_target,
+            None,
+        );
+        let reset_typography = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("Restaurar tipografia"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        reset_typography.setFrame(NSRect::new(
+            NSPoint::new(400.0, 272.0),
+            NSSize::new(150.0, 28.0),
+        ));
+        let font_fallback_warning = warning_label(mtm, 236.0);
+        let layout_warning = warning_label(mtm, 208.0);
+
+        let update_heading = heading(mtm, "Atualização", 170.0);
+        let interval_label = text_label(mtm, "Intervalo", 130.0);
+        let interval_field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(100.0, 126.0), NSSize::new(58.0, 26.0)),
+        );
+        interval_field.setStringValue(ns_string!("2"));
+        interval_field.setAccessibilityLabel(Some(ns_string!("Intervalo de atualização")));
+        interval_field.setAccessibilityIdentifier(Some(ns_string!("indicator.refresh.interval")));
+        let interval_stepper = NSStepper::initWithFrame(
+            NSStepper::alloc(mtm),
+            NSRect::new(NSPoint::new(164.0, 124.0), NSSize::new(20.0, 28.0)),
+        );
+        interval_stepper.setMinValue(1.0);
+        interval_stepper.setMaxValue(60.0);
+        interval_stepper.setIncrement(1.0);
+        interval_stepper.setValueWraps(false);
+        interval_stepper
+            .setAccessibilityLabel(Some(ns_string!("Ajustar intervalo de atualização")));
+        let seconds_label = text_label(mtm, "segundos", 130.0);
+        seconds_label.setFrameOrigin(NSPoint::new(194.0, 130.0));
+        let interval_help = text_label(
+            mtm,
+            "Intervalos menores atualizam com mais frequência e usam mais recursos.",
+            90.0,
+        );
+        interval_help.setFrameSize(NSSize::new(500.0, 24.0));
+        interval_help.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        let interval_error = warning_label(mtm, 60.0);
+
+        let defaults = IndicatorPreferences::default();
+        let target = IndicatorControlsTarget::new(
+            mtm,
+            IndicatorControlsTargetIvars {
+                proxy: proxy.clone(),
+                applying: Cell::new(false),
+                selected_family: RefCell::new(defaults.typography.family.clone()),
+                selected_font_size: Cell::new(defaults.typography.size),
+                interval_draft: RefCell::new(IntervalDraft::new(defaults.refresh_interval)),
+                font_picker: RefCell::new(FontPicker::new(mtm, proxy.clone())),
+                font_catalog: RefCell::new(FontCatalog::new(mtm)),
+                font_size: font_size.clone(),
+                interval_field: interval_field.clone(),
+                interval_stepper: interval_stepper.clone(),
+                interval_error: interval_error.clone(),
+            },
+        );
+        configure_actions(
+            &target,
+            &cpu_mode,
+            &ram_mode,
+            &labels_visible,
+            &labels_mode,
+            &font_family,
+            &font_size,
+            &font_weight,
+            &reset_typography,
+            &interval_field,
+            &interval_stepper,
+        );
 
         for child in [
             &*cpu_heading as &NSView,
@@ -195,6 +454,24 @@ impl IndicatorControls {
             &*labels_visible,
             &*labels_mode,
             labels_editor.view(),
+            &*typography_heading,
+            &*family_label,
+            &*font_family,
+            &*size_label,
+            &*font_size,
+            &*points_label,
+            &*weight_label,
+            &*font_weight,
+            &*reset_typography,
+            &*font_fallback_warning,
+            &*layout_warning,
+            &*update_heading,
+            &*interval_label,
+            &*interval_field,
+            &*interval_stepper,
+            &*seconds_label,
+            &*interval_help,
+            &*interval_error,
         ] {
             view.addSubview(child);
         }
@@ -205,6 +482,15 @@ impl IndicatorControls {
             ram_mode,
             labels_visible,
             labels_mode,
+            font_family,
+            font_size,
+            font_weight,
+            font_fallback_warning,
+            layout_warning,
+            reset_typography,
+            interval_field,
+            interval_stepper,
+            interval_error,
             cpu_editor,
             ram_editor,
             labels_editor,
@@ -237,6 +523,30 @@ impl IndicatorControls {
                 LabelColorMode::MatchMetric => 1,
                 LabelColorMode::Fixed => 2,
             });
+        self.target
+            .ivars()
+            .selected_family
+            .replace(preferences.typography.family.clone());
+        self.target
+            .ivars()
+            .selected_font_size
+            .set(preferences.typography.size);
+        self.target
+            .ivars()
+            .interval_draft
+            .borrow_mut()
+            .sync(preferences.refresh_interval);
+        self.apply_typography(&preferences.typography);
+        let interval = self.target.ivars().interval_draft.borrow();
+        self.interval_field
+            .setStringValue(&objc2_foundation::NSString::from_str(interval.text()));
+        self.interval_stepper
+            .setIntegerValue(interval.valid_interval().seconds().into());
+        set_inline_error(
+            &self.interval_error,
+            interval.error().map(|error| error.message()),
+        );
+        drop(interval);
 
         let cpu_state = ColorEditorState::from_preferences(preferences.cpu_color.fixed);
         let ram_state = ColorEditorState::from_preferences(preferences.ram_color.fixed);
@@ -281,12 +591,21 @@ impl IndicatorControls {
             if labels_fixed {
                 self.labels_editor.configure_key_order(
                     &self.labels_mode,
-                    &self.cpu_mode,
+                    &self.font_family,
                     &labels_state,
                 );
             } else {
-                self.labels_mode.setNextKeyView(Some(&self.cpu_mode));
+                self.labels_mode.setNextKeyView(Some(&self.font_family));
             }
+            self.font_family.setNextKeyView(Some(&self.font_size));
+            self.font_size.setNextKeyView(Some(&self.font_weight));
+            self.font_weight
+                .setNextKeyView(Some(&self.reset_typography));
+            self.reset_typography
+                .setNextKeyView(Some(&self.interval_field));
+            self.interval_field
+                .setNextKeyView(Some(&self.interval_stepper));
+            self.interval_stepper.setNextKeyView(Some(&self.cpu_mode));
         }
         self.target.ivars().applying.set(false);
     }
@@ -307,6 +626,60 @@ impl IndicatorControls {
     pub(super) fn first_key_view(&self) -> &NSSegmentedControl {
         &self.cpu_mode
     }
+
+    pub(super) fn apply_diagnostics(
+        &self,
+        fallback: Option<&IndicatorFontFallback>,
+        layout: &IndicatorLayoutDiagnostics,
+    ) {
+        let fallback_message = fallback.map(|fallback| {
+            let requested = family_name(&fallback.requested_family);
+            format!(
+                "A fonte {requested} não está disponível; usando {} sem alterar sua escolha.",
+                fallback.resolved_family
+            )
+        });
+        set_warning_text(&self.font_fallback_warning, fallback_message.as_deref());
+
+        let diagnostics = [layout.status, Some(layout.light), Some(layout.dark)]
+            .into_iter()
+            .flatten();
+        let (too_tall, too_wide) = diagnostics.fold((false, false), |state, item| {
+            (
+                state.0 || item.exceeds_menu_bar_height,
+                state.1 || item.exceeds_curated_width,
+            )
+        });
+        let message = match (too_tall, too_wide) {
+            (true, true) => {
+                Some("Esta tipografia pode cortar as linhas e ocupar largura excessiva.")
+            }
+            (true, false) => Some("Esta tipografia pode cortar as linhas na altura da menu bar."),
+            (false, true) => Some("Esta tipografia pode ocupar largura excessiva na menu bar."),
+            (false, false) => None,
+        };
+        set_warning_text(&self.layout_warning, message);
+    }
+
+    fn apply_typography(&self, typography: &TypographyPreferences) {
+        let family = family_name(&typography.family);
+        self.font_family
+            .setTitle(&objc2_foundation::NSString::from_str(&family));
+        self.font_family
+            .setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+                "Família da fonte, {family}"
+            ))));
+        self.font_size
+            .setStringValue(&objc2_foundation::NSString::from_str(
+                &typography.size.points().to_string(),
+            ));
+        self.font_weight
+            .setSelectedSegment(match typography.weight {
+                FontWeight::Regular => 0,
+                FontWeight::Medium => 1,
+                FontWeight::Bold => 2,
+            });
+    }
 }
 
 fn segmented(
@@ -314,8 +687,8 @@ fn segmented(
     labels: &[&str],
     identifier: &str,
     frame: NSRect,
-    target: &IndicatorControlsTarget,
-    action: objc2::runtime::Sel,
+    target: Option<&IndicatorControlsTarget>,
+    action: Option<objc2::runtime::Sel>,
 ) -> Retained<NSSegmentedControl> {
     let labels = labels
         .iter()
@@ -326,8 +699,8 @@ fn segmented(
         NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
             &NSArray::from_slice(&refs),
             NSSegmentSwitchTracking::SelectOne,
-            Some(target as &AnyObject),
-            Some(action),
+            target.map(|target| target as &AnyObject),
+            action,
             mtm,
         )
     };
@@ -342,4 +715,107 @@ fn heading(mtm: MainThreadMarker, title: &str, y: f64) -> Retained<NSTextField> 
     field.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(92.0, 24.0)));
     field.setFont(Some(&NSFont::boldSystemFontOfSize(15.0)));
     field
+}
+
+fn text_label(mtm: MainThreadMarker, title: &str, y: f64) -> Retained<NSTextField> {
+    let field = NSTextField::labelWithString(&objc2_foundation::NSString::from_str(title), mtm);
+    field.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(92.0, 24.0)));
+    field
+}
+
+fn warning_label(mtm: MainThreadMarker, y: f64) -> Retained<NSTextField> {
+    let field = NSTextField::labelWithString(ns_string!(""), mtm);
+    field.setFrame(NSRect::new(
+        NSPoint::new(100.0, y),
+        NSSize::new(450.0, 24.0),
+    ));
+    field.setTextColor(Some(&NSColor::systemOrangeColor()));
+    field.setHidden(true);
+    field
+}
+
+#[allow(clippy::too_many_arguments)]
+fn configure_actions(
+    target: &IndicatorControlsTarget,
+    cpu_mode: &NSSegmentedControl,
+    ram_mode: &NSSegmentedControl,
+    labels_visible: &NSButton,
+    labels_mode: &NSSegmentedControl,
+    font_family: &NSButton,
+    font_size: &NSTextField,
+    font_weight: &NSSegmentedControl,
+    reset_typography: &NSButton,
+    interval_field: &NSTextField,
+    interval_stepper: &NSStepper,
+) {
+    unsafe {
+        for (control, action) in [
+            (
+                &**cpu_mode as &objc2_app_kit::NSControl,
+                sel!(changeCpuColorMode:),
+            ),
+            (
+                &**ram_mode as &objc2_app_kit::NSControl,
+                sel!(changeRamColorMode:),
+            ),
+            (
+                &**labels_visible as &objc2_app_kit::NSControl,
+                sel!(toggleLabelsVisible:),
+            ),
+            (
+                &**labels_mode as &objc2_app_kit::NSControl,
+                sel!(changeLabelColorMode:),
+            ),
+            (
+                &**font_family as &objc2_app_kit::NSControl,
+                sel!(openFontPicker:),
+            ),
+            (
+                &**font_size as &objc2_app_kit::NSControl,
+                sel!(commitFontSize:),
+            ),
+            (
+                &**font_weight as &objc2_app_kit::NSControl,
+                sel!(changeFontWeight:),
+            ),
+            (
+                &**reset_typography as &objc2_app_kit::NSControl,
+                sel!(resetTypography:),
+            ),
+            (
+                &**interval_field as &objc2_app_kit::NSControl,
+                sel!(commitRefreshInterval:),
+            ),
+            (
+                &**interval_stepper as &objc2_app_kit::NSControl,
+                sel!(stepRefreshInterval:),
+            ),
+        ] {
+            control.setTarget(Some(target as &AnyObject));
+            control.setAction(Some(action));
+        }
+        font_size.setDelegate(Some(ProtocolObject::from_ref(target)));
+        interval_field.setDelegate(Some(ProtocolObject::from_ref(target)));
+    }
+}
+
+fn family_name(family: &FontFamilyPreference) -> String {
+    match family {
+        FontFamilyPreference::SystemMonospaced => "System Monospaced".to_owned(),
+        FontFamilyPreference::Named(family) => family.clone(),
+    }
+}
+
+fn notification_text_field(notification: &NSNotification) -> Option<Retained<NSTextField>> {
+    notification.object()?.downcast::<NSTextField>().ok()
+}
+
+fn set_inline_error(field: &NSTextField, message: Option<&str>) {
+    set_warning_text(field, message);
+    field.setAccessibilityLabel(message.map(objc2_foundation::NSString::from_str).as_deref());
+}
+
+fn set_warning_text(field: &NSTextField, message: Option<&str>) {
+    field.setStringValue(&objc2_foundation::NSString::from_str(message.unwrap_or("")));
+    field.setHidden(message.is_none());
 }

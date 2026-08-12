@@ -1,4 +1,146 @@
-use crate::indicator_preferences::{AppearanceColors, FixedColorPreferences, SrgbColor};
+use crate::indicator_preferences::{
+    AppearanceColors, FixedColorPreferences, MetricsRefreshInterval, SrgbColor,
+};
+
+const SYSTEM_MONOSPACED_LABEL: &str = "System Monospaced";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FontRow {
+    SystemMonospaced,
+    Available(String),
+    Missing(String),
+}
+
+impl FontRow {
+    pub fn family_preference(&self) -> crate::indicator_preferences::FontFamilyPreference {
+        match self {
+            Self::SystemMonospaced => {
+                crate::indicator_preferences::FontFamilyPreference::SystemMonospaced
+            }
+            Self::Available(family) | Self::Missing(family) => {
+                crate::indicator_preferences::FontFamilyPreference::Named(family.clone())
+            }
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::SystemMonospaced => SYSTEM_MONOSPACED_LABEL,
+            Self::Available(family) | Self::Missing(family) => family,
+        }
+    }
+
+    pub const fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing(_))
+    }
+}
+
+pub fn filter_font_families(
+    families: &[String],
+    query: &str,
+    missing_selection: Option<&str>,
+) -> Vec<FontRow> {
+    let query = query.trim().to_lowercase();
+    let matches_query = |family: &str| family.to_lowercase().contains(&query);
+    let has_selected_family = missing_selection.is_some_and(|selected| {
+        let selected = selected.to_lowercase();
+        families
+            .iter()
+            .any(|family| family.to_lowercase() == selected)
+    });
+    let mut rows = Vec::with_capacity(families.len() + 2);
+
+    if matches_query(SYSTEM_MONOSPACED_LABEL) {
+        rows.push(FontRow::SystemMonospaced);
+    }
+    if !has_selected_family {
+        if let Some(selected) = missing_selection {
+            rows.push(FontRow::Missing(selected.to_owned()));
+        }
+    }
+
+    let mut available = families
+        .iter()
+        .filter(|family| matches_query(family))
+        .cloned()
+        .collect::<Vec<_>>();
+    available.sort_by(|left, right| {
+        left.to_lowercase()
+            .cmp(&right.to_lowercase())
+            .then_with(|| left.cmp(right))
+    });
+    rows.extend(available.into_iter().map(FontRow::Available));
+    rows
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidIntervalDraft;
+
+impl InvalidIntervalDraft {
+    pub const fn message(self) -> &'static str {
+        "Digite um número inteiro de 1 a 60."
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntervalDraft {
+    text: String,
+    valid_interval: MetricsRefreshInterval,
+    error: Option<InvalidIntervalDraft>,
+}
+
+impl IntervalDraft {
+    pub fn new(interval: MetricsRefreshInterval) -> Self {
+        Self {
+            text: interval.seconds().to_string(),
+            valid_interval: interval,
+            error: None,
+        }
+    }
+
+    pub fn commit(&mut self, text: &str) -> Result<MetricsRefreshInterval, InvalidIntervalDraft> {
+        self.text = text.to_owned();
+        let interval = text
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .and_then(|seconds| MetricsRefreshInterval::try_from(seconds).ok())
+            .ok_or(InvalidIntervalDraft);
+
+        match interval {
+            Ok(interval) => {
+                self.valid_interval = interval;
+                self.text = interval.seconds().to_string();
+                self.error = None;
+                Ok(interval)
+            }
+            Err(error) => {
+                self.error = Some(error);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn sync(&mut self, interval: MetricsRefreshInterval) {
+        if self.valid_interval != interval {
+            self.valid_interval = interval;
+            self.text = interval.seconds().to_string();
+            self.error = None;
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub const fn valid_interval(&self) -> MetricsRefreshInterval {
+        self.valid_interval
+    }
+
+    pub const fn error(&self) -> Option<InvalidIntervalDraft> {
+        self.error
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorWellPresentation {

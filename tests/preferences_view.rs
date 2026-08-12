@@ -1,8 +1,38 @@
-use statlet::indicator_preferences::{AppearanceColors, FixedColorPreferences, SrgbColor};
-use statlet::preferences_view::{
-    color_well_configuration, ColorEditorFocusTarget, ColorEditorRows, ColorEditorState,
-    ColorWellPresentation, HexDraft, HexDraftError, HexEdit,
+use statlet::indicator_preferences::{
+    AppearanceColors, FixedColorPreferences, MetricsRefreshInterval, SrgbColor,
 };
+use statlet::preferences_view::{
+    color_well_configuration, filter_font_families, ColorEditorFocusTarget, ColorEditorRows,
+    ColorEditorState, ColorWellPresentation, FontRow, HexDraft, HexDraftError, HexEdit,
+    IntervalDraft,
+};
+
+#[test]
+fn font_filter_is_case_insensitive_sorted_and_keeps_missing_selection_visible() {
+    let result = filter_font_families(
+        &["Menlo".into(), "Avenir Next".into()],
+        "ave",
+        Some("Missing Family"),
+    );
+
+    assert_eq!(
+        result,
+        vec![
+            FontRow::Missing("Missing Family".into()),
+            FontRow::Available("Avenir Next".into()),
+        ]
+    );
+}
+
+#[test]
+fn interval_draft_applies_only_whole_values_from_one_through_sixty() {
+    let mut draft = IntervalDraft::new(MetricsRefreshInterval::default());
+
+    assert!(draft.commit("0").is_err());
+    assert!(draft.commit("1.5").is_err());
+    assert_eq!(draft.commit("60").unwrap().seconds(), 60);
+    assert!(draft.commit("61").is_err());
+}
 
 #[test]
 fn incomplete_or_invalid_draft_keeps_the_last_valid_color() {
