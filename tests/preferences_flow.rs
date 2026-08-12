@@ -150,6 +150,10 @@ fn save_failure_keeps_session_state_and_retry_uses_the_latest_document() {
     );
 
     app.handle(AppEvent::UpdateIndicator(change_interval(9)));
+    assert_eq!(
+        app.state().preferences_save_status,
+        PreferencesSaveStatus::Failed
+    );
 
     assert_eq!(
         app.handle(AppEvent::RetrySavePreferences),

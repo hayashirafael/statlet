@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use objc2::MainThreadMarker;
-use statlet::core::{AppEffect, AppEvent, StatletCore};
+use statlet::core::{AppEffect, AppEvent, Preferences, PreferencesSaveResult, StatletCore};
 use statlet::disk::macos::{ContinuousClock, StartupVolumeSampler};
 use statlet::disk::DiskSamplingSchedule;
 use statlet::history::{History, HistoryStore};
@@ -201,9 +201,7 @@ impl RuntimeAdapters {
                     }
                 }
                 AppEffect::SavePreferences(preferences) => {
-                    if let Err(error) = self.preferences_store.save(preferences) {
-                        eprintln!("Statlet could not save preferences: {error}");
-                    }
+                    pending.extend(save_preferences(&self.preferences_store, preferences, core));
                     if let Some(windows) = &self.windows {
                         windows.update_state(core.state());
                     }
@@ -267,6 +265,21 @@ impl RuntimeAdapters {
         }
         should_quit
     }
+}
+
+fn save_preferences(
+    store: &PreferencesStore,
+    preferences: Preferences,
+    core: &mut StatletCore,
+) -> Vec<AppEffect> {
+    let result = match store.save(preferences) {
+        Ok(()) => PreferencesSaveResult::Saved,
+        Err(error) => {
+            eprintln!("Statlet could not save preferences: {error}");
+            PreferencesSaveResult::Failed
+        }
+    };
+    core.handle(AppEvent::PreferencesSaveFinished(result))
 }
 
 struct RuntimeMole {
@@ -401,5 +414,39 @@ impl RuntimeSamplers {
             }
             effects
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use statlet::core::{Preferences, PreferencesSaveStatus};
+    use tempfile::tempdir;
+
+    use super::{save_preferences, PreferencesStore, StatletCore};
+
+    #[test]
+    fn runtime_save_reports_real_failure_and_later_success_to_the_reducer() {
+        let directory = tempdir().unwrap();
+        let blocked_parent = directory.path().join("not-a-directory");
+        fs::write(&blocked_parent, "blocking file").unwrap();
+        let failing_store = PreferencesStore::new(blocked_parent.join("preferences.json"));
+        let successful_store = PreferencesStore::new(directory.path().join("preferences.json"));
+        let preferences = Preferences::default();
+        let mut core = StatletCore::new();
+
+        assert!(save_preferences(&failing_store, preferences.clone(), &mut core).is_empty());
+        assert_eq!(
+            core.state().preferences_save_status,
+            PreferencesSaveStatus::Failed
+        );
+
+        assert!(save_preferences(&successful_store, preferences.clone(), &mut core).is_empty());
+        assert_eq!(
+            core.state().preferences_save_status,
+            PreferencesSaveStatus::Saved
+        );
+        assert_eq!(successful_store.load(), preferences);
     }
 }

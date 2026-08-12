@@ -1,4 +1,6 @@
-use statlet::core::{AppEffect, AppEvent, IndicatorPreferenceChange, Preferences, StatletCore};
+use statlet::core::{
+    AppEffect, AppEvent, IndicatorPreferenceChange, Preferences, StatletCore, WarningThreshold,
+};
 use statlet::indicator_preferences::{
     FontFamilyPreference, FontSize, FontWeight, IndicatorAppearance, IndicatorPreferenceGroup,
     IndicatorPreferences, LabelColorMode, MetricColorMode, MetricKind, MetricsRefreshInterval,
@@ -10,8 +12,8 @@ fn customized_app(mole_enabled: bool) -> StatletCore {
     indicator.typography.size = FontSize::try_from(14).unwrap();
     let preferences = Preferences {
         mole_integration_enabled: mole_enabled,
+        warning_threshold: WarningThreshold::try_from(80).unwrap(),
         indicator,
-        ..Preferences::default()
     };
     StatletCore::with_preferences(preferences).0
 }
@@ -122,6 +124,8 @@ fn global_reset_keeps_disk_preferences_and_undo_replaces_later_indicator_edits()
         IndicatorPreferences::default()
     );
     assert!(app.state().can_undo_indicator_reset);
+    assert!(app.state().preferences.mole_integration_enabled);
+    assert_eq!(app.state().preferences.warning_threshold.get(), 80);
 
     app.handle(AppEvent::UpdateIndicator(
         IndicatorPreferenceChange::SetFontSize(FontSize::try_from(14).unwrap()),
@@ -130,6 +134,7 @@ fn global_reset_keeps_disk_preferences_and_undo_replaces_later_indicator_edits()
 
     assert_eq!(app.state().preferences.indicator, before);
     assert!(app.state().preferences.mole_integration_enabled);
+    assert_eq!(app.state().preferences.warning_threshold.get(), 80);
     assert!(!app.state().can_undo_indicator_reset);
 }
 
