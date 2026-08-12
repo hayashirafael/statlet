@@ -191,7 +191,7 @@ impl RuntimeAdapters {
 
     fn apply_effects(&mut self, effects: &[AppEffect], core: &mut StatletCore) -> bool {
         let mut should_quit = false;
-        let mut pending = effects.iter().copied().collect::<VecDeque<_>>();
+        let mut pending = effects.iter().cloned().collect::<VecDeque<_>>();
         while let Some(effect) = pending.pop_front() {
             match effect {
                 AppEffect::ShowWindow(kind) => {

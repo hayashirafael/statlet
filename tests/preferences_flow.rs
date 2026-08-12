@@ -43,7 +43,7 @@ fn enabling_the_integration_saves_preferences_and_starts_sampling() {
     assert_eq!(
         effects,
         vec![
-            AppEffect::SavePreferences(expected),
+            AppEffect::SavePreferences(expected.clone()),
             AppEffect::SetDiskSamplingEnabled(true),
             AppEffect::RequestNotificationAuthorization,
             AppEffect::CheckMoleCompatibility,
@@ -63,7 +63,7 @@ fn changing_the_threshold_saves_the_validated_preference() {
         ..Preferences::default()
     };
     assert_eq!(app.state().preferences, expected);
-    assert_eq!(effects, vec![AppEffect::SavePreferences(expected)]);
+    assert_eq!(effects, vec![AppEffect::SavePreferences(expected.clone())]);
 }
 
 #[test]
@@ -71,9 +71,10 @@ fn startup_preferences_control_disk_sampling_without_rewriting_the_file() {
     let preferences = Preferences {
         mole_integration_enabled: true,
         warning_threshold: WarningThreshold::try_from(95).unwrap(),
+        ..Preferences::default()
     };
 
-    let (app, effects) = StatletCore::with_preferences(preferences);
+    let (app, effects) = StatletCore::with_preferences(preferences.clone());
 
     assert_eq!(app.state().preferences, preferences);
     assert_eq!(

@@ -8,6 +8,7 @@ fn enabled_core() -> StatletCore {
     StatletCore::with_preferences(Preferences {
         mole_integration_enabled: true,
         warning_threshold: WarningThreshold::try_from(90).unwrap(),
+        ..Preferences::default()
     })
     .0
 }

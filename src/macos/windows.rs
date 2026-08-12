@@ -185,7 +185,7 @@ impl WindowManager {
 
     pub fn update_state(&self, state: &AppState) {
         if let Some(window) = &self.preferences {
-            window.apply(state.preferences);
+            window.apply(state.preferences.clone());
         }
         if let Some(window) = &self.free_space {
             window.apply(state);

@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::disk::DiskObservation;
 use crate::history::HistoryEventKind;
+use crate::indicator_preferences::IndicatorPreferences;
 use crate::mole::MoleStatus;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,7 +97,7 @@ pub enum WindowKind {
     FreeSpace,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppEffect {
     ShowWindow(WindowKind),
     SavePreferences(Preferences),
@@ -110,10 +111,11 @@ pub enum AppEffect {
     Quit,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Preferences {
     pub mole_integration_enabled: bool,
     pub warning_threshold: WarningThreshold,
+    pub indicator: IndicatorPreferences,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -234,7 +236,7 @@ impl StatletCore {
                     self.refresh_status();
                 }
                 let mut effects = vec![
-                    AppEffect::SavePreferences(self.state.preferences),
+                    AppEffect::SavePreferences(self.state.preferences.clone()),
                     AppEffect::SetDiskSamplingEnabled(enabled),
                 ];
                 if enabled {
@@ -248,7 +250,7 @@ impl StatletCore {
                     return Vec::new();
                 }
                 self.state.preferences.warning_threshold = threshold;
-                vec![AppEffect::SavePreferences(self.state.preferences)]
+                vec![AppEffect::SavePreferences(self.state.preferences.clone())]
             }
             AppEvent::DiskObserved(observation) => {
                 if !self.state.preferences.mole_integration_enabled {
