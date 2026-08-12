@@ -7,7 +7,7 @@ pub struct InvalidHexColor;
 impl SrgbColor {
     pub fn parse_hex(input: &str) -> Result<Self, InvalidHexColor> {
         let hex = input.strip_prefix('#').unwrap_or(input);
-        if hex.len() != 6 {
+        if hex.len() != 6 || !hex.is_ascii() {
             return Err(InvalidHexColor);
         }
 

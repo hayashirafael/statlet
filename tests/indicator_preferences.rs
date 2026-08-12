@@ -17,6 +17,13 @@ fn hex_rejects_alpha_short_and_non_hex_values() {
 }
 
 #[test]
+fn hex_rejects_non_ascii_input_without_panicking() {
+    let result = std::panic::catch_unwind(|| SrgbColor::parse_hex("AéAAA"));
+    assert!(result.is_ok(), "parser panicked for non-ASCII input");
+    assert!(result.unwrap().is_err());
+}
+
+#[test]
 fn bounded_values_accept_only_the_approved_ranges() {
     assert!(FontSize::try_from(8).is_err());
     assert_eq!(FontSize::try_from(9).unwrap().points(), 9);
