@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
@@ -13,10 +15,41 @@ use objc2_foundation::{
 use statlet::core::{AppEvent, AppState, Preferences, WarningThreshold, WindowKind};
 use statlet::disk::format_decimal_gigabytes;
 use statlet::history::{History, HistoryEventKind, HistoryRecord, MAX_HISTORY_RECORDS};
+use statlet::indicator::LayoutDiagnostics;
+use statlet::indicator_preferences::FontFamilyPreference;
 use statlet::mole::MoleStatus;
 use tao::event_loop::EventLoopProxy;
 
+use super::environment::VisualEnvironment;
+use super::renderer::PreviewImages;
 use super::RuntimeEvent;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PreviewContrastWarnings {
+    pub light: bool,
+    pub dark: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndicatorFontFallback {
+    pub requested_family: FontFamilyPreference,
+    pub resolved_family: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IndicatorLayoutDiagnostics {
+    pub status: Option<LayoutDiagnostics>,
+    pub light: LayoutDiagnostics,
+    pub dark: LayoutDiagnostics,
+}
+
+pub struct IndicatorSurfaceUpdate {
+    pub previews: PreviewImages,
+    pub font_fallback: Option<IndicatorFontFallback>,
+    pub contrast_warnings: PreviewContrastWarnings,
+    pub layout: IndicatorLayoutDiagnostics,
+    pub environment: VisualEnvironment,
+}
 
 struct ControlTargetIvars {
     proxy: EventLoopProxy<RuntimeEvent>,
@@ -106,6 +139,11 @@ struct PreferencesWindow {
     window: Retained<NSWindow>,
     mole_checkbox: Retained<NSButton>,
     warning_threshold: Retained<NSPopUpButton>,
+    _indicator_previews: RefCell<Option<PreviewImages>>,
+    _indicator_font_fallback: RefCell<Option<IndicatorFontFallback>>,
+    _indicator_contrast_warnings: RefCell<Option<PreviewContrastWarnings>>,
+    _indicator_layout: RefCell<Option<IndicatorLayoutDiagnostics>>,
+    _visual_environment: RefCell<Option<VisualEnvironment>>,
 }
 
 struct FreeSpaceWindow {
@@ -195,6 +233,29 @@ impl WindowManager {
     pub fn update_history(&self, history: &History) {
         if let Some(window) = &self.history {
             window.apply(history);
+        }
+    }
+
+    pub fn has_preferences_surface(&self) -> bool {
+        self.preferences.is_some()
+    }
+
+    pub fn update_indicator_surfaces(&self, surfaces: IndicatorSurfaceUpdate) {
+        if let Some(window) = &self.preferences {
+            let IndicatorSurfaceUpdate {
+                previews,
+                font_fallback,
+                contrast_warnings,
+                layout,
+                environment,
+            } = surfaces;
+            window._indicator_previews.replace(Some(previews));
+            window._indicator_font_fallback.replace(font_fallback);
+            window
+                ._indicator_contrast_warnings
+                .replace(Some(contrast_warnings));
+            window._indicator_layout.replace(Some(layout));
+            window._visual_environment.replace(Some(environment));
         }
     }
 }
@@ -363,6 +424,11 @@ fn create_preferences_window(mtm: MainThreadMarker, target: &ControlTarget) -> P
         window,
         mole_checkbox: checkbox,
         warning_threshold: threshold,
+        _indicator_previews: RefCell::new(None),
+        _indicator_font_fallback: RefCell::new(None),
+        _indicator_contrast_warnings: RefCell::new(None),
+        _indicator_layout: RefCell::new(None),
+        _visual_environment: RefCell::new(None),
     }
 }
 

@@ -10,11 +10,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use objc2::MainThreadMarker;
+use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
 use statlet::core::{AppEffect, AppEvent, Preferences, PreferencesSaveResult, StatletCore};
 use statlet::disk::macos::{ContinuousClock, StartupVolumeSampler};
 use statlet::disk::DiskSamplingSchedule;
 use statlet::history::{History, HistoryStore};
-use statlet::indicator_preferences::MetricsRefreshInterval;
+use statlet::indicator::{compose_indicator, IndicatorScene, SegmentColor};
+use statlet::indicator_preferences::{IndicatorAppearance, MetricsRefreshInterval, SrgbColor};
 use statlet::metrics_schedule::MetricsSamplingSchedule;
 use statlet::mole::{MoleDetection, MoleDetector, MoleInstallation, MoleStatus};
 use statlet::preferences::PreferencesStore;
@@ -24,10 +26,14 @@ use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
+use macos::environment::{VisualEnvironment, VisualEnvironmentObserver};
 use macos::notifications::NotificationManager;
-use macos::renderer::Renderer;
+use macos::renderer::{PreviewImages, RenderSlot, Renderer};
 use macos::sampler::MacSampler;
-use macos::windows::WindowManager;
+use macos::windows::{
+    IndicatorFontFallback, IndicatorLayoutDiagnostics, IndicatorSurfaceUpdate,
+    PreviewContrastWarnings, WindowManager,
+};
 use macos::RuntimeEvent;
 
 fn main() {
@@ -83,7 +89,7 @@ fn main() {
         proxy.clone(),
         initial_metrics_interval,
     );
-    let renderer = Renderer::new();
+    let mut renderer = Renderer::new();
     // tray-icon removes the status item when its owner is dropped.
     let mut _retained_tray: Option<TrayIcon> = None;
     let mut button = None;
@@ -102,27 +108,74 @@ fn main() {
             };
             let marker = MainThreadMarker::new().expect("main-thread event loop");
             button = macos::renderer::status_button(marker);
-            runtime.initialize_native(marker, proxy.clone());
+            runtime.initialize_native(marker, proxy.clone(), button.as_deref());
             let _ = proxy.send_event(RuntimeEvent::App(AppEvent::ApplicationLaunched));
-            let _ = runtime.apply_effects(&startup_effects, &mut core);
-            let sampling_effects =
-                poll_due_and_render(&mut runtime, &mut core, &renderer, button.as_deref());
-            let _ = runtime.apply_effects(&sampling_effects, &mut core);
+            let _ = runtime.apply_effects(
+                &startup_effects,
+                &mut core,
+                &mut renderer,
+                button.as_deref(),
+            );
+            let sampling_effects = run_redraw_cycle(
+                RedrawReason::Metrics,
+                &mut runtime,
+                &mut core,
+                &mut renderer,
+                button.as_deref(),
+            );
+            let _ = runtime.apply_effects(
+                &sampling_effects,
+                &mut core,
+                &mut renderer,
+                button.as_deref(),
+            );
             set_next_wakeup(control_flow, &runtime.samplers);
         }
         Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
             if button.is_none() {
                 let marker = MainThreadMarker::new().expect("main-thread event loop");
                 button = macos::renderer::status_button(marker);
+                runtime.rebind_status_button(button.as_deref());
             }
-            let sampling_effects =
-                poll_due_and_render(&mut runtime, &mut core, &renderer, button.as_deref());
-            let _ = runtime.apply_effects(&sampling_effects, &mut core);
+            let sampling_effects = run_redraw_cycle(
+                RedrawReason::Metrics,
+                &mut runtime,
+                &mut core,
+                &mut renderer,
+                button.as_deref(),
+            );
+            let _ = runtime.apply_effects(
+                &sampling_effects,
+                &mut core,
+                &mut renderer,
+                button.as_deref(),
+            );
             set_next_wakeup(control_flow, &runtime.samplers);
         }
         Event::UserEvent(runtime_event) => {
             let effects = match runtime_event {
                 RuntimeEvent::App(app_event) => core.handle(app_event),
+                RuntimeEvent::VisualEnvironmentChanged => run_redraw_cycle(
+                    RedrawReason::Appearance,
+                    &mut runtime,
+                    &mut core,
+                    &mut renderer,
+                    button.as_deref(),
+                ),
+                RuntimeEvent::FontSetChanged => run_redraw_cycle(
+                    RedrawReason::Fonts,
+                    &mut runtime,
+                    &mut core,
+                    &mut renderer,
+                    button.as_deref(),
+                ),
+                RuntimeEvent::ScreenParametersChanged => run_redraw_cycle(
+                    RedrawReason::Screens,
+                    &mut runtime,
+                    &mut core,
+                    &mut renderer,
+                    button.as_deref(),
+                ),
                 RuntimeEvent::MoleDetected {
                     generation,
                     detection,
@@ -132,7 +185,7 @@ fn main() {
                     .map(|status| core.handle(AppEvent::MoleStatusObserved(status)))
                     .unwrap_or_default(),
             };
-            if runtime.apply_effects(&effects, &mut core) {
+            if runtime.apply_effects(&effects, &mut core, &mut renderer, button.as_deref()) {
                 *control_flow = ControlFlow::Exit;
             } else {
                 set_next_wakeup(control_flow, &runtime.samplers);
@@ -145,25 +198,112 @@ fn main() {
             let effects = core.handle(AppEvent::ApplicationReopened {
                 has_visible_windows,
             });
-            let _ = runtime.apply_effects(&effects, &mut core);
+            let _ = runtime.apply_effects(&effects, &mut core, &mut renderer, button.as_deref());
         }
         _ => {}
     });
 }
 
-fn poll_due_and_render(
+fn run_redraw_cycle(
+    reason: RedrawReason,
     runtime: &mut RuntimeAdapters,
     core: &mut StatletCore,
-    renderer: &Renderer,
+    renderer: &mut Renderer,
     button: Option<&objc2_app_kit::NSStatusBarButton>,
 ) -> Vec<AppEffect> {
     objc2::rc::autoreleasepool(|_| {
-        let effects = runtime.samplers.poll_due(core);
-        if let Some(button) = button {
-            renderer.set_status(button, &core.state().status);
-        }
-        effects
+        let mut target = LiveRedrawTarget {
+            runtime,
+            core,
+            renderer,
+            button,
+            effects: Vec::new(),
+        };
+        execute_redraw_reason(reason, &mut target);
+        target.effects
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RedrawReason {
+    Metrics,
+    Preferences,
+    Appearance,
+    Fonts,
+    Screens,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeDecision {
+    sample: bool,
+    save: bool,
+    redraw: bool,
+    refresh_fonts: bool,
+}
+
+fn decision_for(reason: RedrawReason) -> RuntimeDecision {
+    RuntimeDecision {
+        sample: reason == RedrawReason::Metrics,
+        save: false,
+        redraw: true,
+        refresh_fonts: reason == RedrawReason::Fonts,
+    }
+}
+
+trait RuntimeRedrawTarget {
+    fn poll_due(&mut self);
+    fn refresh_fonts_and_invalidate(&mut self);
+    fn preferences_surface_exists(&self) -> bool;
+    fn redraw_indicator_surfaces(&mut self, include_previews: bool);
+}
+
+fn execute_redraw_reason(reason: RedrawReason, target: &mut impl RuntimeRedrawTarget) {
+    let decision = decision_for(reason);
+    if decision.sample {
+        target.poll_due();
+    }
+    if decision.refresh_fonts {
+        target.refresh_fonts_and_invalidate();
+    }
+    if decision.redraw {
+        let include_previews = target.preferences_surface_exists();
+        target.redraw_indicator_surfaces(include_previews);
+    }
+}
+
+struct LiveRedrawTarget<'a> {
+    runtime: &'a mut RuntimeAdapters,
+    core: &'a mut StatletCore,
+    renderer: &'a mut Renderer,
+    button: Option<&'a objc2_app_kit::NSStatusBarButton>,
+    effects: Vec<AppEffect>,
+}
+
+impl RuntimeRedrawTarget for LiveRedrawTarget<'_> {
+    fn poll_due(&mut self) {
+        self.effects
+            .extend(self.runtime.samplers.poll_due(self.core));
+    }
+
+    fn refresh_fonts_and_invalidate(&mut self) {
+        self.renderer.refresh_fonts();
+    }
+
+    fn preferences_surface_exists(&self) -> bool {
+        self.runtime
+            .windows
+            .as_ref()
+            .is_some_and(WindowManager::has_preferences_surface)
+    }
+
+    fn redraw_indicator_surfaces(&mut self, include_previews: bool) {
+        self.runtime.redraw_indicator_surfaces(
+            self.core,
+            self.renderer,
+            self.button,
+            include_previews,
+        );
+    }
 }
 
 fn set_next_wakeup(control_flow: &mut ControlFlow, samplers: &RuntimeSamplers) {
@@ -178,6 +318,7 @@ struct RuntimeAdapters {
     samplers: RuntimeSamplers,
     mole: RuntimeMole,
     notifications: Option<NotificationManager>,
+    visual_environment_observer: Option<VisualEnvironmentObserver>,
     review_space_item: MenuItem,
 }
 
@@ -198,6 +339,7 @@ impl RuntimeAdapters {
             samplers: RuntimeSamplers::new(metrics_interval),
             mole: RuntimeMole::new(proxy),
             notifications: None,
+            visual_environment_observer: None,
             review_space_item,
         }
     }
@@ -206,23 +348,56 @@ impl RuntimeAdapters {
         &mut self,
         marker: MainThreadMarker,
         proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
+        button: Option<&objc2_app_kit::NSStatusBarButton>,
     ) {
         self.windows = Some(WindowManager::new(marker, proxy.clone()));
-        self.notifications = NotificationManager::new(marker, proxy);
+        self.notifications = NotificationManager::new(marker, proxy.clone());
+        let mut observer = VisualEnvironmentObserver::new(marker, proxy);
+        observer.rebind_status_button(button);
+        self.visual_environment_observer = Some(observer);
     }
 
-    fn apply_effects(&mut self, effects: &[AppEffect], core: &mut StatletCore) -> bool {
+    fn rebind_status_button(&mut self, button: Option<&objc2_app_kit::NSStatusBarButton>) {
+        if let Some(observer) = &mut self.visual_environment_observer {
+            observer.rebind_status_button(button);
+        }
+    }
+
+    fn apply_effects(
+        &mut self,
+        effects: &[AppEffect],
+        core: &mut StatletCore,
+        renderer: &mut Renderer,
+        button: Option<&objc2_app_kit::NSStatusBarButton>,
+    ) -> bool {
         let mut should_quit = false;
         let mut pending = effects.iter().cloned().collect::<VecDeque<_>>();
         while let Some(effect) = pending.pop_front() {
             match effect {
-                AppEffect::RedrawIndicator => {}
+                AppEffect::RedrawIndicator => {
+                    pending.extend(run_redraw_cycle(
+                        RedrawReason::Preferences,
+                        self,
+                        core,
+                        renderer,
+                        button,
+                    ));
+                }
                 AppEffect::SetMetricsSamplingInterval(interval) => {
                     self.samplers.reschedule_metrics(interval);
                 }
                 AppEffect::ShowWindow(kind) => {
                     if let Some(windows) = &mut self.windows {
                         windows.show(kind, core.state(), &self.history);
+                    }
+                    if kind == statlet::core::WindowKind::Preferences {
+                        pending.extend(run_redraw_cycle(
+                            RedrawReason::Preferences,
+                            self,
+                            core,
+                            renderer,
+                            button,
+                        ));
                     }
                 }
                 AppEffect::SavePreferences(preferences) => {
@@ -290,6 +465,120 @@ impl RuntimeAdapters {
         }
         should_quit
     }
+
+    fn redraw_indicator_surfaces(
+        &mut self,
+        core: &StatletCore,
+        renderer: &mut Renderer,
+        button: Option<&objc2_app_kit::NSStatusBarButton>,
+        include_previews: bool,
+    ) {
+        let marker = MainThreadMarker::new().expect("indicator redraws run on the main thread");
+        let environment = VisualEnvironment::current(button, marker);
+        let preferences = &core.state().preferences.indicator;
+        let status_scene =
+            compose_indicator(&core.state().status, preferences, environment.appearance);
+        let status_layout = button
+            .map(|button| renderer.apply_status(button, &status_scene, &preferences.typography));
+
+        if !include_previews {
+            return;
+        }
+        let Some(windows) = &self.windows else {
+            return;
+        };
+        if !windows.has_preferences_surface() {
+            return;
+        }
+
+        let light_scene = compose_indicator(
+            &core.state().status,
+            preferences,
+            IndicatorAppearance::Light,
+        );
+        let dark_scene =
+            compose_indicator(&core.state().status, preferences, IndicatorAppearance::Dark);
+        let light_appearance = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameAqua })
+            .expect("Aqua appearance is available on macOS");
+        let dark_appearance = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua })
+            .expect("Dark Aqua appearance is available on macOS");
+        let light = renderer.render(
+            RenderSlot::PreviewLight,
+            &light_scene,
+            &preferences.typography,
+            &light_appearance,
+        );
+        let dark = renderer.render(
+            RenderSlot::PreviewDark,
+            &dark_scene,
+            &preferences.typography,
+            &dark_appearance,
+        );
+        let font_fallback = light.font.used_fallback.then(|| IndicatorFontFallback {
+            requested_family: light.font.requested_family.clone(),
+            resolved_family: light.font.resolved_family.clone(),
+        });
+        let contrast_warnings = preview_contrast_warnings(&light_scene, &dark_scene);
+        windows.update_indicator_surfaces(IndicatorSurfaceUpdate {
+            previews: PreviewImages {
+                light: light.image,
+                dark: dark.image,
+            },
+            font_fallback,
+            contrast_warnings,
+            layout: IndicatorLayoutDiagnostics {
+                status: status_layout,
+                light: light.layout,
+                dark: dark.layout,
+            },
+            environment,
+        });
+    }
+}
+
+fn preview_contrast_warnings(
+    light_scene: &IndicatorScene,
+    dark_scene: &IndicatorScene,
+) -> PreviewContrastWarnings {
+    let light_background =
+        SrgbColor::parse_hex("#FFFFFF").expect("literal preview background is valid");
+    let dark_background =
+        SrgbColor::parse_hex("#1E1E1E").expect("literal preview background is valid");
+    PreviewContrastWarnings {
+        light: scene_has_low_contrast(light_scene, light_background),
+        dark: scene_has_low_contrast(dark_scene, dark_background),
+    }
+}
+
+fn scene_has_low_contrast(scene: &IndicatorScene, background: SrgbColor) -> bool {
+    scene
+        .top
+        .iter()
+        .chain(&scene.bottom)
+        .chain(scene.disk_badge.iter())
+        .filter_map(|run| match run.color {
+            SegmentColor::Srgb(color) => Some(color),
+            SegmentColor::Semantic(_) => None,
+        })
+        .any(|color| contrast_ratio(color, background) < 4.5)
+}
+
+fn contrast_ratio(left: SrgbColor, right: SrgbColor) -> f64 {
+    let left = relative_luminance(left);
+    let right = relative_luminance(right);
+    (left.max(right) + 0.05) / (left.min(right) + 0.05)
+}
+
+fn relative_luminance(color: SrgbColor) -> f64 {
+    let [red, green, blue] = color.components().map(|component| {
+        let component = f64::from(component) / 255.0;
+        if component <= 0.04045 {
+            component / 12.92
+        } else {
+            ((component + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    0.2126 * red + 0.7152 * green + 0.0722 * blue
 }
 
 fn save_preferences(
@@ -453,10 +742,196 @@ mod tests {
     use std::time::Duration;
 
     use statlet::core::{Preferences, PreferencesSaveStatus};
-    use statlet::indicator_preferences::MetricsRefreshInterval;
+    use statlet::indicator::{IndicatorRun, IndicatorScene, SegmentColor};
+    use statlet::indicator_preferences::{MetricsRefreshInterval, SrgbColor};
     use tempfile::tempdir;
 
-    use super::{save_preferences, PreferencesStore, RuntimeSamplers, StatletCore};
+    use super::{
+        decision_for, execute_redraw_reason, preview_contrast_warnings, save_preferences,
+        PreferencesStore, RedrawReason, RuntimeDecision, RuntimeRedrawTarget, RuntimeSamplers,
+        StatletCore,
+    };
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RecordedAction {
+        Sample,
+        RefreshFontsAndInvalidate,
+        RedrawStatus,
+        RedrawPreviews,
+    }
+
+    struct FakeRedrawTarget {
+        preferences_surface_exists: bool,
+        actions: Vec<RecordedAction>,
+    }
+
+    impl FakeRedrawTarget {
+        fn new(preferences_surface_exists: bool) -> Self {
+            Self {
+                preferences_surface_exists,
+                actions: Vec::new(),
+            }
+        }
+    }
+
+    impl RuntimeRedrawTarget for FakeRedrawTarget {
+        fn poll_due(&mut self) {
+            self.actions.push(RecordedAction::Sample);
+        }
+
+        fn refresh_fonts_and_invalidate(&mut self) {
+            self.actions.push(RecordedAction::RefreshFontsAndInvalidate);
+        }
+
+        fn preferences_surface_exists(&self) -> bool {
+            self.preferences_surface_exists
+        }
+
+        fn redraw_indicator_surfaces(&mut self, include_previews: bool) {
+            self.actions.push(RecordedAction::RedrawStatus);
+            if include_previews {
+                self.actions.push(RecordedAction::RedrawPreviews);
+            }
+        }
+    }
+
+    #[test]
+    fn visual_reasons_select_redraw_without_sampling_or_saving() {
+        for reason in [
+            RedrawReason::Appearance,
+            RedrawReason::Fonts,
+            RedrawReason::Screens,
+        ] {
+            assert_eq!(
+                decision_for(reason),
+                RuntimeDecision {
+                    sample: false,
+                    save: false,
+                    redraw: true,
+                    refresh_fonts: reason == RedrawReason::Fonts,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn metric_due_may_sample_then_redraw_but_preference_redraw_never_samples() {
+        let mut metrics = FakeRedrawTarget::new(false);
+        execute_redraw_reason(RedrawReason::Metrics, &mut metrics);
+        assert_eq!(
+            metrics.actions,
+            vec![RecordedAction::Sample, RecordedAction::RedrawStatus]
+        );
+
+        let mut preferences = FakeRedrawTarget::new(false);
+        execute_redraw_reason(RedrawReason::Preferences, &mut preferences);
+        assert_eq!(preferences.actions, vec![RecordedAction::RedrawStatus]);
+    }
+
+    #[test]
+    fn font_event_refreshes_and_invalidates_before_redrawing() {
+        let mut target = FakeRedrawTarget::new(true);
+
+        execute_redraw_reason(RedrawReason::Fonts, &mut target);
+
+        assert_eq!(
+            target.actions,
+            vec![
+                RecordedAction::RefreshFontsAndInvalidate,
+                RecordedAction::RedrawStatus,
+                RecordedAction::RedrawPreviews,
+            ]
+        );
+    }
+
+    #[test]
+    fn previews_are_skipped_until_the_preferences_surface_exists() {
+        let mut absent = FakeRedrawTarget::new(false);
+        execute_redraw_reason(RedrawReason::Appearance, &mut absent);
+        assert_eq!(absent.actions, vec![RecordedAction::RedrawStatus]);
+
+        let mut created = FakeRedrawTarget::new(true);
+        execute_redraw_reason(RedrawReason::Appearance, &mut created);
+        assert_eq!(
+            created.actions,
+            vec![RecordedAction::RedrawStatus, RecordedAction::RedrawPreviews]
+        );
+    }
+
+    #[test]
+    fn preview_contrast_metadata_flags_custom_text_below_the_threshold() {
+        let gray = SegmentColor::Srgb(SrgbColor::parse_hex("#777777").unwrap());
+        let scene = IndicatorScene {
+            top: vec![IndicatorRun {
+                text: "C 42%".into(),
+                color: gray,
+            }],
+            bottom: vec![IndicatorRun {
+                text: "R 68%".into(),
+                color: gray,
+            }],
+            disk_badge: None,
+            accessibility_label: "CPU 42%, RAM 68%".into(),
+        };
+
+        let warnings = preview_contrast_warnings(&scene, &scene);
+
+        assert!(warnings.light);
+        assert!(warnings.dark);
+    }
+
+    struct DeadlineTarget<'a> {
+        samplers: &'a mut RuntimeSamplers,
+    }
+
+    impl RuntimeRedrawTarget for DeadlineTarget<'_> {
+        fn poll_due(&mut self) {
+            panic!("visual redraw must not poll samplers");
+        }
+
+        fn refresh_fonts_and_invalidate(&mut self) {}
+
+        fn preferences_surface_exists(&self) -> bool {
+            false
+        }
+
+        fn redraw_indicator_surfaces(&mut self, _include_previews: bool) {
+            let _ = &self.samplers;
+        }
+    }
+
+    #[test]
+    fn redraw_paths_do_not_change_metric_or_disk_deadlines() {
+        let mut samplers = RuntimeSamplers::new(MetricsRefreshInterval::try_from(30).unwrap());
+        let now = samplers.clock.now();
+        samplers.reschedule_metrics(MetricsRefreshInterval::try_from(30).unwrap());
+        samplers.disk_schedule.set_enabled(true, now);
+        assert!(samplers.disk_schedule.take_due(now));
+        let metrics_deadline = samplers.metrics_schedule.remaining(Duration::ZERO);
+        let disk_deadline = samplers.disk_schedule.remaining(Duration::ZERO);
+
+        for reason in [
+            RedrawReason::Preferences,
+            RedrawReason::Appearance,
+            RedrawReason::Fonts,
+            RedrawReason::Screens,
+        ] {
+            execute_redraw_reason(
+                reason,
+                &mut DeadlineTarget {
+                    samplers: &mut samplers,
+                },
+            );
+            assert_eq!(
+                samplers.metrics_schedule.remaining(Duration::ZERO),
+                metrics_deadline
+            );
+            assert_eq!(
+                samplers.disk_schedule.remaining(Duration::ZERO),
+                disk_deadline
+            );
+        }
+    }
 
     #[test]
     fn runtime_constructor_uses_the_loaded_metrics_interval() {
