@@ -80,25 +80,26 @@ fn preview_text(
                 .to_owned(),
         );
     }
+    if contrast.light {
+        shared_warnings.push("Prévia clara: o contraste pode ficar abaixo de 4,5:1.".to_owned());
+    }
+    if contrast.dark {
+        shared_warnings.push("Prévia escura: o contraste pode ficar abaixo de 4,5:1.".to_owned());
+    }
     shared_warnings.push(
         "As prévias não reproduzem papel de parede, transparência nem todo estado real da menu bar."
             .to_owned(),
     );
 
     PreviewText {
-        light_description: appearance_description("clara", contrast.light),
-        dark_description: appearance_description("escura", contrast.dark),
+        light_description: appearance_description("clara"),
+        dark_description: appearance_description("escura"),
         shared_warnings,
     }
 }
 
-fn appearance_description(appearance: &str, low_contrast: bool) -> String {
-    let mut description =
-        format!("Prévia {appearance} do indicador em escala aproximada da menu bar.");
-    if low_contrast {
-        description.push_str(" Aviso: o contraste pode ficar abaixo de 4,5:1.");
-    }
-    description
+fn appearance_description(appearance: &str) -> String {
+    format!("Prévia {appearance} do indicador em escala aproximada da menu bar.")
 }
 
 pub(super) struct PreviewPane {
@@ -384,11 +385,19 @@ mod tests {
         );
 
         assert!(text.light_description.contains("Prévia clara"));
-        assert!(text.light_description.contains("contraste"));
+        assert!(!text.light_description.contains("contraste"));
         assert!(!text.light_description.contains("Prévia escura"));
         assert!(text.dark_description.contains("Prévia escura"));
         assert!(!text.dark_description.contains("contraste"));
         assert!(!text.dark_description.contains("Prévia clara"));
+        assert!(text
+            .shared_warnings
+            .iter()
+            .any(|warning| warning.contains("Prévia clara") && warning.contains("4,5:1")));
+        assert!(!text
+            .shared_warnings
+            .iter()
+            .any(|warning| warning.contains("Prévia escura") && warning.contains("4,5:1")));
         assert!(text
             .shared_warnings
             .iter()
@@ -413,6 +422,44 @@ mod tests {
             .shared_warnings
             .iter()
             .any(|warning| warning.contains("papel de parede") && warning.contains("estado real")));
+    }
+
+    #[test]
+    fn preview_text_routes_each_appearance_contrast_warning_once_to_scrollable_region() {
+        let text = preview_text(
+            &LayoutDiagnostics {
+                exceeds_menu_bar_height: false,
+                exceeds_curated_width: false,
+            },
+            None,
+            &VisualEnvironment {
+                appearance: IndicatorAppearance::Dark,
+                increase_contrast: false,
+                differentiate_without_color: false,
+                reduce_transparency: false,
+            },
+            PreviewContrastWarnings {
+                light: true,
+                dark: true,
+            },
+        );
+
+        assert!(!text.light_description.contains("Aviso:"));
+        assert!(!text.dark_description.contains("Aviso:"));
+        assert_eq!(
+            text.shared_warnings
+                .iter()
+                .filter(|warning| warning.contains("Prévia clara") && warning.contains("4,5:1"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            text.shared_warnings
+                .iter()
+                .filter(|warning| warning.contains("Prévia escura") && warning.contains("4,5:1"))
+                .count(),
+            1
+        );
     }
 
     #[test]
