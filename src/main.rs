@@ -161,13 +161,21 @@ fn main() {
         Event::UserEvent(runtime_event) => {
             let effects = match runtime_event {
                 RuntimeEvent::App(app_event) => core.handle(app_event),
-                RuntimeEvent::VisualEnvironmentChanged => run_redraw_cycle(
-                    RedrawReason::Appearance,
-                    &mut runtime,
-                    &mut core,
-                    &mut renderer,
-                    button.as_deref(),
-                ),
+                RuntimeEvent::VisualEnvironmentChanged => {
+                    let marker = MainThreadMarker::new().expect("visual events run on main thread");
+                    let environment = VisualEnvironment::current(button.as_deref(), marker);
+                    if runtime.visual_environment.record(environment) {
+                        run_redraw_cycle(
+                            RedrawReason::Appearance,
+                            &mut runtime,
+                            &mut core,
+                            &mut renderer,
+                            button.as_deref(),
+                        )
+                    } else {
+                        Vec::new()
+                    }
+                }
                 RuntimeEvent::FontSetChanged => run_redraw_cycle(
                     RedrawReason::Fonts,
                     &mut runtime,
@@ -255,6 +263,21 @@ fn decision_for(reason: RedrawReason) -> RuntimeDecision {
         redraw: true,
         refresh_fonts: reason == RedrawReason::Fonts,
         invalidate_render_cache: reason == RedrawReason::Appearance,
+    }
+}
+
+#[derive(Default)]
+struct VisualEnvironmentState {
+    last: Option<VisualEnvironment>,
+}
+
+impl VisualEnvironmentState {
+    fn record(&mut self, current: VisualEnvironment) -> bool {
+        if self.last == Some(current) {
+            return false;
+        }
+        self.last = Some(current);
+        true
     }
 }
 
@@ -347,6 +370,7 @@ struct RuntimeAdapters {
     mole: RuntimeMole,
     notifications: Option<NotificationManager>,
     visual_environment_observer: Option<VisualEnvironmentObserver>,
+    visual_environment: VisualEnvironmentState,
     review_space_item: MenuItem,
 }
 
@@ -368,6 +392,7 @@ impl RuntimeAdapters {
             mole: RuntimeMole::new(proxy),
             notifications: None,
             visual_environment_observer: None,
+            visual_environment: VisualEnvironmentState::default(),
             review_space_item,
         }
     }
@@ -503,6 +528,7 @@ impl RuntimeAdapters {
     ) {
         let marker = MainThreadMarker::new().expect("indicator redraws run on the main thread");
         let environment = VisualEnvironment::current(button, marker);
+        self.visual_environment.record(environment);
         let preferences = &core.state().preferences.indicator;
         let status_scene =
             compose_indicator(&core.state().status, preferences, environment.appearance);
@@ -769,6 +795,7 @@ mod tests {
         coalesce_redraw_effects_owned_by_cycle, decision_for, execute_redraw_reason,
         preview_contrast_warnings, save_preferences, PreferencesStore, PreviewContrastWarnings,
         RedrawReason, RuntimeDecision, RuntimeRedrawTarget, RuntimeSamplers, StatletCore,
+        VisualEnvironment, VisualEnvironmentState,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -780,6 +807,24 @@ mod tests {
         RedrawStatus,
         RedrawPreviewLight,
         RedrawPreviewDark,
+    }
+
+    #[test]
+    fn repeated_visual_environment_notification_does_not_request_another_redraw() {
+        let standard = VisualEnvironment {
+            appearance: statlet::indicator_preferences::IndicatorAppearance::Light,
+            increase_contrast: false,
+            differentiate_without_color: false,
+            reduce_transparency: false,
+        };
+        let mut state = VisualEnvironmentState::default();
+
+        assert!(state.record(standard));
+        assert!(!state.record(standard));
+        assert!(state.record(VisualEnvironment {
+            increase_contrast: true,
+            ..standard
+        }));
     }
 
     struct FakeRedrawTarget {
