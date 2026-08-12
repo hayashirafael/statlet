@@ -32,12 +32,20 @@ struct IndicatorControlsTargetIvars {
     selected_family: RefCell<FontFamilyPreference>,
     selected_font_size: Cell<FontSize>,
     interval_draft: RefCell<IntervalDraft>,
-    font_picker: RefCell<FontPicker>,
-    font_catalog: RefCell<FontCatalog>,
+    font_resources: RefCell<Option<FontResources>>,
     font_size: Retained<NSTextField>,
     interval_field: Retained<NSTextField>,
     interval_stepper: Retained<NSStepper>,
     interval_error: Retained<NSTextField>,
+}
+
+struct FontResources {
+    picker: FontPicker,
+    catalog: FontCatalog,
+}
+
+fn get_or_create_font_resources<T>(slot: &mut Option<T>, create: impl FnOnce() -> T) -> &mut T {
+    slot.get_or_insert_with(create)
 }
 
 define_class!(
@@ -97,12 +105,19 @@ define_class!(
             let Some(parent) = sender.window() else {
                 return;
             };
-            let mut catalog = self.ivars().font_catalog.borrow_mut();
-            catalog.refresh();
             let selected = self.ivars().selected_family.borrow().clone();
-            let mut picker = self.ivars().font_picker.borrow_mut();
-            picker.refresh_catalog(&catalog);
-            picker.present(&parent, &catalog, &selected);
+            let marker = MainThreadMarker::new().expect("font picker actions run on main thread");
+            let proxy = self.ivars().proxy.clone();
+            let mut slot = self.ivars().font_resources.borrow_mut();
+            let resources = get_or_create_font_resources(&mut slot, || FontResources {
+                picker: FontPicker::new(marker, proxy),
+                catalog: FontCatalog::new(marker),
+            });
+            resources.catalog.refresh();
+            resources.picker.refresh_catalog(&resources.catalog);
+            resources
+                .picker
+                .present(&parent, &resources.catalog, &selected);
         }
 
         #[unsafe(method(commitFontSize:))]
@@ -455,8 +470,7 @@ impl IndicatorControls {
                 selected_family: RefCell::new(defaults.typography.family.clone()),
                 selected_font_size: Cell::new(defaults.typography.size),
                 interval_draft: RefCell::new(IntervalDraft::new(defaults.refresh_interval)),
-                font_picker: RefCell::new(FontPicker::new(mtm, proxy.clone())),
-                font_catalog: RefCell::new(FontCatalog::new(mtm)),
+                font_resources: RefCell::new(None),
                 font_size: font_size.clone(),
                 interval_field: interval_field.clone(),
                 interval_stepper: interval_stepper.clone(),
@@ -899,4 +913,30 @@ fn set_inline_error(field: &NSTextField, message: Option<&str>) {
 fn set_warning_text(field: &NSTextField, message: Option<&str>) {
     field.setStringValue(&objc2_foundation::NSString::from_str(message.unwrap_or("")));
     field.setHidden(message.is_none());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::get_or_create_font_resources;
+
+    #[test]
+    fn font_picker_resources_are_created_only_on_first_request() {
+        let creations = Cell::new(0);
+        let mut resources = None;
+        assert!(resources.is_none());
+
+        let first = *get_or_create_font_resources(&mut resources, || {
+            creations.set(creations.get() + 1);
+            7
+        });
+        let second = *get_or_create_font_resources(&mut resources, || {
+            creations.set(creations.get() + 1);
+            8
+        });
+
+        assert_eq!((first, second), (7, 7));
+        assert_eq!(creations.get(), 1);
+    }
 }

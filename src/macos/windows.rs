@@ -110,6 +110,10 @@ fn apply_state_to_retained_windows<P, F>(
     }
 }
 
+fn release_preferences<P>(preferences: &mut Option<P>) {
+    drop(preferences.take());
+}
+
 impl WindowManager {
     pub fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Self {
         let control_target = ControlTarget::new(mtm, proxy);
@@ -187,6 +191,10 @@ impl WindowManager {
             window.apply_surfaces(surfaces);
         }
     }
+
+    pub fn release_preferences(&mut self) {
+        release_preferences(&mut self.preferences);
+    }
 }
 
 #[cfg(test)]
@@ -195,7 +203,7 @@ mod tests {
 
     use statlet::core::{AppState, StatletCore};
 
-    use super::{prepare_preferences_for_show, RetainedStateConsumer};
+    use super::{prepare_preferences_for_show, release_preferences, RetainedStateConsumer};
 
     #[derive(Default)]
     struct RecordingStateConsumer {
@@ -229,6 +237,28 @@ mod tests {
         assert_eq!(
             free_space.applications.borrow().as_slice(),
             std::slice::from_ref(&state)
+        );
+    }
+
+    #[test]
+    fn closing_then_reopening_preferences_rebuilds_from_the_latest_app_state() {
+        let mut preferences = Some(RecordingStateConsumer::default());
+        release_preferences(&mut preferences);
+        assert!(preferences.is_none());
+
+        let mut core = StatletCore::new();
+        core.handle(statlet::core::AppEvent::SetMoleIntegrationEnabled(true));
+        let latest = core.state().clone();
+        let reopened = prepare_preferences_for_show(
+            &mut preferences,
+            None::<&RecordingStateConsumer>,
+            &latest,
+            RecordingStateConsumer::default,
+        );
+
+        assert_eq!(
+            reopened.applications.borrow().as_slice(),
+            std::slice::from_ref(&latest)
         );
     }
 }

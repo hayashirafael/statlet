@@ -4,6 +4,7 @@ use objc2_app_kit::{NSFont, NSFontManager, NSFontTraitMask};
 
 use statlet::indicator_preferences::{FontFamilyPreference, FontWeight, TypographyPreferences};
 
+#[derive(Clone)]
 pub struct FontResolution {
     pub font: Retained<NSFont>,
     pub requested_family: FontFamilyPreference,

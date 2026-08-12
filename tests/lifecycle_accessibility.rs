@@ -110,7 +110,7 @@ fn save_failure_keeps_preferences_open_for_explicit_retry() {
     );
     assert_eq!(
         app.handle(AppEvent::RetrySavePreferences),
-        vec![AppEffect::SavePreferences(app.state().preferences.clone())]
+        vec![AppEffect::FlushPreferences(app.state().preferences.clone())]
     );
 }
 

@@ -55,7 +55,7 @@ fn integration_blocks_are_recorded_once_until_mole_recovers() {
     assert_eq!(
         app.handle(AppEvent::MoleStatusObserved(MoleStatus::Missing)),
         vec![
-            AppEffect::RedrawIndicator,
+            AppEffect::RequestIndicatorRedraw,
             AppEffect::RecordHistory(HistoryEventKind::MoleMissing),
         ]
     );
@@ -66,14 +66,14 @@ fn integration_blocks_are_recorded_once_until_mole_recovers() {
         app.handle(AppEvent::MoleStatusObserved(MoleStatus::Compatible(
             MoleVersion::new(1, 49, 2)
         ))),
-        vec![AppEffect::RedrawIndicator]
+        vec![AppEffect::RequestIndicatorRedraw]
     );
     assert_eq!(
         app.handle(AppEvent::MoleStatusObserved(MoleStatus::Incompatible(
             MoleVersion::new(2, 0, 0)
         ))),
         vec![
-            AppEffect::RedrawIndicator,
+            AppEffect::RequestIndicatorRedraw,
             AppEffect::RecordHistory(HistoryEventKind::MoleIncompatible),
         ]
     );

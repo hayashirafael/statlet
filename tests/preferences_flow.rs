@@ -43,7 +43,13 @@ fn menu_actions_route_to_reusable_window_kinds() {
             vec![AppEffect::ShowWindow(WindowKind::History)]
         );
     }
-    assert_eq!(app.handle(AppEvent::Quit), vec![AppEffect::Quit]);
+    assert_eq!(
+        app.handle(AppEvent::Quit),
+        vec![
+            AppEffect::FlushPreferences(app.state().preferences.clone()),
+            AppEffect::Quit,
+        ]
+    );
 }
 
 #[test]
@@ -60,7 +66,7 @@ fn enabling_the_integration_saves_preferences_and_starts_sampling() {
     assert_eq!(
         effects,
         vec![
-            AppEffect::SavePreferences(expected.clone()),
+            AppEffect::QueuePreferencesSave(expected.clone()),
             AppEffect::SetDiskSamplingEnabled(true),
             AppEffect::RequestNotificationAuthorization,
             AppEffect::CheckMoleCompatibility,
@@ -80,7 +86,10 @@ fn changing_the_threshold_saves_the_validated_preference() {
         ..Preferences::default()
     };
     assert_eq!(app.state().preferences, expected);
-    assert_eq!(effects, vec![AppEffect::SavePreferences(expected.clone())]);
+    assert_eq!(
+        effects,
+        vec![AppEffect::QueuePreferencesSave(expected.clone())]
+    );
 }
 
 #[test]
@@ -118,7 +127,7 @@ fn disabled_startup_and_enabled_to_disabled_transition_stop_disk_sampling() {
     assert_eq!(
         effects,
         vec![
-            AppEffect::SavePreferences(Preferences::default()),
+            AppEffect::QueuePreferencesSave(Preferences::default()),
             AppEffect::SetDiskSamplingEnabled(false),
         ]
     );
@@ -157,7 +166,7 @@ fn save_failure_keeps_session_state_and_retry_uses_the_latest_document() {
 
     assert_eq!(
         app.handle(AppEvent::RetrySavePreferences),
-        vec![AppEffect::SavePreferences(app.state().preferences.clone())]
+        vec![AppEffect::FlushPreferences(app.state().preferences.clone())]
     );
 
     app.handle(AppEvent::PreferencesSaveFinished(

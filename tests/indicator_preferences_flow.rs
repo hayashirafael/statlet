@@ -22,8 +22,8 @@ fn assert_redraw_then_save(effects: Vec<AppEffect>, app: &StatletCore) {
     assert_eq!(
         effects,
         vec![
-            AppEffect::RedrawIndicator,
-            AppEffect::SavePreferences(app.state().preferences.clone()),
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::QueuePreferencesSave(app.state().preferences.clone()),
         ]
     );
 }
@@ -40,10 +40,10 @@ fn visual_change_redraws_then_saves_the_complete_document() {
         },
     ));
 
-    assert_eq!(effects[0], AppEffect::RedrawIndicator);
+    assert_eq!(effects[0], AppEffect::RequestIndicatorRedraw);
     assert_eq!(
         effects[1],
-        AppEffect::SavePreferences(app.state().preferences.clone())
+        AppEffect::QueuePreferencesSave(app.state().preferences.clone())
     );
 }
 
@@ -60,8 +60,8 @@ fn interval_change_reschedules_without_collecting() {
         effects,
         vec![
             AppEffect::SetMetricsSamplingInterval(interval),
-            AppEffect::RedrawIndicator,
-            AppEffect::SavePreferences(app.state().preferences.clone()),
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::QueuePreferencesSave(app.state().preferences.clone()),
         ]
     );
 }
@@ -144,11 +144,18 @@ fn closing_preferences_discards_only_the_transient_undo_snapshot() {
 
     app.handle(AppEvent::ResetIndicatorConfirmed);
     let after_reset = app.state().preferences.clone();
-    app.handle(AppEvent::PreferencesWindowClosed);
+    let effects = app.handle(AppEvent::PreferencesWindowClosed);
 
     assert!(app.handle(AppEvent::UndoIndicatorReset).is_empty());
     assert_eq!(app.state().preferences, after_reset);
     assert!(!app.state().can_undo_indicator_reset);
+    assert_eq!(
+        effects,
+        vec![
+            AppEffect::FlushPreferences(after_reset),
+            AppEffect::ReleasePreferencesWindow,
+        ]
+    );
 }
 
 #[test]
@@ -179,8 +186,8 @@ fn group_reset_changes_only_that_indicator_group() {
     assert_eq!(
         effects,
         vec![
-            AppEffect::RedrawIndicator,
-            AppEffect::SavePreferences(app.state().preferences.clone()),
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::QueuePreferencesSave(app.state().preferences.clone()),
         ]
     );
 }
@@ -206,8 +213,8 @@ fn refresh_interval_group_reset_reschedules_to_the_default() {
         effects,
         vec![
             AppEffect::SetMetricsSamplingInterval(default_interval),
-            AppEffect::RedrawIndicator,
-            AppEffect::SavePreferences(app.state().preferences.clone()),
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::QueuePreferencesSave(app.state().preferences.clone()),
         ]
     );
 }
@@ -232,8 +239,8 @@ fn global_reset_and_undo_reschedule_only_when_the_interval_changes() {
         reset_effects,
         vec![
             AppEffect::SetMetricsSamplingInterval(default_interval),
-            AppEffect::RedrawIndicator,
-            AppEffect::SavePreferences(app.state().preferences.clone()),
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::QueuePreferencesSave(app.state().preferences.clone()),
         ]
     );
 
@@ -243,8 +250,8 @@ fn global_reset_and_undo_reschedule_only_when_the_interval_changes() {
         undo_effects,
         vec![
             AppEffect::SetMetricsSamplingInterval(customized_interval),
-            AppEffect::RedrawIndicator,
-            AppEffect::SavePreferences(app.state().preferences.clone()),
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::QueuePreferencesSave(app.state().preferences.clone()),
         ]
     );
 }

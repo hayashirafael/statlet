@@ -133,7 +133,6 @@ fn color_plan(color: SegmentColor) -> ColorPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PaintKey {
     layout: LayoutKey,
-    appearance: String,
     top: Vec<RunIdentity>,
     bottom: Vec<RunIdentity>,
     badge: Option<RunIdentity>,
@@ -167,7 +166,16 @@ fn paint_key(scene: &IndicatorScene, layout: LayoutKey, appearance: String) -> P
             .disk_badge
             .as_ref()
             .map(|run| run_identity(run, &appearance)),
-        appearance,
+    }
+}
+
+impl PaintKey {
+    fn uses_semantic_color(&self) -> bool {
+        self.top
+            .iter()
+            .chain(&self.bottom)
+            .chain(self.badge.iter())
+            .any(|run| matches!(run.paint, PaintIdentity::Semantic { .. }))
     }
 }
 
@@ -245,6 +253,17 @@ impl<I: Clone> SurfaceCache<I> {
     fn clear(&mut self) {
         self.slots.clear();
     }
+
+    fn clear_semantic_paint(&mut self) {
+        for slot in &mut self.slots.entries {
+            if slot
+                .as_ref()
+                .is_some_and(|cached| cached.paint_key.uses_semantic_color())
+            {
+                *slot = None;
+            }
+        }
+    }
 }
 
 pub struct RenderOutput {
@@ -269,10 +288,110 @@ fn line_has_label(runs: &[IndicatorRun], label: &str) -> bool {
         .is_some_and(char::is_whitespace)
 }
 
+type TextAttributes = Retained<NSDictionary<NSString, AnyObject>>;
+
+#[derive(Clone)]
+struct ResolvedTypography {
+    generation: u64,
+    preferences: TypographyPreferences,
+    font: FontResolution,
+    measurer: FontTextMeasurer,
+}
+
+#[derive(Default)]
+struct ResolvedTypographyCache {
+    active: Option<ResolvedTypography>,
+}
+
+impl ResolvedTypographyCache {
+    fn matches(&self, generation: u64, preferences: &TypographyPreferences) -> bool {
+        self.active.as_ref().is_some_and(|active| {
+            active.generation == generation && &active.preferences == preferences
+        })
+    }
+
+    fn replace(&mut self, resolved: ResolvedTypography) {
+        self.active = Some(resolved);
+    }
+
+    fn get(&self) -> ResolvedTypography {
+        self.active
+            .as_ref()
+            .expect("typography is resolved before rendering")
+            .clone()
+    }
+
+    fn clear(&mut self) {
+        self.active = None;
+    }
+}
+
+const ATTRIBUTE_CACHE_CAPACITY: usize = 16;
+
+struct AttributeEntry {
+    key: PaintIdentity,
+    attributes: TextAttributes,
+}
+
+#[derive(Default)]
+struct AttributeCache {
+    entries: Vec<AttributeEntry>,
+    total_created: usize,
+}
+
+impl AttributeCache {
+    fn resolve(
+        &mut self,
+        key: PaintIdentity,
+        create: impl FnOnce() -> TextAttributes,
+    ) -> TextAttributes {
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let entry = self.entries.remove(index);
+            let attributes = entry.attributes.clone();
+            self.entries.push(entry);
+            return attributes;
+        }
+        let attributes = create();
+        self.total_created += 1;
+        if self.entries.len() == ATTRIBUTE_CACHE_CAPACITY {
+            self.entries.remove(0);
+        }
+        self.entries.push(AttributeEntry {
+            key,
+            attributes: attributes.clone(),
+        });
+        attributes
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn clear_semantic(&mut self) {
+        self.entries
+            .retain(|entry| matches!(entry.key, PaintIdentity::Srgb(_)));
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct ConstructionStats {
+    font_resolutions: usize,
+    measurers: usize,
+    attribute_sets: usize,
+    images: usize,
+}
+
 pub struct Renderer {
     font_catalog: FontCatalog,
+    font_generation: u64,
+    typography: ResolvedTypographyCache,
+    attributes: AttributeCache,
     cache: SurfaceCache<Retained<NSImage>>,
     default_width: f64,
+    font_resolutions: usize,
+    measurers: usize,
+    images: usize,
 }
 
 impl Renderer {
@@ -289,10 +408,23 @@ impl Renderer {
         let default_measurer = FontTextMeasurer::new(&default_font.font);
         let default_width =
             measure_stable_layout(&default_measurer, true, f64::INFINITY).base_width();
+        let mut typography = ResolvedTypographyCache::default();
+        typography.replace(ResolvedTypography {
+            generation: 0,
+            preferences: default_typography,
+            font: default_font,
+            measurer: default_measurer,
+        });
         Self {
             font_catalog,
+            font_generation: 0,
+            typography,
+            attributes: AttributeCache::default(),
             cache: SurfaceCache::default(),
             default_width,
+            font_resolutions: 1,
+            measurers: 1,
+            images: 0,
         }
     }
 
@@ -303,7 +435,9 @@ impl Renderer {
         typography: &TypographyPreferences,
         appearance: &NSAppearance,
     ) -> RenderOutput {
-        let font = self.font_catalog.resolve(typography);
+        let resolved = self.resolve_typography(typography);
+        let font = resolved.font;
+        let measurer = resolved.measurer;
         let labels_visible = labels_visible(scene);
         let layout_key = LayoutKey {
             resolved_family: font.resolved_family.clone(),
@@ -311,7 +445,6 @@ impl Renderer {
             weight: typography.weight,
             labels_visible,
         };
-        let measurer = FontTextMeasurer::new(&font.font);
         let layout = self.cache.resolve_layout(slot, &layout_key, || {
             measure_stable_layout(&measurer, labels_visible, self.default_width)
         });
@@ -324,7 +457,15 @@ impl Renderer {
                 font,
             };
         }
-        let image = draw_image(scene, &font.font, layout, appearance);
+        let image = draw_image(
+            scene,
+            &font.font,
+            &measurer,
+            layout,
+            appearance,
+            &mut self.attributes,
+        );
+        self.images += 1;
 
         self.cache
             .replace(slot, layout_key, layout, paint_key, image.clone());
@@ -351,17 +492,55 @@ impl Renderer {
 
     pub fn refresh_fonts(&mut self) {
         self.font_catalog.refresh();
-        self.invalidate();
+        self.font_generation = self.font_generation.wrapping_add(1);
+        self.typography.clear();
+        self.attributes.clear();
+        self.cache.clear();
     }
 
-    pub fn invalidate(&mut self) {
-        self.cache.clear();
+    pub fn invalidate_semantic_colors(&mut self) {
+        self.attributes.clear_semantic();
+        self.cache.clear_semantic_paint();
+    }
+
+    fn resolve_typography(&mut self, preferences: &TypographyPreferences) -> ResolvedTypography {
+        if !self.typography.matches(self.font_generation, preferences) {
+            let font = self.font_catalog.resolve(preferences);
+            let measurer = FontTextMeasurer::new(&font.font);
+            self.font_resolutions += 1;
+            self.measurers += 1;
+            self.typography.replace(ResolvedTypography {
+                generation: self.font_generation,
+                preferences: preferences.clone(),
+                font,
+                measurer,
+            });
+            self.attributes.clear();
+            self.cache.clear();
+        }
+        self.typography.get()
+    }
+
+    #[cfg(test)]
+    fn construction_stats(&self) -> ConstructionStats {
+        ConstructionStats {
+            font_resolutions: self.font_resolutions,
+            measurers: self.measurers,
+            attribute_sets: self.attributes.total_created,
+            images: self.images,
+        }
+    }
+
+    #[cfg(test)]
+    fn attribute_cache_len(&self) -> usize {
+        self.attributes.entries.len()
     }
 }
 
+#[derive(Clone)]
 struct FontTextMeasurer {
     font: Retained<NSFont>,
-    attributes: Retained<NSDictionary<NSString, AnyObject>>,
+    attributes: TextAttributes,
 }
 
 impl FontTextMeasurer {
@@ -396,10 +575,14 @@ impl TextMeasurer for FontTextMeasurer {
 fn draw_image(
     scene: &IndicatorScene,
     font: &NSFont,
+    measurer: &FontTextMeasurer,
     layout: StableLayout,
     appearance: &NSAppearance,
+    attributes: &mut AttributeCache,
 ) -> Retained<NSImage> {
     let rendered = RefCell::new(None);
+    let attributes = RefCell::new(attributes);
+    let appearance_name = appearance.name().to_string();
     let draw = StackBlock::new(|| {
         let badge = scene.disk_badge.as_ref().map(|run| run.text.as_str());
         let width = layout.width_for_badge(badge).ceil();
@@ -413,32 +596,31 @@ fn draw_image(
         let cap_height = font.capHeight();
         let descent = -font.descender();
         let margin = (HEIGHT - 2.0 * cap_height - LINE_GAP) / 2.0;
-        let measurer = FontTextMeasurer::new(font);
+        let mut attributes = attributes.borrow_mut();
+        let mut text = DrawTextContext {
+            font,
+            measurer,
+            layout,
+            attributes: &mut attributes,
+            appearance_name: &appearance_name,
+        };
 
         #[allow(deprecated)]
         {
             image.lockFocus();
-            draw_metric_line(
-                &scene.bottom,
-                margin - descent,
-                font,
-                &measurer,
-                layout,
-                layout.ram_width,
-            );
+            draw_metric_line(&scene.bottom, margin - descent, layout.ram_width, &mut text);
             draw_metric_line(
                 &scene.top,
                 margin + cap_height + LINE_GAP - descent,
-                font,
-                &measurer,
-                layout,
                 layout.cpu_width,
+                &mut text,
             );
             if let Some(badge) = &scene.disk_badge {
-                attributed_scene_run(font, badge).drawAtPoint(NSPoint {
-                    x: layout.base_width(),
-                    y: margin + cap_height + LINE_GAP - descent,
-                });
+                attributed_scene_run(text.font, badge, text.attributes, text.appearance_name)
+                    .drawAtPoint(NSPoint {
+                        x: layout.base_width(),
+                        y: margin + cap_height + LINE_GAP - descent,
+                    });
             }
             image.unlockFocus();
         }
@@ -455,44 +637,83 @@ fn draw_image(
         .expect("drawing appearance executes its block synchronously")
 }
 
+struct DrawTextContext<'a> {
+    font: &'a NSFont,
+    measurer: &'a FontTextMeasurer,
+    layout: StableLayout,
+    attributes: &'a mut AttributeCache,
+    appearance_name: &'a str,
+}
+
 fn draw_metric_line(
     runs: &[IndicatorRun],
     y: f64,
-    font: &NSFont,
-    measurer: &impl TextMeasurer,
-    layout: StableLayout,
     line_width: f64,
+    context: &mut DrawTextContext<'_>,
 ) {
     match runs {
-        [value] => attributed_scene_run(font, value).drawAtPoint(NSPoint {
-            x: layout.value_origin(measurer, line_width, &value.text),
+        [value] => attributed_scene_run(
+            context.font,
+            value,
+            context.attributes,
+            context.appearance_name,
+        )
+        .drawAtPoint(NSPoint {
+            x: context
+                .layout
+                .value_origin(context.measurer, line_width, &value.text),
             y,
         }),
         [label, value] => {
-            attributed_scene_run(font, label).drawAtPoint(NSPoint { x: 0.0, y });
-            attributed_scene_run(font, value).drawAtPoint(NSPoint {
-                x: layout.value_origin(measurer, line_width, &value.text),
+            attributed_scene_run(
+                context.font,
+                label,
+                context.attributes,
+                context.appearance_name,
+            )
+            .drawAtPoint(NSPoint { x: 0.0, y });
+            attributed_scene_run(
+                context.font,
+                value,
+                context.attributes,
+                context.appearance_name,
+            )
+            .drawAtPoint(NSPoint {
+                x: context
+                    .layout
+                    .value_origin(context.measurer, line_width, &value.text),
                 y,
             });
         }
-        _ => attributed_scene_line(font, runs.iter()).drawAtPoint(NSPoint { x: 0.0, y }),
+        _ => attributed_scene_line(
+            context.font,
+            runs.iter(),
+            context.attributes,
+            context.appearance_name,
+        )
+        .drawAtPoint(NSPoint { x: 0.0, y }),
     }
 }
 
 fn attributed_scene_run(
     font: &NSFont,
     run: &IndicatorRun,
+    cache: &mut AttributeCache,
+    appearance_name: &str,
 ) -> Retained<objc2_foundation::NSAttributedString> {
-    let color = resolve_color(run.color);
-    let attributes = NSDictionary::from_retained_objects(
-        &[unsafe { NSFontAttributeName }, unsafe {
-            NSForegroundColorAttributeName
-        }],
-        &[
-            Retained::into_super(Retained::into_super(font.retain())),
-            Retained::into_super(Retained::into_super(color)),
-        ],
-    );
+    let key = paint_identity(run.color, appearance_name);
+    let attributes = cache.resolve(key, || {
+        let color = resolve_color(run.color);
+        NSDictionary::from_retained_objects(
+            &[unsafe { NSFontAttributeName }, unsafe {
+                NSForegroundColorAttributeName
+            }],
+            &[
+                Retained::into_super(Retained::into_super(font.retain())),
+                Retained::into_super(Retained::into_super(color)),
+            ],
+        )
+    });
     unsafe {
         objc2_foundation::NSAttributedString::new_with_attributes(
             &NSString::from_str(&run.text),
@@ -504,10 +725,17 @@ fn attributed_scene_run(
 fn attributed_scene_line<'a>(
     font: &NSFont,
     runs: impl Iterator<Item = &'a IndicatorRun>,
+    attributes: &mut AttributeCache,
+    appearance_name: &str,
 ) -> Retained<NSMutableAttributedString> {
     let line = NSMutableAttributedString::new();
     for run in runs {
-        line.appendAttributedString(&attributed_scene_run(font, run));
+        line.appendAttributedString(&attributed_scene_run(
+            font,
+            run,
+            attributes,
+            appearance_name,
+        ));
     }
     line
 }
@@ -866,6 +1094,144 @@ mod tests {
     }
 
     #[test]
+    fn equal_typography_across_scenes_resolves_font_measurer_and_attributes_once() {
+        let Some(marker) = MainThreadMarker::new() else {
+            eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
+            return;
+        };
+        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let mut typography =
+            statlet::indicator_preferences::IndicatorPreferences::default().typography;
+        typography.size = statlet::indicator_preferences::FontSize::try_from(13).unwrap();
+        let aqua =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameAqua }).unwrap();
+        let before = renderer.construction_stats();
+
+        renderer.render(
+            RenderSlot::Status,
+            &scene_with_lines(&["C 42%"], &["R 68%"]),
+            &typography,
+            &aqua,
+        );
+        renderer.render(
+            RenderSlot::PreviewLight,
+            &scene_with_lines(&["C 43%"], &["R 69%"]),
+            &typography,
+            &aqua,
+        );
+
+        let after = renderer.construction_stats();
+        assert_eq!(after.font_resolutions - before.font_resolutions, 1);
+        assert_eq!(after.measurers - before.measurers, 1);
+        assert_eq!(after.attribute_sets - before.attribute_sets, 1);
+    }
+
+    #[test]
+    fn semantic_invalidation_preserves_fixed_srgb_image_and_typography_cache() {
+        let Some(marker) = MainThreadMarker::new() else {
+            eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
+            return;
+        };
+        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
+        let fixed = SegmentColor::Srgb(SrgbColor::parse_hex("#AF52DE").unwrap());
+        let scene = scene_with_color(fixed);
+        let aqua =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameAqua }).unwrap();
+        let dark =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameDarkAqua })
+                .unwrap();
+
+        let first = renderer.render(RenderSlot::Status, &scene, &typography, &aqua);
+        let before = renderer.construction_stats();
+        renderer.invalidate_semantic_colors();
+        let second = renderer.render(RenderSlot::Status, &scene, &typography, &dark);
+        let after = renderer.construction_stats();
+
+        assert!(std::ptr::eq(&*first.image, &*second.image));
+        assert_eq!(after.font_resolutions, before.font_resolutions);
+        assert_eq!(after.measurers, before.measurers);
+        assert_eq!(after.attribute_sets, before.attribute_sets);
+        assert_eq!(after.images, before.images);
+    }
+
+    #[test]
+    fn semantic_invalidation_rebuilds_semantic_paint_but_not_typography() {
+        let Some(marker) = MainThreadMarker::new() else {
+            eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
+            return;
+        };
+        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
+        let scene = scene_with_color(SegmentColor::Semantic(SemanticColor::Warning));
+        let aqua =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameAqua }).unwrap();
+        let dark =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameDarkAqua })
+                .unwrap();
+
+        renderer.render(RenderSlot::Status, &scene, &typography, &aqua);
+        let before = renderer.construction_stats();
+        renderer.invalidate_semantic_colors();
+        renderer.render(RenderSlot::Status, &scene, &typography, &dark);
+        let after = renderer.construction_stats();
+
+        assert_eq!(after.font_resolutions, before.font_resolutions);
+        assert_eq!(after.measurers, before.measurers);
+        assert!(after.attribute_sets > before.attribute_sets);
+        assert_eq!(after.images, before.images + 1);
+    }
+
+    #[test]
+    fn attribute_cache_stays_bounded_during_intermediate_color_changes() {
+        let Some(marker) = MainThreadMarker::new() else {
+            eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
+            return;
+        };
+        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
+        let aqua =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameAqua }).unwrap();
+
+        for red in 0..=40 {
+            let color =
+                SegmentColor::Srgb(SrgbColor::parse_hex(&format!("#{red:02X}2850")).unwrap());
+            renderer.render(
+                RenderSlot::Status,
+                &scene_with_color(color),
+                &typography,
+                &aqua,
+            );
+        }
+
+        assert!(renderer.attribute_cache_len() <= 16);
+    }
+
+    #[test]
+    fn font_refresh_invalidates_font_measurer_attributes_layout_and_images() {
+        let Some(marker) = MainThreadMarker::new() else {
+            eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
+            return;
+        };
+        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
+        let scene = scene_with_lines(&["C 42%"], &["R 68%"]);
+        let aqua =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameAqua }).unwrap();
+
+        renderer.render(RenderSlot::Status, &scene, &typography, &aqua);
+        let before = renderer.construction_stats();
+        renderer.refresh_fonts();
+        renderer.render(RenderSlot::Status, &scene, &typography, &aqua);
+        let after = renderer.construction_stats();
+
+        assert_eq!(after.font_resolutions, before.font_resolutions + 1);
+        assert_eq!(after.measurers, before.measurers + 1);
+        assert!(after.attribute_sets > before.attribute_sets);
+        assert_eq!(after.images, before.images + 1);
+    }
+
+    #[test]
     fn label_detection_accepts_split_and_consolidated_runs_but_rejects_hidden_labels() {
         let split = scene_with_lines(&["C ", "42%"], &["R ", "68%"]);
         let consolidated = scene_with_lines(&["C 42%"], &["R 68%"]);
@@ -959,6 +1325,21 @@ mod tests {
         IndicatorScene {
             top: runs(top),
             bottom: runs(bottom),
+            disk_badge: None,
+            accessibility_label: "CPU 42%, RAM 68%".to_owned(),
+        }
+    }
+
+    fn scene_with_color(color: SegmentColor) -> IndicatorScene {
+        IndicatorScene {
+            top: vec![IndicatorRun {
+                text: "C 42%".to_owned(),
+                color,
+            }],
+            bottom: vec![IndicatorRun {
+                text: "R 68%".to_owned(),
+                color,
+            }],
             disk_badge: None,
             accessibility_label: "CPU 42%, RAM 68%".to_owned(),
         }

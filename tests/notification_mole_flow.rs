@@ -18,7 +18,7 @@ fn enabling_requests_notification_permission_and_checks_mole_in_context() {
     assert_eq!(
         effects,
         vec![
-            AppEffect::SavePreferences(Preferences {
+            AppEffect::QueuePreferencesSave(Preferences {
                 mole_integration_enabled: true,
                 ..Preferences::default()
             }),
@@ -71,7 +71,7 @@ fn opening_free_space_rechecks_mole_without_blocking_the_window() {
     assert_eq!(
         app.handle(AppEvent::ReviewSpace),
         vec![
-            AppEffect::RedrawIndicator,
+            AppEffect::RequestIndicatorRedraw,
             AppEffect::CheckMoleCompatibility,
             AppEffect::ShowWindow(WindowKind::FreeSpace),
         ]
@@ -131,7 +131,7 @@ fn asynchronous_mole_error_redraws_once_before_recording_history() {
     assert_eq!(
         effects,
         vec![
-            AppEffect::RedrawIndicator,
+            AppEffect::RequestIndicatorRedraw,
             AppEffect::RecordHistory(HistoryEventKind::MoleMissing),
         ]
     );
@@ -152,7 +152,7 @@ fn asynchronous_compatible_mole_status_redraws_once_when_it_clears_the_error_bad
     )));
 
     assert_eq!(app.state().status.disk_badge, None);
-    assert_eq!(effects, vec![AppEffect::RedrawIndicator]);
+    assert_eq!(effects, vec![AppEffect::RequestIndicatorRedraw]);
 }
 
 #[test]
@@ -171,8 +171,8 @@ fn disabling_mole_with_an_active_badge_redraws_before_saving_and_stopping_sampli
     assert_eq!(
         effects,
         vec![
-            AppEffect::RedrawIndicator,
-            AppEffect::SavePreferences(Preferences::default()),
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::QueuePreferencesSave(Preferences::default()),
             AppEffect::SetDiskSamplingEnabled(false),
         ]
     );

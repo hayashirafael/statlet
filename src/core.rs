@@ -157,10 +157,12 @@ pub enum WindowKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppEffect {
-    RedrawIndicator,
+    RequestIndicatorRedraw,
     SetMetricsSamplingInterval(MetricsRefreshInterval),
     ShowWindow(WindowKind),
-    SavePreferences(Preferences),
+    QueuePreferencesSave(Preferences),
+    FlushPreferences(Preferences),
+    ReleasePreferencesWindow,
     SetDiskSamplingEnabled(bool),
     DiskPressureAlert(DiskObservation),
     RequestNotificationAuthorization,
@@ -280,14 +282,17 @@ impl StatletCore {
                 if self.state.preferences.mole_integration_enabled {
                     self.state.mole_status = MoleStatus::Unknown;
                     if self.refresh_status() {
-                        effects.push(AppEffect::RedrawIndicator);
+                        effects.push(AppEffect::RequestIndicatorRedraw);
                     }
                     effects.push(AppEffect::CheckMoleCompatibility);
                 }
                 effects.push(AppEffect::ShowWindow(WindowKind::FreeSpace));
                 effects
             }
-            AppEvent::Quit => vec![AppEffect::Quit],
+            AppEvent::Quit => vec![
+                AppEffect::FlushPreferences(self.state.preferences.clone()),
+                AppEffect::Quit,
+            ],
             AppEvent::SetMoleIntegrationEnabled(enabled) => {
                 if self.state.preferences.mole_integration_enabled == enabled {
                     return Vec::new();
@@ -304,11 +309,11 @@ impl StatletCore {
                     false
                 };
                 let mut effects = vec![
-                    AppEffect::SavePreferences(self.state.preferences.clone()),
+                    AppEffect::QueuePreferencesSave(self.state.preferences.clone()),
                     AppEffect::SetDiskSamplingEnabled(enabled),
                 ];
                 if disk_badge_changed {
-                    effects.insert(0, AppEffect::RedrawIndicator);
+                    effects.insert(0, AppEffect::RequestIndicatorRedraw);
                 }
                 if enabled {
                     effects.push(AppEffect::RequestNotificationAuthorization);
@@ -321,7 +326,9 @@ impl StatletCore {
                     return Vec::new();
                 }
                 self.state.preferences.warning_threshold = threshold;
-                vec![AppEffect::SavePreferences(self.state.preferences.clone())]
+                vec![AppEffect::QueuePreferencesSave(
+                    self.state.preferences.clone(),
+                )]
             }
             AppEvent::DiskObserved(observation) => {
                 if !self.state.preferences.mole_integration_enabled {
@@ -377,7 +384,7 @@ impl StatletCore {
                     _ => Vec::new(),
                 };
                 if disk_badge_changed {
-                    effects.insert(0, AppEffect::RedrawIndicator);
+                    effects.insert(0, AppEffect::RequestIndicatorRedraw);
                 }
                 effects
             }
@@ -431,10 +438,13 @@ impl StatletCore {
             AppEvent::PreferencesWindowClosed => {
                 self.indicator_reset_undo = None;
                 self.state.can_undo_indicator_reset = false;
-                Vec::new()
+                vec![
+                    AppEffect::FlushPreferences(self.state.preferences.clone()),
+                    AppEffect::ReleasePreferencesWindow,
+                ]
             }
             AppEvent::RetrySavePreferences => {
-                vec![AppEffect::SavePreferences(self.state.preferences.clone())]
+                vec![AppEffect::FlushPreferences(self.state.preferences.clone())]
             }
             AppEvent::PreferencesSaveFinished(result) => {
                 self.state.preferences_save_status = match result {
@@ -452,8 +462,10 @@ impl StatletCore {
         if current_interval != previous_interval {
             effects.push(AppEffect::SetMetricsSamplingInterval(current_interval));
         }
-        effects.push(AppEffect::RedrawIndicator);
-        effects.push(AppEffect::SavePreferences(self.state.preferences.clone()));
+        effects.push(AppEffect::RequestIndicatorRedraw);
+        effects.push(AppEffect::QueuePreferencesSave(
+            self.state.preferences.clone(),
+        ));
         effects
     }
 
