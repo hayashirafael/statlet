@@ -4,8 +4,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAccessibility, NSButton, NSColor, NSColorSpace, NSColorWell, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSEvent, NSStackView, NSTextField, NSTextFieldDelegate, NSView,
+    NSAccessibility, NSButton, NSColor, NSColorSpace, NSColorWell, NSColorWellStyle,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSStackView, NSTextField,
+    NSTextFieldDelegate, NSView,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
@@ -13,7 +14,10 @@ use objc2_foundation::{
 };
 use statlet::core::{AppEvent, IndicatorPreferenceChange};
 use statlet::indicator_preferences::{IndicatorAppearance, MetricKind, SrgbColor};
-use statlet::preferences_view::{ColorEditorState, HexDraftError, HexEdit};
+use statlet::preferences_view::{
+    color_well_configuration, ColorEditorFocusTarget, ColorEditorState, ColorWellPresentation,
+    HexDraftError, HexEdit,
+};
 use tao::event_loop::EventLoopProxy;
 
 use crate::macos::RuntimeEvent;
@@ -439,19 +443,30 @@ impl ColorEditor {
         next: &NSView,
         state: &ColorEditorState,
     ) {
-        unsafe {
-            if state.variants_enabled() {
-                previous.setNextKeyView(Some(&self.light.well));
-                self.light.well.setNextKeyView(Some(&self.light.hex));
-                self.light.hex.setNextKeyView(Some(&self.dark.well));
-                self.dark.well.setNextKeyView(Some(&self.dark.hex));
-                self.dark.hex.setNextKeyView(Some(&self.variants_toggle));
-            } else {
-                previous.setNextKeyView(Some(&self.shared.well));
-                self.shared.well.setNextKeyView(Some(&self.shared.hex));
-                self.shared.hex.setNextKeyView(Some(&self.variants_toggle));
+        for pair in state.tab_order().windows(2) {
+            let current = self.focus_view(pair[0], previous, next);
+            let following = self.focus_view(pair[1], previous, next);
+            unsafe {
+                current.setNextKeyView(Some(following));
             }
-            self.variants_toggle.setNextKeyView(Some(next));
+        }
+    }
+
+    fn focus_view<'a>(
+        &'a self,
+        target: ColorEditorFocusTarget,
+        previous: &'a NSView,
+        next: &'a NSView,
+    ) -> &'a NSView {
+        match target {
+            ColorEditorFocusTarget::Mode => previous,
+            ColorEditorFocusTarget::SharedWell => &self.shared.well,
+            ColorEditorFocusTarget::SharedHex => &self.shared.hex,
+            ColorEditorFocusTarget::LightWell => &self.light.well,
+            ColorEditorFocusTarget::LightHex => &self.light.hex,
+            ColorEditorFocusTarget::DarkWell => &self.dark.well,
+            ColorEditorFocusTarget::DarkHex => &self.dark.hex,
+            ColorEditorFocusTarget::NextGroup => next,
         }
     }
 }
@@ -481,7 +496,11 @@ fn create_color_row(
         ]
     };
     let well: Retained<NSColorWell> = Retained::into_super(well);
-    well.setSupportsAlpha(false);
+    let configuration = color_well_configuration();
+    match configuration.presentation() {
+        ColorWellPresentation::Minimal => well.setColorWellStyle(NSColorWellStyle::Minimal),
+    }
+    well.setSupportsAlpha(configuration.supports_alpha());
     well.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(&format!(
         "Cor {title}"
     ))));

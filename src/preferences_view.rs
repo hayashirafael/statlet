@@ -1,6 +1,34 @@
 use crate::indicator_preferences::{AppearanceColors, FixedColorPreferences, SrgbColor};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ColorWellPresentation {
+    Minimal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColorWellConfiguration {
+    presentation: ColorWellPresentation,
+    supports_alpha: bool,
+}
+
+impl ColorWellConfiguration {
+    pub const fn presentation(self) -> ColorWellPresentation {
+        self.presentation
+    }
+
+    pub const fn supports_alpha(self) -> bool {
+        self.supports_alpha
+    }
+}
+
+pub const fn color_well_configuration() -> ColorWellConfiguration {
+    ColorWellConfiguration {
+        presentation: ColorWellPresentation::Minimal,
+        supports_alpha: false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HexEdit {
     Incomplete,
     Invalid,
@@ -43,8 +71,14 @@ impl HexDraft {
         self.error = None;
 
         let digits = text.strip_prefix('#').unwrap_or(text);
-        if digits.len() != 6 {
+        if !digits.bytes().all(|digit| digit.is_ascii_hexdigit()) {
+            return HexEdit::Invalid;
+        }
+        if digits.len() < 6 {
             return HexEdit::Incomplete;
+        }
+        if digits.len() > 6 {
+            return HexEdit::Invalid;
         }
 
         match SrgbColor::parse_hex(digits) {
@@ -59,7 +93,9 @@ impl HexDraft {
 
     pub fn commit(&mut self) -> Result<SrgbColor, HexDraftError> {
         let digits = self.text.strip_prefix('#').unwrap_or(&self.text);
-        let result = if digits.len() != 6 {
+        let result = if !digits.bytes().all(|digit| digit.is_ascii_hexdigit()) {
+            Err(HexDraftError::InvalidDigit)
+        } else if digits.len() != 6 {
             Err(HexDraftError::ExpectedSixDigits)
         } else {
             SrgbColor::parse_hex(digits).map_err(|_| HexDraftError::InvalidDigit)
@@ -112,6 +148,34 @@ pub enum ColorEditorRows {
     Appearances,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ColorEditorFocusTarget {
+    Mode,
+    SharedWell,
+    SharedHex,
+    LightWell,
+    LightHex,
+    DarkWell,
+    DarkHex,
+    NextGroup,
+}
+
+const SHARED_TAB_ORDER: &[ColorEditorFocusTarget] = &[
+    ColorEditorFocusTarget::Mode,
+    ColorEditorFocusTarget::SharedWell,
+    ColorEditorFocusTarget::SharedHex,
+    ColorEditorFocusTarget::NextGroup,
+];
+
+const APPEARANCE_TAB_ORDER: &[ColorEditorFocusTarget] = &[
+    ColorEditorFocusTarget::Mode,
+    ColorEditorFocusTarget::LightWell,
+    ColorEditorFocusTarget::LightHex,
+    ColorEditorFocusTarget::DarkWell,
+    ColorEditorFocusTarget::DarkHex,
+    ColorEditorFocusTarget::NextGroup,
+];
+
 impl ColorEditorState {
     pub fn from_preferences(preferences: FixedColorPreferences) -> Self {
         let variants = preferences.variants.unwrap_or(AppearanceColors {
@@ -158,6 +222,14 @@ impl ColorEditorState {
             ColorEditorRows::Appearances
         } else {
             ColorEditorRows::Shared
+        }
+    }
+
+    pub const fn tab_order(&self) -> &'static [ColorEditorFocusTarget] {
+        if self.variants_enabled {
+            APPEARANCE_TAB_ORDER
+        } else {
+            SHARED_TAB_ORDER
         }
     }
 
