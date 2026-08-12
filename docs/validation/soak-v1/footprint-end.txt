@@ -5,4 +5,3 @@ Statlet [51430]: 64-bit    Footprint: 19956552 B (16384 bytes per page)
 Auxiliary data:
     phys_footprint: 19989320 B
     phys_footprint_peak: 20841288 B
-

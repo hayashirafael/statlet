@@ -80,6 +80,7 @@ trap cleanup EXIT
 
 sleep "$warmup_seconds"
 footprint --pid "$pid" --noCategories --format bytes >"$footprint_start"
+perl -0pi -e 's/\n+\z/\n/' "$footprint_start"
 echo "timestamp_unix,elapsed_seconds,rss_kib,cpu_percent,cpu_time,context_switches,idle_wakeups" >"$csv"
 
 started="$(date +%s)"
@@ -100,6 +101,7 @@ while :; do
 done
 
 footprint --pid "$pid" --noCategories --format bytes >"$footprint_end"
+perl -0pi -e 's/\n+\z/\n/' "$footprint_end"
 
 read -r samples elapsed_last rss_min rss_max rss_first rss_last cpu_average context_first context_last idle_first idle_last < <(
     awk -F, '
