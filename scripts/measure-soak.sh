@@ -9,7 +9,7 @@ interval="${3:-10}"
 output_dir="${4:-$(pwd)/dist/soak}"
 executable="$app/Contents/MacOS/Statlet"
 scenario="${STATLET_SOAK_SCENARIO:-Idle menu-bar sampling; Mole integration disabled; no UI interaction during samples}"
-preferences_path="$HOME/Library/Application Support/Statlet/preferences.json"
+preferences_path="${STATLET_PREFERENCES_PATH:-$HOME/Library/Application Support/Statlet/preferences.json}"
 
 if [[ -z "$output_dir" || "$output_dir" == "/" ]]; then
     echo "Refusing unsafe soak output directory: '$output_dir'" >&2

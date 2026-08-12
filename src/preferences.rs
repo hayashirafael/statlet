@@ -24,9 +24,20 @@ impl PreferencesStore {
     }
 
     pub fn for_current_user() -> io::Result<Self> {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is unavailable"))?;
+        let override_path = std::env::var_os("STATLET_PREFERENCES_PATH").map(PathBuf::from);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        Self::for_user_locations(override_path, home)
+    }
+
+    fn for_user_locations(
+        override_path: Option<PathBuf>,
+        home: Option<PathBuf>,
+    ) -> io::Result<Self> {
+        if let Some(path) = override_path {
+            return Ok(Self::new(path));
+        }
+        let home =
+            home.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is unavailable"))?;
         Ok(Self::new(home.join(
             "Library/Application Support/Statlet/preferences.json",
         )))
@@ -72,6 +83,31 @@ impl PreferencesStore {
         file.sync_all()?;
         fs::rename(temporary_path, &self.path)?;
         File::open(parent)?.sync_all()
+    }
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::PreferencesStore;
+    use std::path::PathBuf;
+
+    #[test]
+    fn explicit_preferences_path_does_not_depend_on_home() {
+        let expected = PathBuf::from("/tmp/statlet-test/preferences.json");
+        let store = PreferencesStore::for_user_locations(Some(expected.clone()), None).unwrap();
+
+        assert_eq!(store.path, expected);
+    }
+
+    #[test]
+    fn current_user_path_remains_the_default_without_an_override() {
+        let home = PathBuf::from("/Users/example");
+        let store = PreferencesStore::for_user_locations(None, Some(home)).unwrap();
+
+        assert_eq!(
+            store.path,
+            PathBuf::from("/Users/example/Library/Application Support/Statlet/preferences.json")
+        );
     }
 }
 
