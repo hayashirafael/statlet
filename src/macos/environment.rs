@@ -47,12 +47,13 @@ impl VisualEnvironment {
     pub fn current(
         button: Option<&NSStatusBarButton>,
         marker: MainThreadMarker,
-    ) -> (Self, Retained<objc2_app_kit::NSAppearance>) {
+    ) -> (Self, Retained<objc2_app_kit::NSAppearance>, String) {
         let appearance = button.map_or_else(
             || NSApplication::sharedApplication(marker).effectiveAppearance(),
             |button| button.effectiveAppearance(),
         );
-        let indicator_appearance = if appearance.name().to_string().contains("Dark") {
+        let appearance_identity = appearance.name().to_string();
+        let indicator_appearance = if appearance_identity.contains("Dark") {
             IndicatorAppearance::Dark
         } else {
             IndicatorAppearance::Light
@@ -67,6 +68,7 @@ impl VisualEnvironment {
                 reduce_transparency: workspace.accessibilityDisplayShouldReduceTransparency(),
             },
             appearance,
+            appearance_identity,
         )
     }
 

@@ -140,8 +140,10 @@ fn main() {
                 RuntimeEvent::App(app_event) => core.handle(app_event),
                 RuntimeEvent::VisualEnvironmentChanged => {
                     let marker = MainThreadMarker::new().expect("visual events run on main thread");
-                    if runtime.refresh_visual_environment(button.as_deref(), marker) {
-                        runtime.request_redraw(RedrawRequest::semantic_colors());
+                    if let Some(request) = visual_environment_redraw_request(
+                        runtime.refresh_visual_environment(button.as_deref(), marker),
+                    ) {
+                        runtime.request_redraw(request);
                     }
                     Vec::new()
                 }
@@ -151,11 +153,10 @@ fn main() {
                 }
                 RuntimeEvent::ScreenParametersChanged => {
                     let marker = MainThreadMarker::new().expect("screen events run on main thread");
-                    let request = if runtime.refresh_visual_environment(button.as_deref(), marker) {
-                        RedrawRequest::semantic_colors()
-                    } else {
-                        RedrawRequest::paint()
-                    };
+                    let request = visual_environment_redraw_request(
+                        runtime.refresh_visual_environment(button.as_deref(), marker),
+                    )
+                    .unwrap_or_else(RedrawRequest::paint);
                     runtime.request_redraw(request);
                     Vec::new()
                 }
@@ -191,6 +192,7 @@ fn main() {
 struct VisualEnvironmentState<A> {
     last: Option<VisualEnvironment>,
     status_appearance: Option<A>,
+    status_appearance_identity: Option<String>,
 }
 
 impl<A> Default for VisualEnvironmentState<A> {
@@ -198,20 +200,32 @@ impl<A> Default for VisualEnvironmentState<A> {
         Self {
             last: None,
             status_appearance: None,
+            status_appearance_identity: None,
         }
     }
 }
 
 impl<A> VisualEnvironmentState<A> {
-    fn refresh_with(&mut self, read: impl FnOnce() -> (VisualEnvironment, A)) -> bool {
-        let (current, status_appearance) = read();
-        self.record(current, status_appearance)
+    fn refresh_with<I: Into<String>>(
+        &mut self,
+        read: impl FnOnce() -> (VisualEnvironment, A, I),
+    ) -> bool {
+        let (current, status_appearance, status_appearance_identity) = read();
+        self.record(current, status_appearance, status_appearance_identity)
     }
 
-    fn record(&mut self, current: VisualEnvironment, status_appearance: A) -> bool {
-        let changed = self.last != Some(current);
+    fn record(
+        &mut self,
+        current: VisualEnvironment,
+        status_appearance: A,
+        status_appearance_identity: impl Into<String>,
+    ) -> bool {
+        let status_appearance_identity = status_appearance_identity.into();
+        let changed = self.last != Some(current)
+            || self.status_appearance_identity.as_ref() != Some(&status_appearance_identity);
         self.last = Some(current);
         self.status_appearance = Some(status_appearance);
+        self.status_appearance_identity = Some(status_appearance_identity);
         changed
     }
 
@@ -224,6 +238,10 @@ impl<A> VisualEnvironmentState<A> {
                 .expect("status appearance is captured during native initialization"),
         )
     }
+}
+
+fn visual_environment_redraw_request(changed: bool) -> Option<RedrawRequest> {
+    changed.then(RedrawRequest::semantic_colors)
 }
 
 fn set_next_wakeup(control_flow: &mut ControlFlow, runtime: &RuntimeAdapters) {
@@ -780,12 +798,13 @@ mod tests {
 
     use super::{
         apply_persistence_intent, preview_contrast_warnings, resolved_scene_srgb_colors,
-        save_preferences, PreferencesStore, PreviewContrastWarnings, RuntimeSamplers, StatletCore,
-        VisualEnvironment, VisualEnvironmentState,
+        save_preferences, visual_environment_redraw_request, PreferencesStore,
+        PreviewContrastWarnings, RuntimeSamplers, StatletCore, VisualEnvironment,
+        VisualEnvironmentState,
     };
 
     #[test]
-    fn repeated_visual_environment_notification_does_not_request_another_redraw() {
+    fn appearance_identity_change_requests_only_a_semantic_color_redraw() {
         let standard = VisualEnvironment {
             appearance: statlet::indicator_preferences::IndicatorAppearance::Light,
             increase_contrast: false,
@@ -794,15 +813,59 @@ mod tests {
         };
         let mut state = VisualEnvironmentState::default();
 
-        assert!(state.record(standard, "standard-aqua"));
-        assert!(!state.record(standard, "refreshed-aqua"));
-        assert!(state.record(
+        assert!(state.record(standard, "first-handle", "standard-aqua"));
+        let changed = state.record(standard, "second-handle", "refreshed-aqua");
+
+        assert_eq!(
+            visual_environment_redraw_request(changed),
+            Some(statlet::runtime_schedule::RedrawRequest::semantic_colors())
+        );
+        let (_, status_appearance) = state.current();
+        assert_eq!(*status_appearance, "second-handle");
+    }
+
+    #[test]
+    fn equivalent_appearance_identity_replaces_the_handle_without_requesting_redraw() {
+        let standard = VisualEnvironment {
+            appearance: statlet::indicator_preferences::IndicatorAppearance::Light,
+            increase_contrast: false,
+            differentiate_without_color: false,
+            reduce_transparency: false,
+        };
+        let mut state = VisualEnvironmentState::default();
+
+        assert!(state.record(standard, "first-handle", "standard-aqua"));
+        let changed = state.record(standard, "second-handle", "standard-aqua");
+
+        assert_eq!(visual_environment_redraw_request(changed), None);
+        let (_, status_appearance) = state.current();
+        assert_eq!(*status_appearance, "second-handle");
+    }
+
+    #[test]
+    fn visual_environment_change_still_requests_only_a_semantic_color_redraw() {
+        let standard = VisualEnvironment {
+            appearance: statlet::indicator_preferences::IndicatorAppearance::Light,
+            increase_contrast: false,
+            differentiate_without_color: false,
+            reduce_transparency: false,
+        };
+        let mut state = VisualEnvironmentState::default();
+
+        assert!(state.record(standard, "first-handle", "standard-aqua"));
+        let changed = state.record(
             VisualEnvironment {
                 increase_contrast: true,
                 ..standard
             },
-            "high-contrast-aqua",
-        ));
+            "second-handle",
+            "standard-aqua",
+        );
+
+        assert_eq!(
+            visual_environment_redraw_request(changed),
+            Some(statlet::runtime_schedule::RedrawRequest::semantic_colors())
+        );
     }
 
     #[test]
@@ -818,21 +881,21 @@ mod tests {
 
         assert!(state.refresh_with(|| {
             reads.set(reads.get() + 1);
-            (standard, "retained-aqua")
+            (standard, "retained-handle", "retained-aqua")
         }));
         for _ in 0..10 {
             let (environment, status_appearance) = state.current();
             assert_eq!(environment, standard);
-            assert_eq!(*status_appearance, "retained-aqua");
+            assert_eq!(*status_appearance, "retained-handle");
         }
         assert_eq!(reads.get(), 1);
 
         assert!(!state.refresh_with(|| {
             reads.set(reads.get() + 1);
-            (standard, "refreshed-aqua")
+            (standard, "refreshed-handle", "retained-aqua")
         }));
         let (_, status_appearance) = state.current();
-        assert_eq!(*status_appearance, "refreshed-aqua");
+        assert_eq!(*status_appearance, "refreshed-handle");
         assert_eq!(reads.get(), 2);
     }
 
