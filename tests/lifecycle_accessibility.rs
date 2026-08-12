@@ -50,6 +50,18 @@ fn reopening_without_visible_windows_exposes_preferences() {
 }
 
 #[test]
+fn repeated_preferences_requests_keep_the_same_window_kind() {
+    let mut app = StatletCore::new();
+
+    for _ in 0..2 {
+        assert_eq!(
+            app.handle(AppEvent::OpenPreferences),
+            vec![AppEffect::ShowWindow(WindowKind::Preferences)]
+        );
+    }
+}
+
+#[test]
 fn an_active_episode_survives_sleep_without_duplicate_alerts() {
     let mut app = enabled_core();
     for minute in 0..5 {
