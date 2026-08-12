@@ -2,20 +2,22 @@
 
 > Tiny system stats, stacked.
 
-Statlet será um monitor open source, compacto e local para a menu bar do macOS. CPU e RAM aparecem simultaneamente em duas linhas dentro de um único item:
+[![CI](https://github.com/hayashirafael/statlet/actions/workflows/ci.yml/badge.svg)](https://github.com/hayashirafael/statlet/actions/workflows/ci.yml)
+
+Statlet é um monitor open source, compacto e local para a menu bar do macOS. CPU e RAM aparecem simultaneamente em duas linhas dentro de um único item:
 
 ```text
 C 18%
 R 63%
 ```
 
-O projeto está em fase de especificação. Ainda não há código, release ou arquitetura implementada.
+A v1 roda em Macs com Apple Silicon e macOS 14 ou mais recente.
 
 ## Proposta
 
 - leitura imediata de CPU e RAM sem abrir um dashboard;
 - largura fixa e reduzida, adequada a MacBooks com notch;
-- funcionamento local, sem telemetry;
+- funcionamento local, sem telemetria;
 - baixo consumo de CPU, memória e energia;
 - nenhuma permissão administrativa para as métricas principais;
 - integração opcional com o [Mole](https://github.com/tw93/Mole) para avisos de pouco espaço.
@@ -60,13 +62,13 @@ Até lá, o Statlet não analisará prompts, ANSI ou arquivos textuais internos 
 
 ## Histórico
 
-O Statlet manterá localmente os 30 eventos mais recentes, sem nomes ou caminhos de arquivos.
+O Statlet mantém localmente os 30 eventos mais recentes, sem nomes ou caminhos de arquivos.
 
 Na v1, o histórico cobre alertas e bloqueios da integração. Quando a execução segura dentro do app existir, também poderá registrar horário, duração, uso antes/depois, espaço liberado e resultado. Uma limpeza conduzida externamente no Terminal não será atribuída ao Statlet.
 
 ## Direção técnica
 
-A implementação inicial será em Rust e partirá de uma derivação rastreável do [featherbar](https://github.com/nim444/featherbar), preservando histórico, copyright, licença Apache 2.0 e avisos aplicáveis.
+A implementação é em Rust e deriva de forma rastreável do [featherbar](https://github.com/nim444/featherbar), preservando histórico, copyright, licença Apache 2.0 e avisos aplicáveis.
 
 O objetivo de performance segue a referência:
 
@@ -77,15 +79,36 @@ O objetivo de performance segue a referência:
 - `autoreleasepool` por ciclo;
 - build de release otimizado e medição prolongada em Apple Silicon.
 
-Isso é uma direção aprovada, não uma afirmação de performance ainda não medida.
+O bundle de produção é medido por um soak reproduzível antes de cada release; resultados e método ficam em [`docs/validation`](docs/validation/).
 
-## Distribuição
+## Instalação
 
-A v1 será distribuída diretamente, assinada e notarizada com Developer ID. O canal inicial será GitHub Releases, com Homebrew Cask após estabilização do pacote. A Mac App Store poderá ser reavaliada se a integração externa se tornar compatível com App Sandbox.
+Baixe `Statlet-v1.0.0-macos-arm64.zip` e seu arquivo `.sha256` na [release v1.0.0](https://github.com/hayashirafael/statlet/releases/tag/v1.0.0). Valide antes de instalar:
+
+```bash
+shasum -a 256 -c Statlet-v1.0.0-macos-arm64.zip.sha256
+```
+
+Extraia o ZIP e mova `Statlet.app` para `/Applications`. O artefato informa claramente na release se possui assinatura Developer ID e notarização. Não desative o Gatekeeper nem remova o atributo de quarentena para contornar uma build não notarizada.
+
+Para compilar e verificar localmente:
+
+```bash
+bash tests/package_contract.sh
+```
+
+O bundle inclui `LICENSE`, a linhagem em `NOTICE` e um inventário reproduzível das licenças transitivas. Para atualizar esse inventário após mudar o `Cargo.lock`:
+
+```bash
+cargo install cargo-about --version 0.9.1 --locked --features cli
+bash scripts/generate-third-party-licenses.sh
+```
+
+O canal inicial é GitHub Releases. Homebrew Cask fica para depois da estabilização; a Mac App Store depende de uma arquitetura futura compatível com App Sandbox.
 
 ## Licença
 
-Statlet é distribuído sob a licença [Apache 2.0](LICENSE). Código derivado do featherbar preservará os avisos e atribuições do projeto original.
+Statlet é distribuído sob a licença [Apache 2.0](LICENSE). Código derivado do featherbar preserva os avisos e atribuições do projeto original; o bundle também contém `THIRD_PARTY_LICENSES.html`.
 
 ## Documentação
 
@@ -93,14 +116,6 @@ Statlet é distribuído sob a licença [Apache 2.0](LICENSE). Código derivado d
 - [Linguagem do domínio](CONTEXT.md)
 - [Decisões arquiteturais](docs/adr/)
 - [Pesquisa de UI/UX e mercado](docs/research/disk-cleanup-ui-market.md)
-
-## Antes de implementar
-
-- validar featherbar e métricas em um Mac Apple Silicon;
-- medir CPU, memória, energia e wakeups do próprio Statlet;
-- testar legibilidade em Retina, Light/Dark Mode, Increase Contrast e VoiceOver;
-- validar sleep/wake, troca de monitor e execução prolongada;
-- revalidar licença e comportamento das versões compatíveis do Mole;
-- definir o deployment target mínimo do macOS.
-
-Nenhum comportamento destrutivo será implementado apenas para completar a interface.
+- [Validação de acessibilidade e ciclo de vida](docs/validation/accessibility-lifecycle.md)
+- [Assinatura e notarização](docs/release/signing-and-notarization.md)
+- [Notas da v1.0.0](docs/release/v1.0.0.md)

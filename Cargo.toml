@@ -1,6 +1,6 @@
 [package]
 name = "statlet"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Tiny macOS system stats, stacked"
@@ -11,14 +11,14 @@ repository = "https://github.com/hayashirafael/statlet"
 block2 = "0.6.2"
 libc = "0.2"
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSAccessibility", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSControl", "NSStatusBarButton", "NSFont", "NSAttributedString", "NSText", "NSTextField", "NSButton", "NSPopUpButton", "NSMenu", "NSResponder", "NSColor", "NSImage", "NSStringDrawing", "NSGraphics", "NSGraphicsContext", "NSCell", "NSParagraphStyle", "NSAlert", "NSScrollView", "NSClipView"] }
-objc2-foundation = { version = "0.3.2", features = ["NSString", "NSDictionary", "NSAttributedString", "NSBundle", "NSURL", "NSError", "NSValue", "NSFileManager", "NSDate", "NSDateFormatter", "NSFormatter"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSAccessibility", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSControl", "NSStatusBarButton", "NSFont", "NSFontDescriptor", "NSAttributedString", "NSText", "NSTextField", "NSButton", "NSPopUpButton", "NSMenu", "NSResponder", "NSColor", "NSImage", "NSStringDrawing", "NSGraphics", "NSGraphicsContext", "NSCell", "NSParagraphStyle", "NSAlert", "NSScrollView", "NSClipView"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSDictionary", "NSAttributedString", "NSBundle", "NSURL", "NSError", "NSValue", "NSFileManager", "NSDate", "NSDateFormatter", "NSFormatter"] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["block2", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
-tao = "0.34"
-tray-icon = "0.21"
+tao = { version = "0.34", default-features = false }
+tray-icon = { version = "0.21", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
@@ -26,4 +26,6 @@ tempfile = "3"
 [profile.release]
 opt-level = "z"
 lto = true
+codegen-units = 1
+panic = "abort"
 strip = true

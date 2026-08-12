@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Statlet third-party licenses</title>
+  <style>
+    body { font: 14px -apple-system, BlinkMacSystemFont, sans-serif; margin: 2rem; }
+    table { border-collapse: collapse; }
+    td, th { padding: 0.3rem 0.8rem 0.3rem 0; text-align: left; vertical-align: top; }
+    pre { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Statlet third-party licenses</h1>
+  <p>Generated from the locked Apple Silicon dependency graph with cargo-about.</p>
+  <table>
+    <thead><tr><th>Component</th><th>Version</th><th>License</th></tr></thead>
+    <tbody>
+    {{#each crates}}
+      {{#if package.source}}
+      <tr>
+        <td>{{package.name}}</td>
+        <td>{{package.version}}</td>
+        <td>{{license}}</td>
+      </tr>
+      {{/if}}
+    {{/each}}
+    </tbody>
+  </table>
+  {{#each overview}}
+    <h2 id="{{id}}">{{name}}</h2>
+    <pre>{{text}}</pre>
+  {{/each}}
+</body>
+</html>
