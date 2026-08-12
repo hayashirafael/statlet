@@ -2,6 +2,12 @@ use crate::indicator_preferences::{
     AppearanceColors, FixedColorPreferences, MetricsRefreshInterval, SrgbColor,
 };
 
+mod layout;
+
+pub use layout::{
+    ControlSlot, IndicatorControlsLayout, IndicatorControlsVisibility, RowSlot, VerticalSlot,
+};
+
 const SYSTEM_MONOSPACED_LABEL: &str = "System Monospaced";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
