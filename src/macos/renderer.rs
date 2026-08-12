@@ -633,6 +633,43 @@ fn resolve_color(color: SegmentColor) -> Retained<NSColor> {
     }
 }
 
+pub fn resolved_scene_srgb_colors(
+    scene: &IndicatorScene,
+    appearance: &NSAppearance,
+) -> Vec<[f64; 3]> {
+    let resolved = RefCell::new(None);
+    let resolve = StackBlock::new(|| {
+        let colors = scene
+            .top
+            .iter()
+            .chain(&scene.bottom)
+            .chain(scene.disk_badge.iter())
+            .map(|run| resolved_srgb_components(&resolve_color(run.color)))
+            .collect();
+        resolved.replace(Some(colors));
+    });
+    unsafe {
+        let _: () = objc2::msg_send![
+            appearance,
+            performAsCurrentDrawingAppearance: &*resolve
+        ];
+    }
+    resolved
+        .into_inner()
+        .expect("drawing appearance resolves colors synchronously")
+}
+
+fn resolved_srgb_components(color: &NSColor) -> [f64; 3] {
+    let color = color
+        .colorUsingColorSpace(&NSColorSpace::sRGBColorSpace())
+        .expect("indicator colors convert to sRGB");
+    [
+        color.redComponent(),
+        color.greenComponent(),
+        color.blueComponent(),
+    ]
+}
+
 fn semantic_color(color: SemanticColor) -> Retained<NSColor> {
     match color {
         SemanticColor::Neutral => NSColor::labelColor(),
@@ -898,6 +935,67 @@ mod tests {
             paint_identity(fixed, "NSAppearanceNameAqua"),
             PaintIdentity::Srgb([0xAF, 0x52, 0xDE])
         );
+    }
+
+    fn semantic_warning_scene() -> IndicatorScene {
+        IndicatorScene {
+            top: vec![IndicatorRun {
+                text: "C 42%".to_owned(),
+                color: SegmentColor::Semantic(SemanticColor::Warning),
+            }],
+            bottom: vec![IndicatorRun {
+                text: "R 68%".to_owned(),
+                color: SegmentColor::Semantic(SemanticColor::Warning),
+            }],
+            disk_badge: None,
+            accessibility_label: "CPU 42%, RAM 68%".to_owned(),
+        }
+    }
+
+    fn test_contrast_ratio(left: [f64; 3], right: [f64; 3]) -> f64 {
+        fn luminance(color: [f64; 3]) -> f64 {
+            let [red, green, blue] = color.map(|component| {
+                if component <= 0.04045 {
+                    component / 12.92
+                } else {
+                    ((component + 0.055) / 1.055).powf(2.4)
+                }
+            });
+            0.2126 * red + 0.7152 * green + 0.0722 * blue
+        }
+
+        let left = luminance(left);
+        let right = luminance(right);
+        (left.max(right) + 0.05) / (left.min(right) + 0.05)
+    }
+
+    #[test]
+    fn aqua_semantic_runs_resolve_to_srgb_before_contrast_diagnostics() {
+        let appearance =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameAqua }).unwrap();
+
+        let colors = resolved_scene_srgb_colors(&semantic_warning_scene(), &appearance);
+
+        assert_eq!(colors.len(), 2);
+        assert!(colors
+            .into_iter()
+            .all(|color| test_contrast_ratio(color, [1.0, 1.0, 1.0]) < 4.5));
+    }
+
+    #[test]
+    fn dark_aqua_semantic_runs_resolve_to_srgb_before_contrast_diagnostics() {
+        let appearance =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameDarkAqua })
+                .unwrap();
+        let dark_background = 30.0 / 255.0;
+
+        let colors = resolved_scene_srgb_colors(&semantic_warning_scene(), &appearance);
+
+        assert_eq!(colors.len(), 2);
+        assert!(colors.into_iter().all(|color| test_contrast_ratio(
+            color,
+            [dark_background, dark_background, dark_background]
+        ) >= 4.5));
     }
 
     #[test]

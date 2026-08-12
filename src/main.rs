@@ -15,8 +15,8 @@ use statlet::core::{AppEffect, AppEvent, Preferences, PreferencesSaveResult, Sta
 use statlet::disk::macos::{ContinuousClock, StartupVolumeSampler};
 use statlet::disk::DiskSamplingSchedule;
 use statlet::history::{History, HistoryStore};
-use statlet::indicator::{compose_indicator, IndicatorScene, SegmentColor};
-use statlet::indicator_preferences::{IndicatorAppearance, MetricsRefreshInterval, SrgbColor};
+use statlet::indicator::{compose_indicator, IndicatorScene};
+use statlet::indicator_preferences::{IndicatorAppearance, MetricsRefreshInterval};
 use statlet::metrics_schedule::MetricsSamplingSchedule;
 use statlet::mole::{MoleDetection, MoleDetector, MoleInstallation, MoleStatus};
 use statlet::preferences::PreferencesStore;
@@ -28,7 +28,7 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use macos::environment::{VisualEnvironment, VisualEnvironmentObserver};
 use macos::notifications::NotificationManager;
-use macos::renderer::{PreviewImages, RenderSlot, Renderer};
+use macos::renderer::{resolved_scene_srgb_colors, PreviewImages, RenderSlot, Renderer};
 use macos::sampler::MacSampler;
 use macos::windows::{
     IndicatorFontFallback, IndicatorLayoutDiagnostics, IndicatorSurfaceUpdate,
@@ -252,9 +252,14 @@ fn decision_for(reason: RedrawReason) -> RuntimeDecision {
 
 trait RuntimeRedrawTarget {
     fn poll_due(&mut self);
+    fn coalesce_redraw_effects_owned_by_cycle(&mut self);
     fn refresh_fonts_and_invalidate(&mut self);
     fn preferences_surface_exists(&self) -> bool;
     fn redraw_indicator_surfaces(&mut self, include_previews: bool);
+}
+
+fn coalesce_redraw_effects_owned_by_cycle(effects: &mut Vec<AppEffect>) {
+    effects.retain(|effect| !matches!(effect, AppEffect::RedrawIndicator));
 }
 
 fn execute_redraw_reason(reason: RedrawReason, target: &mut impl RuntimeRedrawTarget) {
@@ -268,6 +273,9 @@ fn execute_redraw_reason(reason: RedrawReason, target: &mut impl RuntimeRedrawTa
     if decision.redraw {
         let include_previews = target.preferences_surface_exists();
         target.redraw_indicator_surfaces(include_previews);
+        if decision.sample {
+            target.coalesce_redraw_effects_owned_by_cycle();
+        }
     }
 }
 
@@ -283,6 +291,10 @@ impl RuntimeRedrawTarget for LiveRedrawTarget<'_> {
     fn poll_due(&mut self) {
         self.effects
             .extend(self.runtime.samplers.poll_due(self.core));
+    }
+
+    fn coalesce_redraw_effects_owned_by_cycle(&mut self) {
+        coalesce_redraw_effects_owned_by_cycle(&mut self.effects);
     }
 
     fn refresh_fonts_and_invalidate(&mut self) {
@@ -518,7 +530,12 @@ impl RuntimeAdapters {
             requested_family: light.font.requested_family.clone(),
             resolved_family: light.font.resolved_family.clone(),
         });
-        let contrast_warnings = preview_contrast_warnings(&light_scene, &dark_scene);
+        let contrast_warnings = preview_contrast_warnings(
+            &light_scene,
+            &light_appearance,
+            &dark_scene,
+            &dark_appearance,
+        );
         windows.update_indicator_surfaces(IndicatorSurfaceUpdate {
             previews: PreviewImages {
                 light: light.image,
@@ -538,40 +555,36 @@ impl RuntimeAdapters {
 
 fn preview_contrast_warnings(
     light_scene: &IndicatorScene,
+    light_appearance: &NSAppearance,
     dark_scene: &IndicatorScene,
+    dark_appearance: &NSAppearance,
 ) -> PreviewContrastWarnings {
-    let light_background =
-        SrgbColor::parse_hex("#FFFFFF").expect("literal preview background is valid");
-    let dark_background =
-        SrgbColor::parse_hex("#1E1E1E").expect("literal preview background is valid");
+    let light_colors = resolved_scene_srgb_colors(light_scene, light_appearance);
+    let dark_colors = resolved_scene_srgb_colors(dark_scene, dark_appearance);
+    let dark_background = 30.0 / 255.0;
     PreviewContrastWarnings {
-        light: scene_has_low_contrast(light_scene, light_background),
-        dark: scene_has_low_contrast(dark_scene, dark_background),
+        light: colors_have_low_contrast(&light_colors, [1.0, 1.0, 1.0]),
+        dark: colors_have_low_contrast(
+            &dark_colors,
+            [dark_background, dark_background, dark_background],
+        ),
     }
 }
 
-fn scene_has_low_contrast(scene: &IndicatorScene, background: SrgbColor) -> bool {
-    scene
-        .top
+fn colors_have_low_contrast(colors: &[[f64; 3]], background: [f64; 3]) -> bool {
+    colors
         .iter()
-        .chain(&scene.bottom)
-        .chain(scene.disk_badge.iter())
-        .filter_map(|run| match run.color {
-            SegmentColor::Srgb(color) => Some(color),
-            SegmentColor::Semantic(_) => None,
-        })
-        .any(|color| contrast_ratio(color, background) < 4.5)
+        .any(|color| contrast_ratio(*color, background) < 4.5)
 }
 
-fn contrast_ratio(left: SrgbColor, right: SrgbColor) -> f64 {
+fn contrast_ratio(left: [f64; 3], right: [f64; 3]) -> f64 {
     let left = relative_luminance(left);
     let right = relative_luminance(right);
     (left.max(right) + 0.05) / (left.min(right) + 0.05)
 }
 
-fn relative_luminance(color: SrgbColor) -> f64 {
-    let [red, green, blue] = color.components().map(|component| {
-        let component = f64::from(component) / 255.0;
+fn relative_luminance(color: [f64; 3]) -> f64 {
+    let [red, green, blue] = color.map(|component| {
         if component <= 0.04045 {
             component / 12.92
         } else {
@@ -741,28 +754,35 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
-    use statlet::core::{Preferences, PreferencesSaveStatus};
-    use statlet::indicator::{IndicatorRun, IndicatorScene, SegmentColor};
+    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
+    use statlet::core::{AppEffect, Preferences, PreferencesSaveStatus};
+    use statlet::history::HistoryEventKind;
+    use statlet::indicator::{IndicatorRun, IndicatorScene, SegmentColor, SemanticColor};
     use statlet::indicator_preferences::{MetricsRefreshInterval, SrgbColor};
     use tempfile::tempdir;
 
     use super::{
-        decision_for, execute_redraw_reason, preview_contrast_warnings, save_preferences,
-        PreferencesStore, RedrawReason, RuntimeDecision, RuntimeRedrawTarget, RuntimeSamplers,
-        StatletCore,
+        coalesce_redraw_effects_owned_by_cycle, decision_for, execute_redraw_reason,
+        preview_contrast_warnings, save_preferences, PreferencesStore, PreviewContrastWarnings,
+        RedrawReason, RuntimeDecision, RuntimeRedrawTarget, RuntimeSamplers, StatletCore,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum RecordedAction {
         Sample,
+        Save,
         RefreshFontsAndInvalidate,
         RedrawStatus,
-        RedrawPreviews,
+        RedrawPreviewLight,
+        RedrawPreviewDark,
     }
 
     struct FakeRedrawTarget {
         preferences_surface_exists: bool,
         actions: Vec<RecordedAction>,
+        pending_poll_effects: Vec<AppEffect>,
+        effects: Vec<AppEffect>,
+        applied_effects: Vec<AppEffect>,
     }
 
     impl FakeRedrawTarget {
@@ -770,6 +790,31 @@ mod tests {
             Self {
                 preferences_surface_exists,
                 actions: Vec::new(),
+                pending_poll_effects: Vec::new(),
+                effects: Vec::new(),
+                applied_effects: Vec::new(),
+            }
+        }
+
+        fn with_poll_result(
+            preferences_surface_exists: bool,
+            pending_poll_effects: Vec<AppEffect>,
+        ) -> Self {
+            Self {
+                pending_poll_effects,
+                ..Self::new(preferences_surface_exists)
+            }
+        }
+
+        fn apply_polled_effects(&mut self) {
+            for effect in std::mem::take(&mut self.effects) {
+                match effect {
+                    AppEffect::RedrawIndicator => {
+                        execute_redraw_reason(RedrawReason::Preferences, self)
+                    }
+                    AppEffect::SavePreferences(_) => self.actions.push(RecordedAction::Save),
+                    effect => self.applied_effects.push(effect),
+                }
             }
         }
     }
@@ -777,6 +822,11 @@ mod tests {
     impl RuntimeRedrawTarget for FakeRedrawTarget {
         fn poll_due(&mut self) {
             self.actions.push(RecordedAction::Sample);
+            self.effects.append(&mut self.pending_poll_effects);
+        }
+
+        fn coalesce_redraw_effects_owned_by_cycle(&mut self) {
+            coalesce_redraw_effects_owned_by_cycle(&mut self.effects);
         }
 
         fn refresh_fonts_and_invalidate(&mut self) {
@@ -790,7 +840,8 @@ mod tests {
         fn redraw_indicator_surfaces(&mut self, include_previews: bool) {
             self.actions.push(RecordedAction::RedrawStatus);
             if include_previews {
-                self.actions.push(RecordedAction::RedrawPreviews);
+                self.actions.push(RecordedAction::RedrawPreviewLight);
+                self.actions.push(RecordedAction::RedrawPreviewDark);
             }
         }
     }
@@ -829,6 +880,57 @@ mod tests {
     }
 
     #[test]
+    fn polling_effect_application_coalesces_the_owned_redraw_and_preserves_other_effects() {
+        for preferences_surface_exists in [false, true] {
+            let mut target = FakeRedrawTarget::with_poll_result(
+                preferences_surface_exists,
+                vec![
+                    AppEffect::RedrawIndicator,
+                    AppEffect::RecordHistory(HistoryEventKind::MonitoringFailed),
+                ],
+            );
+
+            execute_redraw_reason(RedrawReason::Metrics, &mut target);
+            target.apply_polled_effects();
+
+            assert_eq!(
+                target
+                    .actions
+                    .iter()
+                    .filter(|action| **action == RecordedAction::Sample)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                target
+                    .actions
+                    .iter()
+                    .filter(|action| **action == RecordedAction::RedrawStatus)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                target
+                    .actions
+                    .iter()
+                    .filter(|action| {
+                        matches!(
+                            action,
+                            RecordedAction::RedrawPreviewLight | RecordedAction::RedrawPreviewDark
+                        )
+                    })
+                    .count(),
+                2 * usize::from(preferences_surface_exists)
+            );
+            assert!(!target.actions.contains(&RecordedAction::Save));
+            assert_eq!(
+                target.applied_effects,
+                vec![AppEffect::RecordHistory(HistoryEventKind::MonitoringFailed)]
+            );
+        }
+    }
+
+    #[test]
     fn font_event_refreshes_and_invalidates_before_redrawing() {
         let mut target = FakeRedrawTarget::new(true);
 
@@ -839,7 +941,8 @@ mod tests {
             vec![
                 RecordedAction::RefreshFontsAndInvalidate,
                 RecordedAction::RedrawStatus,
-                RecordedAction::RedrawPreviews,
+                RecordedAction::RedrawPreviewLight,
+                RecordedAction::RedrawPreviewDark,
             ]
         );
     }
@@ -854,7 +957,11 @@ mod tests {
         execute_redraw_reason(RedrawReason::Appearance, &mut created);
         assert_eq!(
             created.actions,
-            vec![RecordedAction::RedrawStatus, RecordedAction::RedrawPreviews]
+            vec![
+                RecordedAction::RedrawStatus,
+                RecordedAction::RedrawPreviewLight,
+                RecordedAction::RedrawPreviewDark,
+            ]
         );
     }
 
@@ -874,10 +981,41 @@ mod tests {
             accessibility_label: "CPU 42%, RAM 68%".into(),
         };
 
-        let warnings = preview_contrast_warnings(&scene, &scene);
+        let warnings = warnings_for_named_previews(&scene, &scene);
 
         assert!(warnings.light);
         assert!(warnings.dark);
+    }
+
+    #[test]
+    fn preview_contrast_metadata_evaluates_semantic_colors_in_both_appearances() {
+        let warning = SegmentColor::Semantic(SemanticColor::Warning);
+        let scene = IndicatorScene {
+            top: vec![IndicatorRun {
+                text: "C 42%".into(),
+                color: warning,
+            }],
+            bottom: vec![IndicatorRun {
+                text: "R 68%".into(),
+                color: warning,
+            }],
+            disk_badge: None,
+            accessibility_label: "CPU 42%, RAM 68%".into(),
+        };
+
+        let warnings = warnings_for_named_previews(&scene, &scene);
+
+        assert!(warnings.light);
+        assert!(!warnings.dark);
+    }
+
+    fn warnings_for_named_previews(
+        light_scene: &IndicatorScene,
+        dark_scene: &IndicatorScene,
+    ) -> PreviewContrastWarnings {
+        let light = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameAqua }).unwrap();
+        let dark = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }).unwrap();
+        preview_contrast_warnings(light_scene, &light, dark_scene, &dark)
     }
 
     struct DeadlineTarget<'a> {
@@ -888,6 +1026,8 @@ mod tests {
         fn poll_due(&mut self) {
             panic!("visual redraw must not poll samplers");
         }
+
+        fn coalesce_redraw_effects_owned_by_cycle(&mut self) {}
 
         fn refresh_fonts_and_invalidate(&mut self) {}
 
