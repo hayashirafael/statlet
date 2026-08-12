@@ -87,50 +87,6 @@ struct LayoutKey {
     labels_visible: bool,
 }
 
-#[cfg(test)]
-#[derive(Clone)]
-struct CachedLayout {
-    key: LayoutKey,
-    layout: StableLayout,
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct LayoutSlots {
-    slots: SlotMap<CachedLayout>,
-}
-
-#[cfg(test)]
-impl LayoutSlots {
-    fn resolve(
-        &mut self,
-        slot: RenderSlot,
-        key: LayoutKey,
-        measure: impl FnOnce() -> StableLayout,
-    ) -> StableLayout {
-        let layout = resolve_layout(
-            self.slots
-                .get(slot)
-                .map(|cached| (&cached.key, cached.layout)),
-            &key,
-            measure,
-        );
-        self.slots.replace(slot, CachedLayout { key, layout });
-        layout
-    }
-}
-
-fn resolve_layout(
-    cached: Option<(&LayoutKey, StableLayout)>,
-    requested: &LayoutKey,
-    measure: impl FnOnce() -> StableLayout,
-) -> StableLayout {
-    match cached {
-        Some((key, layout)) if key == requested => layout,
-        _ => measure(),
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PaintIdentity {
     Srgb([u8; 3]),
@@ -141,32 +97,167 @@ enum PaintIdentity {
 }
 
 fn paint_identity(color: SegmentColor, appearance: &str) -> PaintIdentity {
-    match color {
-        SegmentColor::Srgb(color) => PaintIdentity::Srgb(color.components()),
-        SegmentColor::Semantic(color) => PaintIdentity::Semantic {
+    match color_plan(color) {
+        ColorPlan::Srgb(components) => PaintIdentity::Srgb(components),
+        ColorPlan::Semantic(color) => PaintIdentity::Semantic {
             color,
             appearance: appearance.to_owned(),
         },
     }
 }
 
-struct StatusMetadata {
-    accessibility_label: String,
-    tooltip: String,
+trait StatusMetadataTarget {
+    fn set_accessibility_label(&self, value: &str);
+    fn set_tooltip(&self, value: &str);
+}
+
+impl StatusMetadataTarget for NSStatusBarButton {
+    fn set_accessibility_label(&self, value: &str) {
+        self.setAccessibilityLabel(Some(&NSString::from_str(value)));
+    }
+
+    fn set_tooltip(&self, value: &str) {
+        self.setToolTip(Some(&NSString::from_str(value)));
+    }
+}
+
+fn apply_status_metadata(target: &impl StatusMetadataTarget, scene: &IndicatorScene) {
+    target.set_accessibility_label(&scene.accessibility_label);
+    target.set_tooltip(&scene.accessibility_label);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColorPlan {
+    Semantic(SemanticColor),
+    Srgb([u8; 3]),
+}
+
+fn color_plan(color: SegmentColor) -> ColorPlan {
+    match color {
+        SegmentColor::Semantic(color) => ColorPlan::Semantic(color),
+        SegmentColor::Srgb(color) => ColorPlan::Srgb(color.components()),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PaintKey {
     layout: LayoutKey,
     appearance: String,
-    colors: Vec<PaintIdentity>,
+    top: Vec<RunIdentity>,
+    bottom: Vec<RunIdentity>,
+    badge: Option<RunIdentity>,
 }
 
-struct SlotCache {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RunIdentity {
+    text: String,
+    paint: PaintIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaintDecision {
+    Reuse,
+    Repaint,
+}
+
+fn paint_decision(cached: Option<&PaintKey>, requested: &PaintKey) -> PaintDecision {
+    match cached {
+        Some(cached) if cached == requested => PaintDecision::Reuse,
+        _ => PaintDecision::Repaint,
+    }
+}
+
+fn paint_key(scene: &IndicatorScene, layout: LayoutKey, appearance: String) -> PaintKey {
+    PaintKey {
+        layout,
+        top: run_identities(&scene.top, &appearance),
+        bottom: run_identities(&scene.bottom, &appearance),
+        badge: scene
+            .disk_badge
+            .as_ref()
+            .map(|run| run_identity(run, &appearance)),
+        appearance,
+    }
+}
+
+fn run_identities(runs: &[IndicatorRun], appearance: &str) -> Vec<RunIdentity> {
+    runs.iter()
+        .map(|run| run_identity(run, appearance))
+        .collect()
+}
+
+fn run_identity(run: &IndicatorRun, appearance: &str) -> RunIdentity {
+    RunIdentity {
+        text: run.text.clone(),
+        paint: paint_identity(run.color, appearance),
+    }
+}
+
+struct SlotCache<I> {
     layout_key: LayoutKey,
     layout: StableLayout,
     paint_key: PaintKey,
-    image: Retained<NSImage>,
+    image: I,
+}
+
+struct SurfaceCache<I> {
+    slots: SlotMap<SlotCache<I>>,
+}
+
+impl<I> Default for SurfaceCache<I> {
+    fn default() -> Self {
+        Self {
+            slots: SlotMap::default(),
+        }
+    }
+}
+
+impl<I: Clone> SurfaceCache<I> {
+    fn resolve_layout(
+        &self,
+        slot: RenderSlot,
+        requested: &LayoutKey,
+        measure: impl FnOnce() -> StableLayout,
+    ) -> StableLayout {
+        match self.slots.get(slot) {
+            Some(cached) if &cached.layout_key == requested => cached.layout,
+            _ => measure(),
+        }
+    }
+
+    fn reused_image(&self, slot: RenderSlot, requested: &PaintKey) -> Option<I> {
+        self.slots.get(slot).and_then(|cached| {
+            (paint_decision(Some(&cached.paint_key), requested) == PaintDecision::Reuse)
+                .then(|| cached.image.clone())
+        })
+    }
+
+    fn replace(
+        &mut self,
+        slot: RenderSlot,
+        layout_key: LayoutKey,
+        layout: StableLayout,
+        paint_key: PaintKey,
+        image: I,
+    ) {
+        self.slots.replace(
+            slot,
+            SlotCache {
+                layout_key,
+                layout,
+                paint_key,
+                image,
+            },
+        );
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+    }
 }
 
 pub struct RenderOutput {
@@ -180,11 +271,15 @@ pub struct PreviewImages {
     pub dark: Retained<NSImage>,
 }
 
-fn status_metadata(scene: &statlet::indicator::IndicatorScene) -> StatusMetadata {
-    StatusMetadata {
-        accessibility_label: scene.accessibility_label.clone(),
-        tooltip: scene.accessibility_label.clone(),
-    }
+fn labels_visible(scene: &IndicatorScene) -> bool {
+    line_has_label(&scene.top, "C") || line_has_label(&scene.bottom, "R")
+}
+
+fn line_has_label(runs: &[IndicatorRun], label: &str) -> bool {
+    let text = runs.iter().map(|run| run.text.as_str()).collect::<String>();
+    text.strip_prefix(label)
+        .and_then(|remainder| remainder.chars().next())
+        .is_some_and(char::is_whitespace)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -207,7 +302,7 @@ pub struct Renderer {
     top_y: f64,
     bottom_y: f64,
     font_catalog: FontCatalog,
-    slots: SlotMap<SlotCache>,
+    cache: SurfaceCache<Retained<NSImage>>,
     default_width: f64,
 }
 
@@ -256,7 +351,7 @@ impl Renderer {
             bottom_y: margin - descent,
             top_y: margin + cap_height + LINE_GAP - descent,
             font_catalog,
-            slots: SlotMap::default(),
+            cache: SurfaceCache::default(),
             default_width,
         }
     }
@@ -269,7 +364,7 @@ impl Renderer {
         appearance: &NSAppearance,
     ) -> RenderOutput {
         let font = self.font_catalog.resolve(typography);
-        let labels_visible = scene.top.len() > 1 || scene.bottom.len() > 1;
+        let labels_visible = labels_visible(scene);
         let layout_key = LayoutKey {
             resolved_family: font.resolved_family.clone(),
             size: typography.size.points(),
@@ -277,32 +372,22 @@ impl Renderer {
             labels_visible,
         };
         let measurer = FontTextMeasurer::new(&font.font);
-        let layout = resolve_layout(
-            self.slots
-                .get(slot)
-                .map(|cached| (&cached.layout_key, cached.layout)),
-            &layout_key,
-            || measure_stable_layout(&measurer, labels_visible, self.default_width),
-        );
+        let layout = self.cache.resolve_layout(slot, &layout_key, || {
+            measure_stable_layout(&measurer, labels_visible, self.default_width)
+        });
         let appearance_name = appearance.name().to_string();
-        let paint_key = PaintKey {
-            layout: layout_key.clone(),
-            appearance: appearance_name.clone(),
-            colors: scene_colors(scene)
-                .map(|color| paint_identity(color, &appearance_name))
-                .collect(),
-        };
+        let paint_key = paint_key(scene, layout_key.clone(), appearance_name);
+        if let Some(image) = self.cache.reused_image(slot, &paint_key) {
+            return RenderOutput {
+                image,
+                layout: layout.diagnostics,
+                font,
+            };
+        }
         let image = draw_image(scene, &font.font, layout, appearance);
 
-        self.slots.replace(
-            slot,
-            SlotCache {
-                layout_key,
-                layout,
-                paint_key,
-                image: image.clone(),
-            },
-        );
+        self.cache
+            .replace(slot, layout_key, layout, paint_key, image.clone());
 
         RenderOutput {
             image,
@@ -351,15 +436,13 @@ impl Renderer {
     ) -> LayoutDiagnostics {
         let appearance = button.effectiveAppearance();
         let output = self.render(RenderSlot::Status, scene, typography, &appearance);
-        let metadata = status_metadata(scene);
         button.setImage(Some(&output.image));
-        button.setAccessibilityLabel(Some(&NSString::from_str(&metadata.accessibility_label)));
-        button.setToolTip(Some(&NSString::from_str(&metadata.tooltip)));
+        apply_status_metadata(button, scene);
         output.layout
     }
 
     pub fn cached_slot_count(&self) -> usize {
-        self.slots.len()
+        self.cache.len()
     }
 
     pub fn font_families(&self) -> &[String] {
@@ -372,7 +455,7 @@ impl Renderer {
     }
 
     pub fn invalidate(&mut self) {
-        self.slots.clear();
+        self.cache.clear();
     }
 
     pub fn set_status(&self, button: &NSStatusBarButton, status: &StatusContent) {
@@ -461,15 +544,6 @@ impl TextMeasurer for FontTextMeasurer {
     }
 }
 
-fn scene_colors(scene: &IndicatorScene) -> impl Iterator<Item = SegmentColor> + '_ {
-    scene
-        .top
-        .iter()
-        .chain(&scene.bottom)
-        .chain(scene.disk_badge.iter())
-        .map(|run| run.color)
-}
-
 fn draw_image(
     scene: &IndicatorScene,
     font: &NSFont,
@@ -547,12 +621,10 @@ fn attributed_scene_line<'a>(
 }
 
 fn resolve_color(color: SegmentColor) -> Retained<NSColor> {
-    match color {
-        SegmentColor::Semantic(color) => semantic_color(color),
-        SegmentColor::Srgb(color) => {
-            let [red, green, blue] = color
-                .components()
-                .map(|component| f64::from(component) / 255.0);
+    match color_plan(color) {
+        ColorPlan::Semantic(color) => semantic_color(color),
+        ColorPlan::Srgb(components) => {
+            let [red, green, blue] = components.map(|component| f64::from(component) / 255.0);
             let color = NSColor::colorWithSRGBRed_green_blue_alpha(red, green, blue, 1.0);
             color
                 .colorUsingColorSpace(&NSColorSpace::sRGBColorSpace())
@@ -707,15 +779,24 @@ mod tests {
 
     #[test]
     fn rerender_replaces_one_entry_per_surface_instead_of_accumulating() {
-        let mut slots = SlotMap::default();
+        let scene = scene_with_lines(&["C 42%"], &["R 68%"]);
+        let mut cache = SurfaceCache::default();
 
-        slots.replace(RenderSlot::Status, TestEntry(1));
-        slots.replace(RenderSlot::PreviewLight, TestEntry(2));
-        slots.replace(RenderSlot::PreviewDark, TestEntry(3));
-        slots.replace(RenderSlot::Status, TestEntry(4));
+        cache_test_surface(&mut cache, RenderSlot::Status, &scene, TestEntry(1));
+        cache_test_surface(&mut cache, RenderSlot::PreviewLight, &scene, TestEntry(2));
+        cache_test_surface(&mut cache, RenderSlot::PreviewDark, &scene, TestEntry(3));
+        cache_test_surface(&mut cache, RenderSlot::Status, &scene, TestEntry(4));
 
-        assert_eq!(slots.len(), 3);
-        assert_eq!(slots.get(RenderSlot::Status), Some(&TestEntry(4)));
+        let key = paint_key(
+            &scene,
+            layout_key("Menlo", true),
+            "NSAppearanceNameAqua".to_owned(),
+        );
+        assert_eq!(cache.len(), 3);
+        assert_eq!(
+            cache.reused_image(RenderSlot::Status, &key),
+            Some(TestEntry(4))
+        );
     }
 
     struct CountingMeasurer {
@@ -753,35 +834,58 @@ mod tests {
     #[test]
     fn paint_only_change_reuses_layout_but_typography_and_labels_invalidate_it() {
         let measurer = CountingMeasurer::new();
-        let mut layouts = LayoutSlots::default();
+        let scene = scene_with_lines(&["C ", "42%"], &["R ", "68%"]);
+        let mut cache = SurfaceCache::default();
         let key = layout_key("Menlo", true);
 
-        layouts.resolve(RenderSlot::Status, key.clone(), || {
+        let initial = cache.resolve_layout(RenderSlot::Status, &key, || {
             measure_stable_layout(&measurer, true, 40.0)
         });
+        cache.replace(
+            RenderSlot::Status,
+            key.clone(),
+            initial,
+            paint_key(&scene, key.clone(), "NSAppearanceNameAqua".to_owned()),
+            TestEntry(1),
+        );
         let initial_calls = measurer.calls.get();
-        layouts.resolve(RenderSlot::Status, key, || {
+        cache.resolve_layout(RenderSlot::Status, &key, || {
             measure_stable_layout(&measurer, true, 40.0)
         });
         assert_eq!(measurer.calls.get(), initial_calls);
 
-        layouts.resolve(RenderSlot::Status, layout_key("Menlo", false), || {
+        let hidden_key = layout_key("Menlo", false);
+        let hidden = cache.resolve_layout(RenderSlot::Status, &hidden_key, || {
             measure_stable_layout(&measurer, false, 40.0)
         });
         assert!(measurer.calls.get() > initial_calls);
+        cache.replace(
+            RenderSlot::Status,
+            hidden_key.clone(),
+            hidden,
+            paint_key(&scene, hidden_key, "NSAppearanceNameAqua".to_owned()),
+            TestEntry(2),
+        );
         let after_labels = measurer.calls.get();
 
-        layouts.resolve(RenderSlot::Status, layout_key("Avenir Next", false), || {
-            measure_stable_layout(&measurer, false, 40.0)
-        });
+        cache.resolve_layout(
+            RenderSlot::Status,
+            &layout_key("Avenir Next", false),
+            || measure_stable_layout(&measurer, false, 40.0),
+        );
         assert!(measurer.calls.get() > after_labels);
     }
 
     #[test]
-    fn fixed_paint_is_srgb_while_semantic_paint_tracks_the_supplied_appearance() {
+    fn production_color_plan_keeps_fixed_srgb_and_semantic_appearance_identity() {
         let fixed = SegmentColor::Srgb(SrgbColor::parse_hex("#AF52DE").unwrap());
         let semantic = SegmentColor::Semantic(SemanticColor::Warning);
 
+        assert_eq!(color_plan(fixed), ColorPlan::Srgb([0xAF, 0x52, 0xDE]));
+        assert_eq!(
+            color_plan(semantic),
+            ColorPlan::Semantic(SemanticColor::Warning)
+        );
         assert_eq!(
             paint_identity(fixed, "NSAppearanceNameAqua"),
             paint_identity(fixed, "NSAppearanceNameDarkAqua")
@@ -797,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn accessible_status_metadata_ignores_visible_runs_and_colors() {
+    fn accessible_status_metadata_is_applied_to_the_target() {
         let scene = IndicatorScene {
             top: vec![IndicatorRun {
                 text: "42%".to_owned(),
@@ -811,10 +915,34 @@ mod tests {
             accessibility_label: "CPU 42%, RAM 68%, pressão de memória normal".to_owned(),
         };
 
-        let metadata = status_metadata(&scene);
+        let target = FakeStatusTarget::default();
 
-        assert_eq!(metadata.accessibility_label, scene.accessibility_label);
-        assert_eq!(metadata.tooltip, scene.accessibility_label);
+        apply_status_metadata(&target, &scene);
+
+        assert_eq!(
+            target.accessibility_label.borrow().as_deref(),
+            Some(scene.accessibility_label.as_str())
+        );
+        assert_eq!(
+            target.tooltip.borrow().as_deref(),
+            Some(scene.accessibility_label.as_str())
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeStatusTarget {
+        accessibility_label: std::cell::RefCell<Option<String>>,
+        tooltip: std::cell::RefCell<Option<String>>,
+    }
+
+    impl StatusMetadataTarget for FakeStatusTarget {
+        fn set_accessibility_label(&self, value: &str) {
+            self.accessibility_label.replace(Some(value.to_owned()));
+        }
+
+        fn set_tooltip(&self, value: &str) {
+            self.tooltip.replace(Some(value.to_owned()));
+        }
     }
 
     #[test]
@@ -861,5 +989,104 @@ mod tests {
             button.toolTip().unwrap().to_string(),
             scene.accessibility_label
         );
+    }
+
+    #[test]
+    fn label_detection_accepts_split_and_consolidated_runs_but_rejects_hidden_labels() {
+        let split = scene_with_lines(&["C ", "42%"], &["R ", "68%"]);
+        let consolidated = scene_with_lines(&["C 42%"], &["R 68%"]);
+        let hidden = scene_with_lines(&["42%"], &["68%"]);
+
+        assert!(labels_visible(&split));
+        assert!(labels_visible(&consolidated));
+        assert!(!labels_visible(&hidden));
+    }
+
+    #[test]
+    fn identical_visual_identity_reuses_the_painted_image() {
+        let scene = scene_with_lines(&["C 42%"], &["R 68%"]);
+        let layout_key = layout_key("Menlo", true);
+        let key = paint_key(
+            &scene,
+            layout_key.clone(),
+            "NSAppearanceNameAqua".to_owned(),
+        );
+        let layout = measure_stable_layout(&CountingMeasurer::new(), true, 40.0);
+        let mut cache = SurfaceCache::default();
+        cache.replace(
+            RenderSlot::Status,
+            layout_key,
+            layout,
+            key.clone(),
+            TestEntry(7),
+        );
+
+        assert_eq!(
+            cache.reused_image(RenderSlot::Status, &key),
+            Some(TestEntry(7))
+        );
+    }
+
+    #[test]
+    fn percentage_text_change_invalidates_the_painted_image() {
+        let before = scene_with_lines(&["C 42%"], &["R 68%"]);
+        let after = scene_with_lines(&["C 43%"], &["R 68%"]);
+        let layout = layout_key("Menlo", true);
+        let cached = paint_key(&before, layout.clone(), "NSAppearanceNameAqua".to_owned());
+        let requested = paint_key(&after, layout, "NSAppearanceNameAqua".to_owned());
+        let mut cache = SurfaceCache::default();
+        cache_test_surface(&mut cache, RenderSlot::Status, &before, TestEntry(7));
+
+        assert_ne!(cached, requested);
+        assert_eq!(cache.reused_image(RenderSlot::Status, &requested), None);
+    }
+
+    #[test]
+    fn badge_text_change_invalidates_even_when_its_color_is_unchanged() {
+        let mut warning = scene_with_lines(&["C 42%"], &["R 68%"]);
+        warning.disk_badge = Some(IndicatorRun {
+            text: " !".to_owned(),
+            color: SegmentColor::Semantic(SemanticColor::DiskWarning),
+        });
+        let mut changed = warning.clone();
+        changed.disk_badge.as_mut().unwrap().text = " ?".to_owned();
+        let layout = layout_key("Menlo", true);
+        let cached = paint_key(&warning, layout.clone(), "NSAppearanceNameAqua".to_owned());
+        let requested = paint_key(&changed, layout, "NSAppearanceNameAqua".to_owned());
+        let mut cache = SurfaceCache::default();
+        cache_test_surface(&mut cache, RenderSlot::Status, &warning, TestEntry(7));
+
+        assert_ne!(cached, requested);
+        assert_eq!(cache.reused_image(RenderSlot::Status, &requested), None);
+    }
+
+    fn cache_test_surface(
+        cache: &mut SurfaceCache<TestEntry>,
+        slot: RenderSlot,
+        scene: &IndicatorScene,
+        image: TestEntry,
+    ) {
+        let layout_key = layout_key("Menlo", true);
+        let layout = measure_stable_layout(&CountingMeasurer::new(), true, 40.0);
+        let paint_key = paint_key(scene, layout_key.clone(), "NSAppearanceNameAqua".to_owned());
+        cache.replace(slot, layout_key, layout, paint_key, image);
+    }
+
+    fn scene_with_lines(top: &[&str], bottom: &[&str]) -> IndicatorScene {
+        let runs = |texts: &[&str]| {
+            texts
+                .iter()
+                .map(|text| IndicatorRun {
+                    text: (*text).to_owned(),
+                    color: SegmentColor::Semantic(SemanticColor::Neutral),
+                })
+                .collect()
+        };
+        IndicatorScene {
+            top: runs(top),
+            bottom: runs(bottom),
+            disk_badge: None,
+            accessibility_label: "CPU 42%, RAM 68%".to_owned(),
+        }
     }
 }

@@ -117,12 +117,10 @@ impl<S: FamilySource> FamilyCache<S> {
     fn resolution_plan(&self, preferences: &TypographyPreferences) -> ResolutionPlan {
         let (resolved_family, used_fallback) = match &preferences.family {
             FontFamilyPreference::SystemMonospaced => (ResolvedFamily::SystemMonospaced, false),
-            FontFamilyPreference::Named(requested)
-                if self.families.iter().any(|family| family == requested) =>
-            {
-                (ResolvedFamily::Named(requested.clone()), false)
-            }
-            FontFamilyPreference::Named(_) => (ResolvedFamily::SystemMonospaced, true),
+            FontFamilyPreference::Named(requested) => self
+                .canonical_family(requested)
+                .map(|family| (ResolvedFamily::Named(family.to_owned()), false))
+                .unwrap_or((ResolvedFamily::SystemMonospaced, true)),
         };
         ResolutionPlan {
             requested_family: preferences.family.clone(),
@@ -134,6 +132,14 @@ impl<S: FamilySource> FamilyCache<S> {
     fn refresh(&mut self) {
         self.families = normalized_families(self.source.installed_families());
     }
+
+    fn canonical_family(&self, requested: &str) -> Option<&str> {
+        let requested = folded_family(requested);
+        self.families
+            .iter()
+            .find(|family| folded_family(family) == requested)
+            .map(String::as_str)
+    }
 }
 
 fn normalized_families(families: Vec<String>) -> Vec<String> {
@@ -143,12 +149,16 @@ fn normalized_families(families: Vec<String>) -> Vec<String> {
         .filter(|family| !family.is_empty() && !family.starts_with('.'))
         .collect::<Vec<_>>();
     families.sort_by(|left, right| {
-        left.to_lowercase()
-            .cmp(&right.to_lowercase())
+        folded_family(left)
+            .cmp(&folded_family(right))
             .then_with(|| left.cmp(right))
     });
-    families.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    families.dedup_by(|left, right| folded_family(left) == folded_family(right));
     families
+}
+
+fn folded_family(family: &str) -> String {
+    family.to_lowercase()
 }
 
 fn manager_weight(weight: FontWeight) -> isize {
@@ -239,6 +249,21 @@ mod tests {
             ResolvedFamily::Named("Avenir Next".to_owned())
         );
         assert!(!named.used_fallback);
+    }
+
+    #[test]
+    fn installed_family_matches_case_insensitively_using_catalog_spelling() {
+        let cache = FamilyCache::new(FakeFamilySource::new(&["Menlo"]));
+        let requested = FontFamilyPreference::named("menlo").unwrap();
+
+        let plan = cache.resolution_plan(&preferences(requested.clone()));
+
+        assert_eq!(plan.requested_family, requested);
+        assert_eq!(
+            plan.resolved_family,
+            ResolvedFamily::Named("Menlo".to_owned())
+        );
+        assert!(!plan.used_fallback);
     }
 
     #[test]
