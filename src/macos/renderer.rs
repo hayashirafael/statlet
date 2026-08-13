@@ -942,7 +942,13 @@ fn draw_metric_line(
         };
         let prefix_width = context.measurer.width(fallback_text);
         if let Some(image) = identifier_image {
-            draw_metric_identifier(image, y, prefix_width, context);
+            draw_metric_identifier(
+                image,
+                y,
+                prefix_width,
+                matches!(identifier, MetricIdentifierVisual::SystemSymbol { .. }),
+                context,
+            );
         } else {
             attributed_scene_run(
                 context.font,
@@ -1010,19 +1016,64 @@ fn draw_metric_identifier(
     image: &NSImage,
     y: f64,
     prefix_width: f64,
+    is_system_symbol: bool,
     context: &DrawTextContext<'_>,
 ) {
     let spacing = context.measurer.width(" ");
-    let available_width = (prefix_width - spacing).max(1.0);
     let available_height = context.font.capHeight().max(1.0);
     let source = image.size();
-    let scale =
-        (available_width / source.width.max(1.0)).min(available_height / source.height.max(1.0));
-    let size = NSSize::new(source.width * scale, source.height * scale);
+    let rect = identifier_draw_rect(
+        source.width,
+        source.height,
+        prefix_width,
+        available_height,
+        spacing,
+        y,
+        is_system_symbol,
+    );
     image.drawInRect(NSRect::new(
-        NSPoint::new((available_width - size.width) / 2.0, y),
-        size,
+        NSPoint::new(rect.x, rect.y),
+        NSSize::new(rect.width, rect.height),
     ));
+}
+
+struct IdentifierDrawRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+fn identifier_draw_rect(
+    source_width: f64,
+    source_height: f64,
+    prefix_width: f64,
+    line_height: f64,
+    spacing: f64,
+    y: f64,
+    is_system_symbol: bool,
+) -> IdentifierDrawRect {
+    let (drawing_width, horizontal_width) = if is_system_symbol {
+        (line_height.max(1.0), prefix_width)
+    } else {
+        let width = (prefix_width - spacing).max(1.0);
+        (width, width)
+    };
+    let drawing_height = line_height.max(1.0);
+    let scale =
+        (drawing_width / source_width.max(1.0)).min(drawing_height / source_height.max(1.0));
+    let width = source_width * scale;
+    let height = source_height * scale;
+    IdentifierDrawRect {
+        x: (horizontal_width - width) / 2.0,
+        y: y + if is_system_symbol {
+            (drawing_height - height) / 2.0
+        } else {
+            0.0
+        },
+        width,
+        height,
+    }
 }
 
 fn create_system_symbol_image(
@@ -1402,6 +1453,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn system_symbol_draw_rect_uses_a_line_height_square_box() {
+        let rect = identifier_draw_rect(12.0, 12.0, 12.0, 10.0, 4.0, 2.0, true);
+
+        assert_eq!(rect.x, 1.0);
+        assert_eq!(rect.y, 2.0);
+        assert_eq!(rect.width, 10.0);
+        assert_eq!(rect.height, 10.0);
+    }
+
+    #[test]
+    fn png_draw_rect_keeps_the_legacy_prefix_width_limit() {
+        let rect = identifier_draw_rect(12.0, 12.0, 11.0, 10.0, 4.0, 2.0, false);
+
+        assert_eq!(rect.x, 0.0);
+        assert_eq!(rect.y, 2.0);
+        assert_eq!(rect.width, 7.0);
+        assert_eq!(rect.height, 7.0);
     }
 
     fn layout_key(family: &str, labels_visible: bool) -> LayoutKey {
