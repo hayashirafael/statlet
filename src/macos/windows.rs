@@ -6,9 +6,10 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAccessibility, NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSButton, NSColor,
-    NSControlStateValueOn, NSEventModifierFlags, NSLineBreakMode, NSPopUpButton, NSScrollView,
-    NSSegmentSwitchTracking, NSSegmentedControl, NSTableColumn, NSTableView, NSTableViewDataSource,
-    NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSEventModifierFlags, NSLineBreakMode,
+    NSPopUpButton, NSScrollView, NSSegmentSwitchTracking, NSSegmentedControl, NSTableColumn,
+    NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSArray, NSDate, NSDateFormatter, NSDateFormatterStyle,
@@ -18,7 +19,9 @@ use statlet::core::{AppEvent, AppState, Preferences, WarningThreshold, WindowKin
 use statlet::disk::format_decimal_gigabytes;
 use statlet::history::{History, HistoryEventKind, HistoryRecord, MAX_HISTORY_RECORDS};
 use statlet::mole::MoleStatus;
-use statlet::stats::{ProcessRowViewModel, SystemUsageSection, SystemUsageViewModel, UsagePoint};
+use statlet::stats::{
+    history_x_position, ProcessRowViewModel, SystemUsageSection, SystemUsageViewModel, UsagePoint,
+};
 use tao::event_loop::EventLoopProxy;
 
 use super::RuntimeEvent;
@@ -46,15 +49,15 @@ define_class!(
             let path = NSBezierPath::new();
             let width = (bounds.size.width - 4.0).max(1.0);
             let height = (bounds.size.height - 4.0).max(1.0);
-            let last_index = (points.len() - 1) as f64;
+            let window_end = points.last().expect("at least two points").observed_at;
             let mut connected = false;
-            for (index, point) in points.iter().enumerate() {
+            for point in points.iter() {
                 let Some(value) = point.value.filter(|value| value.is_finite()) else {
                     connected = false;
                     continue;
                 };
                 let graph_point = NSPoint::new(
-                    2.0 + width * index as f64 / last_index,
+                    2.0 + width * history_x_position(point.observed_at, window_end),
                     2.0 + height * value.clamp(0.0, 100.0) / 100.0,
                 );
                 if connected {
@@ -101,6 +104,8 @@ define_class!(
 
     unsafe impl NSObjectProtocol for StatsTableDataSource {}
 
+    unsafe impl NSControlTextEditingDelegate for StatsTableDataSource {}
+
     unsafe impl NSTableViewDataSource for StatsTableDataSource {
         #[unsafe(method(numberOfRowsInTableView:))]
         fn number_of_rows(&self, _table_view: &NSTableView) -> isize {
@@ -129,7 +134,42 @@ define_class!(
                 .map(|value| Retained::into_super(Retained::into_super(NSString::from_str(&value))))
         }
     }
+
+    unsafe impl NSTableViewDelegate for StatsTableDataSource {
+        #[unsafe(method_id(tableView:viewForTableColumn:row:))]
+        fn view_for_row(
+            &self,
+            _table_view: &NSTableView,
+            table_column: Option<&NSTableColumn>,
+            row: isize,
+        ) -> Option<Retained<NSView>> {
+            (|| {
+                let rows = self.ivars().rows.borrow();
+                let process = rows.get(usize::try_from(row).ok()?)?;
+                let column = table_column?.identifier().to_string();
+                let (text, accessibility_label) = process_cell_presentation(process, &column);
+                let field = NSTextField::labelWithString(
+                    &NSString::from_str(text),
+                    MainThreadMarker::new().expect("table cells are created on the main thread"),
+                );
+                field.setAccessibilityLabel(Some(&NSString::from_str(accessibility_label)));
+                if column == "memory" {
+                    field.setAlignment(objc2_app_kit::NSTextAlignment::Right);
+                }
+                Some(Retained::into_super(Retained::into_super(field)))
+            })()
+        }
+    }
 );
+
+fn process_cell_presentation<'a>(row: &'a ProcessRowViewModel, column: &str) -> (&'a str, &'a str) {
+    let text = if column == "memory" {
+        row.memory.as_str()
+    } else {
+        row.name.as_str()
+    };
+    (text, row.accessibility_label.as_str())
+}
 
 impl StatsTableDataSource {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
@@ -307,6 +347,64 @@ struct SystemUsageWindow {
     process_scroll: Retained<NSScrollView>,
     process_table: Retained<NSTableView>,
     process_data_source: Retained<StatsTableDataSource>,
+}
+
+struct SystemUsageLayout {
+    segmented: NSRect,
+    primary: NSRect,
+    secondary: NSRect,
+    status: NSRect,
+    detail_labels: [NSRect; 6],
+    detail_values: [NSRect; 6],
+    history_heading: NSRect,
+    graph: NSRect,
+    history_summary: NSRect,
+    process_heading: NSRect,
+    process_scroll: NSRect,
+}
+
+fn system_usage_layout(size: NSSize) -> SystemUsageLayout {
+    let top = size.height;
+    let detail_labels = std::array::from_fn(|index| {
+        NSRect::new(
+            NSPoint::new(size.width - 330.0, top - 100.0 - index as f64 * 30.0),
+            NSSize::new(190.0, 24.0),
+        )
+    });
+    let detail_values = std::array::from_fn(|index| {
+        NSRect::new(
+            NSPoint::new(size.width - 140.0, top - 100.0 - index as f64 * 30.0),
+            NSSize::new(116.0, 24.0),
+        )
+    });
+    SystemUsageLayout {
+        segmented: NSRect::new(
+            NSPoint::new((size.width - 200.0) / 2.0, top - 54.0),
+            NSSize::new(200.0, 28.0),
+        ),
+        primary: NSRect::new(NSPoint::new(24.0, top - 110.0), NSSize::new(240.0, 38.0)),
+        secondary: NSRect::new(NSPoint::new(24.0, top - 140.0), NSSize::new(240.0, 24.0)),
+        status: NSRect::new(NSPoint::new(24.0, top - 172.0), NSSize::new(240.0, 28.0)),
+        detail_labels,
+        detail_values,
+        history_heading: NSRect::new(NSPoint::new(24.0, top - 250.0), NSSize::new(240.0, 26.0)),
+        graph: NSRect::new(
+            NSPoint::new(24.0, top - 370.0),
+            NSSize::new((size.width - 48.0).max(1.0), 112.0),
+        ),
+        history_summary: NSRect::new(
+            NSPoint::new(24.0, top - 406.0),
+            NSSize::new((size.width - 48.0).max(1.0), 30.0),
+        ),
+        process_heading: NSRect::new(
+            NSPoint::new(24.0, top - 438.0),
+            NSSize::new((size.width - 48.0).max(1.0), 26.0),
+        ),
+        process_scroll: NSRect::new(
+            NSPoint::new(24.0, 24.0),
+            NSSize::new((size.width - 48.0).max(1.0), (size.height - 468.0).max(1.0)),
+        ),
+    }
 }
 
 impl WindowManager {
@@ -567,11 +665,21 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
     unsafe { window.setReleasedWhenClosed(false) };
     window.setCollectionBehavior(NSWindowCollectionBehavior::MoveToActiveSpace);
     window.setTitle(ns_string!("Uso do sistema"));
-    window.setMinSize(NSSize::new(620.0, 520.0));
+    window.setContentMinSize(NSSize::new(620.0, 520.0));
     window.center();
     let content = window
         .contentView()
         .expect("system-usage window content view");
+    let layout = system_usage_layout(content.bounds().size);
+    let top_left_mask =
+        NSAutoresizingMaskOptions::ViewMaxXMargin | NSAutoresizingMaskOptions::ViewMinYMargin;
+    let top_center_mask = NSAutoresizingMaskOptions::ViewMinXMargin
+        | NSAutoresizingMaskOptions::ViewMaxXMargin
+        | NSAutoresizingMaskOptions::ViewMinYMargin;
+    let top_right_mask =
+        NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin;
+    let full_width_top_mask =
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin;
 
     let labels =
         NSArray::from_retained_slice(&[NSString::from_str("RAM"), NSString::from_str("GPU")]);
@@ -584,45 +692,27 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
             mtm,
         )
     };
-    segmented_control.setFrame(NSRect::new(
-        NSPoint::new(240.0, 566.0),
-        NSSize::new(200.0, 28.0),
-    ));
+    segmented_control.setFrame(layout.segmented);
+    segmented_control.setAutoresizingMask(top_center_mask);
     segmented_control.setSelectedSegment(0);
     segmented_control.setAccessibilityLabel(Some(ns_string!("Seção de uso do sistema")));
 
-    let primary_value = text_label(
-        mtm,
-        "—",
-        NSRect::new(NSPoint::new(24.0, 510.0), NSSize::new(300.0, 38.0)),
-    );
+    let primary_value = text_label(mtm, "—", layout.primary);
+    primary_value.setAutoresizingMask(top_left_mask);
     primary_value.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(28.0)));
-    let secondary_value = text_label(
-        mtm,
-        "",
-        NSRect::new(NSPoint::new(24.0, 480.0), NSSize::new(300.0, 24.0)),
-    );
-    let status = text_label(
-        mtm,
-        "Coletando a primeira leitura…",
-        NSRect::new(NSPoint::new(24.0, 448.0), NSSize::new(310.0, 28.0)),
-    );
+    let secondary_value = text_label(mtm, "", layout.secondary);
+    secondary_value.setAutoresizingMask(top_left_mask);
+    let status = text_label(mtm, "Coletando a primeira leitura…", layout.status);
+    status.setAutoresizingMask(top_left_mask);
     status.setTextColor(Some(&NSColor::secondaryLabelColor()));
 
     let mut detail_labels = Vec::with_capacity(6);
     let mut detail_values = Vec::with_capacity(6);
     for index in 0..6 {
-        let y = 520.0 - index as f64 * 30.0;
-        let label = text_label(
-            mtm,
-            "",
-            NSRect::new(NSPoint::new(350.0, y), NSSize::new(190.0, 24.0)),
-        );
-        let value = text_label(
-            mtm,
-            "",
-            NSRect::new(NSPoint::new(540.0, y), NSSize::new(116.0, 24.0)),
-        );
+        let label = text_label(mtm, "", layout.detail_labels[index]);
+        label.setAutoresizingMask(top_right_mask);
+        let value = text_label(mtm, "", layout.detail_values[index]);
+        value.setAutoresizingMask(top_right_mask);
         value.setAlignment(objc2_app_kit::NSTextAlignment::Right);
         value.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(13.0)));
         label.setHidden(true);
@@ -633,35 +723,24 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
         detail_values.push(value);
     }
 
-    let history_heading = text_label(
-        mtm,
-        "Últimos 5 minutos",
-        NSRect::new(NSPoint::new(24.0, 410.0), NSSize::new(300.0, 26.0)),
-    );
+    let history_heading = text_label(mtm, "Últimos 5 minutos", layout.history_heading);
+    history_heading.setAutoresizingMask(top_left_mask);
     history_heading.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(15.0)));
-    let graph = UsageGraphView::new(
-        mtm,
-        NSRect::new(NSPoint::new(24.0, 286.0), NSSize::new(632.0, 116.0)),
-    );
-    graph.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    let graph = UsageGraphView::new(mtm, layout.graph);
+    graph.setAutoresizingMask(full_width_top_mask);
     let history_summary = text_label(
         mtm,
         "O histórico aparecerá após duas leituras.",
-        NSRect::new(NSPoint::new(24.0, 250.0), NSSize::new(632.0, 30.0)),
+        layout.history_summary,
     );
     history_summary.setTextColor(Some(&NSColor::secondaryLabelColor()));
-    history_summary.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    history_summary.setAutoresizingMask(full_width_top_mask);
 
-    let process_heading = text_label(
-        mtm,
-        "Maiores usos de memória agora",
-        NSRect::new(NSPoint::new(24.0, 218.0), NSSize::new(400.0, 26.0)),
-    );
+    let process_heading = text_label(mtm, "Maiores usos de memória agora", layout.process_heading);
+    process_heading.setAutoresizingMask(full_width_top_mask);
     process_heading.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(15.0)));
-    let process_scroll = NSScrollView::initWithFrame(
-        NSScrollView::alloc(mtm),
-        NSRect::new(NSPoint::new(24.0, 24.0), NSSize::new(632.0, 188.0)),
-    );
+    let process_scroll =
+        NSScrollView::initWithFrame(NSScrollView::alloc(mtm), layout.process_scroll);
     process_scroll.setHasVerticalScroller(true);
     process_scroll.setDrawsBackground(false);
     process_scroll.setAutoresizingMask(
@@ -691,6 +770,7 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
     let process_data_source = StatsTableDataSource::new(mtm);
     unsafe {
         process_table.setDataSource(Some(ProtocolObject::from_ref(&*process_data_source)));
+        process_table.setDelegate(Some(ProtocolObject::from_ref(&*process_data_source)));
     }
     process_scroll.setDocumentView(Some(&process_table));
 
@@ -1120,4 +1200,47 @@ fn create_window(mtm: MainThreadMarker, title: &str, size: NSSize) -> Retained<N
 
 fn threshold_title(threshold: WarningThreshold) -> Retained<objc2_foundation::NSString> {
     objc2_foundation::NSString::from_str(&format!("{}%", threshold.get()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{process_cell_presentation, system_usage_layout};
+    use objc2_foundation::NSSize;
+    use statlet::stats::ProcessRowViewModel;
+
+    #[test]
+    fn native_process_cells_use_the_complete_row_accessibility_label() {
+        let row = ProcessRowViewModel {
+            pid: 42,
+            name: "Safari".to_owned(),
+            memory: "512 MB".to_owned(),
+            accessibility_label: "Safari, 512 MB".to_owned(),
+        };
+
+        assert_eq!(
+            process_cell_presentation(&row, "process"),
+            ("Safari", "Safari, 512 MB")
+        );
+        assert_eq!(
+            process_cell_presentation(&row, "memory"),
+            ("512 MB", "Safari, 512 MB")
+        );
+    }
+
+    #[test]
+    fn system_usage_layout_fits_without_overlap_at_the_declared_minimum() {
+        let layout = system_usage_layout(NSSize::new(620.0, 520.0));
+        let max_x = |frame: objc2_foundation::NSRect| frame.origin.x + frame.size.width;
+        let max_y = |frame: objc2_foundation::NSRect| frame.origin.y + frame.size.height;
+
+        assert!(max_x(layout.segmented) <= 620.0);
+        assert!(max_y(layout.segmented) <= 520.0);
+        assert!(max_x(layout.primary) < layout.detail_labels[0].origin.x);
+        assert!(max_x(layout.history_heading) < layout.detail_labels[4].origin.x);
+        assert!(max_y(layout.graph) < layout.detail_values[5].origin.y);
+        assert!(max_y(layout.history_summary) < layout.graph.origin.y);
+        assert!(max_y(layout.process_heading) < layout.history_summary.origin.y);
+        assert!(max_y(layout.process_scroll) < layout.process_heading.origin.y);
+        assert!(layout.process_scroll.size.height >= 50.0);
+    }
 }

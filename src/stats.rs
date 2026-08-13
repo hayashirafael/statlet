@@ -5,6 +5,7 @@ use crate::core::MemoryPressure;
 use crate::metrics::MemoryReading;
 
 pub const USAGE_HISTORY_CAPACITY: usize = 150;
+pub const USAGE_HISTORY_WINDOW: Duration = Duration::from_secs(5 * 60);
 const MAX_CONTINUOUS_SAMPLE_GAP: Duration = Duration::from_secs(6);
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(4);
@@ -86,6 +87,14 @@ enum GpuReadingState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MemoryReadingState {
+    Collecting,
+    Available(MemoryReading),
+    Stale(MemoryReading),
+    Failed,
+}
+
 impl GpuReading {
     pub fn normalized(
         utilization_percent: f64,
@@ -114,11 +123,15 @@ fn normalize_optional_percent(value: f64) -> Option<f64> {
     normalize_required_percent(value)
 }
 
+pub fn history_x_position(observed_at: Duration, window_end: Duration) -> f64 {
+    let age = window_end.saturating_sub(observed_at);
+    (1.0 - age.as_secs_f64() / USAGE_HISTORY_WINDOW.as_secs_f64()).clamp(0.0, 1.0)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SystemUsageModel {
     visible: bool,
-    memory: Option<MemoryReading>,
-    memory_stale: bool,
+    memory_state: MemoryReadingState,
     ram_history: UsageHistory,
     gpu_state: GpuReadingState,
     gpu_history: UsageHistory,
@@ -129,6 +142,19 @@ pub struct SystemUsageModel {
 pub struct ProcessSamplingSchedule {
     visible: bool,
     next_due: Option<Duration>,
+}
+
+pub trait SystemUsageSamplingPorts {
+    fn sample_gpu(&mut self) -> GpuSampleOutcome;
+    fn request_process_sample(&mut self, generation: u64) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SystemUsageSamplingCoordinator {
+    visible: bool,
+    generation: u64,
+    process_in_flight: bool,
+    process_schedule: ProcessSamplingSchedule,
 }
 
 impl UsageHistory {
@@ -158,6 +184,7 @@ impl UsageHistory {
             });
         }
         self.push_point(UsagePoint { observed_at, value });
+        self.expire_before(observed_at.saturating_sub(USAGE_HISTORY_WINDOW));
     }
 
     fn push_point(&mut self, point: UsagePoint) {
@@ -165,6 +192,16 @@ impl UsageHistory {
             self.points.pop_front();
         }
         self.points.push_back(point);
+    }
+
+    fn expire_before(&mut self, cutoff: Duration) {
+        while self
+            .points
+            .front()
+            .is_some_and(|point| point.observed_at < cutoff)
+        {
+            self.points.pop_front();
+        }
     }
 
     pub fn points(&self) -> &VecDeque<UsagePoint> {
@@ -183,6 +220,8 @@ impl SystemUsageModel {
 
     pub fn set_visible(&mut self, visible: bool) {
         if self.visible && !visible {
+            self.ram_history.clear();
+            self.memory_state = MemoryReadingState::Collecting;
             self.gpu_history.clear();
             self.gpu_state = GpuReadingState::Collecting;
             self.processes.clear();
@@ -194,12 +233,18 @@ impl SystemUsageModel {
         match outcome {
             Ok(reading) => {
                 self.ram_history.push(observed_at, Some(reading.percent));
-                self.memory = Some(reading);
-                self.memory_stale = false;
+                self.memory_state = MemoryReadingState::Available(reading);
             }
             Err(()) => {
                 self.ram_history.push(observed_at, None);
-                self.memory_stale = self.memory.is_some();
+                self.memory_state = match self.memory_state {
+                    MemoryReadingState::Available(reading) | MemoryReadingState::Stale(reading) => {
+                        MemoryReadingState::Stale(reading)
+                    }
+                    MemoryReadingState::Collecting | MemoryReadingState::Failed => {
+                        MemoryReadingState::Failed
+                    }
+                };
             }
         }
     }
@@ -261,14 +306,27 @@ impl SystemUsageModel {
     }
 
     fn ram_view_model(&self) -> SystemUsageViewModel {
-        let Some(memory) = self.memory else {
-            let mut view_model = empty_view_model(
-                SystemUsageSection::Ram,
-                "Coletando a primeira leitura…",
-                &self.ram_history,
-            );
-            view_model.process_rows = self.process_rows();
-            return view_model;
+        let (memory, memory_stale) = match self.memory_state {
+            MemoryReadingState::Collecting => {
+                let mut view_model = empty_view_model(
+                    SystemUsageSection::Ram,
+                    "Coletando a primeira leitura…",
+                    &self.ram_history,
+                );
+                view_model.process_rows = self.process_rows();
+                return view_model;
+            }
+            MemoryReadingState::Failed => {
+                let mut view_model = empty_view_model(
+                    SystemUsageSection::Ram,
+                    "Não foi possível ler a RAM.",
+                    &self.ram_history,
+                );
+                view_model.process_rows = self.process_rows();
+                return view_model;
+            }
+            MemoryReadingState::Available(reading) => (reading, false),
+            MemoryReadingState::Stale(reading) => (reading, true),
         };
         let (symbol, pressure) = match memory.pressure {
             MemoryPressure::Normal => ("✓", "Pressão normal"),
@@ -284,7 +342,7 @@ impl SystemUsageModel {
                 format_bytes(memory.used_bytes),
                 format_bytes(memory.total_bytes)
             ),
-            status: if self.memory_stale {
+            status: if memory_stale {
                 format!("{symbol} {pressure} — atualização interrompida; última leitura preservada")
             } else {
                 format!("{symbol} {pressure}")
@@ -407,12 +465,61 @@ impl ProcessSamplingSchedule {
     }
 }
 
+impl SystemUsageSamplingCoordinator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn collect_if_visible<P: SystemUsageSamplingPorts>(
+        &mut self,
+        now: Duration,
+        visible: bool,
+        ports: &mut P,
+    ) -> Option<GpuSampleOutcome> {
+        if visible != self.visible {
+            self.visible = visible;
+            self.generation = self.generation.wrapping_add(1);
+            self.process_in_flight = false;
+            self.process_schedule.set_visible(visible, now);
+        }
+        if !visible {
+            return None;
+        }
+
+        let gpu = ports.sample_gpu();
+        if !self.process_in_flight && self.process_schedule.take_due(now) {
+            self.process_in_flight = ports.request_process_sample(self.generation);
+        }
+        Some(gpu)
+    }
+
+    pub fn accept_process_sample(&mut self, generation: u64) -> bool {
+        if !self.visible || !self.process_in_flight || generation != self.generation {
+            return false;
+        }
+        self.process_in_flight = false;
+        true
+    }
+
+    pub fn record_processes_if_current(
+        &mut self,
+        generation: u64,
+        outcome: Result<Vec<ProcessMemory>, ()>,
+        model: &mut SystemUsageModel,
+    ) -> bool {
+        if !self.accept_process_sample(generation) {
+            return false;
+        }
+        model.record_processes(outcome);
+        true
+    }
+}
+
 impl Default for SystemUsageModel {
     fn default() -> Self {
         Self {
             visible: false,
-            memory: None,
-            memory_stale: false,
+            memory_state: MemoryReadingState::Collecting,
             ram_history: UsageHistory::new(),
             gpu_state: GpuReadingState::Collecting,
             gpu_history: UsageHistory::new(),
@@ -440,26 +547,46 @@ fn empty_view_model(
 }
 
 fn history_summary(section: SystemUsageSection, history: &[UsagePoint]) -> String {
-    let values = history
-        .iter()
-        .filter_map(|point| point.value)
-        .collect::<Vec<_>>();
-    if values.len() < 2 {
-        return "O histórico aparecerá após duas leituras.".to_owned();
-    }
-    let current = values.last().copied().unwrap_or_default();
-    let minimum = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let maximum = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let metric = match section {
         SystemUsageSection::Ram => "RAM",
         SystemUsageSection::Gpu => "GPU",
     };
-    format!(
-        "Histórico de uso de {metric}, últimos 5 minutos. Atual {}%, mínimo {}%, máximo {}%.",
-        current.round() as u8,
-        minimum.round() as u8,
-        maximum.round() as u8
-    )
+    let values = history
+        .iter()
+        .filter_map(|point| point.value)
+        .collect::<Vec<_>>();
+    let gaps = history.iter().filter(|point| point.value.is_none()).count();
+    let gap_summary = match gaps {
+        0 => String::new(),
+        1 => "; 1 lacuna".to_owned(),
+        count => format!("; {count} lacunas"),
+    };
+    if values.is_empty() && gaps > 0 {
+        return format!(
+            "Histórico de uso de {metric}, últimos 5 minutos. Leitura atual indisponível; nenhuma leitura válida{gap_summary}."
+        );
+    }
+    if values.len() < 2 && gaps == 0 {
+        return "O histórico aparecerá após duas leituras.".to_owned();
+    }
+    let last_valid = values.last().copied().unwrap_or_default();
+    let minimum = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let maximum = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if history.last().is_some_and(|point| point.value.is_some()) {
+        format!(
+            "Histórico de uso de {metric}, últimos 5 minutos. Atual {}%, mínimo {}%, máximo {}%{gap_summary}.",
+            last_valid.round() as u8,
+            minimum.round() as u8,
+            maximum.round() as u8
+        )
+    } else {
+        format!(
+            "Histórico de uso de {metric}, últimos 5 minutos. Leitura atual indisponível; última válida {}%, mínimo {}%, máximo {}%{gap_summary}.",
+            last_valid.round() as u8,
+            minimum.round() as u8,
+            maximum.round() as u8
+        )
+    }
 }
 
 fn detail(label: &'static str, bytes: u64) -> StatsDetailRow {

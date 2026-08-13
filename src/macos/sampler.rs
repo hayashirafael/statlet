@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::ffi::CString;
 use std::mem;
 
@@ -42,22 +43,63 @@ impl MacSampler {
         })
     }
 
-    pub fn sample_processes(&mut self) -> Vec<ProcessMemory> {
-        self.system.refresh_processes_specifics(
+    pub fn sample_processes() -> Vec<ProcessMemory> {
+        let mut system = System::new();
+        system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing().with_memory(),
         );
-        self.system
-            .processes()
-            .iter()
-            .map(|(pid, process)| ProcessMemory {
-                pid: pid.as_u32(),
-                name: process.name().to_string_lossy().into_owned(),
-                memory_bytes: process.memory(),
-            })
-            .collect()
+        select_top_process_ids(
+            system
+                .processes()
+                .iter()
+                .map(|(pid, process)| (pid.as_u32(), process.memory())),
+            20,
+        )
+        .into_iter()
+        .filter_map(|(pid, memory_bytes)| {
+            system
+                .processes()
+                .iter()
+                .find(|(candidate, _)| candidate.as_u32() == pid)
+                .map(|(_, process)| ProcessMemory {
+                    pid,
+                    name: process.name().to_string_lossy().into_owned(),
+                    memory_bytes,
+                })
+        })
+        .collect()
     }
+}
+
+fn select_top_process_ids<I>(candidates: I, limit: usize) -> Vec<(u32, u64)>
+where
+    I: IntoIterator<Item = (u32, u64)>,
+{
+    let mut top = Vec::with_capacity(limit);
+    for candidate in candidates {
+        if top.len() < limit {
+            top.push(candidate);
+            continue;
+        }
+        let Some((worst_index, worst)) = top
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| process_rank(left, right))
+        else {
+            continue;
+        };
+        if process_rank(&candidate, worst).is_gt() {
+            top[worst_index] = candidate;
+        }
+    }
+    top.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    top
+}
+
+fn process_rank(left: &(u32, u64), right: &(u32, u64)) -> Ordering {
+    left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0))
 }
 
 fn read_memory(total_bytes: u64, swap_used_bytes: u64) -> Option<MemoryReading> {
@@ -116,4 +158,24 @@ fn read_memory_pressure() -> Option<MemoryPressure> {
     }
 
     MemoryPressure::try_from(level).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_top_process_ids;
+
+    #[test]
+    fn process_candidates_are_bounded_and_sorted_before_names_are_allocated() {
+        let candidates = (0..25).map(|pid| (pid, u64::from(pid) * 100));
+
+        let top = select_top_process_ids(candidates, 20);
+
+        assert_eq!(top.len(), 20);
+        assert_eq!(top.first(), Some(&(24, 2_400)));
+        assert_eq!(top.last(), Some(&(5, 500)));
+        assert_eq!(
+            select_top_process_ids([(9, 500), (3, 500), (7, 100)], 2),
+            vec![(3, 500), (9, 500)]
+        );
+    }
 }

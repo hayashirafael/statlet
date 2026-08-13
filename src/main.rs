@@ -28,7 +28,9 @@ use macos::renderer::Renderer;
 use macos::sampler::MacSampler;
 use macos::windows::WindowManager;
 use macos::RuntimeEvent;
-use statlet::stats::{ProcessSamplingSchedule, SystemUsageModel, SystemUsageSection};
+use statlet::stats::{
+    SystemUsageModel, SystemUsageSamplingCoordinator, SystemUsageSamplingPorts, SystemUsageSection,
+};
 
 const METRICS_REFRESH: Duration = Duration::from_secs(2);
 
@@ -134,6 +136,13 @@ fn main() {
                     .apply_detection(generation, detection)
                     .map(|status| core.handle(AppEvent::MoleStatusObserved(status)))
                     .unwrap_or_default(),
+                RuntimeEvent::ProcessesSampled {
+                    generation,
+                    processes,
+                } => {
+                    runtime.samplers.record_processes(generation, processes);
+                    Vec::new()
+                }
             };
             if runtime.apply_effects(&effects, &mut core) {
                 *control_flow = ControlFlow::Exit;
@@ -176,7 +185,7 @@ impl RuntimeAdapters {
             history_store,
             history,
             windows: None,
-            samplers: RuntimeSamplers::new(),
+            samplers: RuntimeSamplers::new(proxy.clone()),
             mole: RuntimeMole::new(proxy),
             notifications: None,
             review_space_item,
@@ -385,11 +394,12 @@ struct RuntimeSamplers {
     clock: ContinuousClock,
     gpu: MacGpuSampler,
     system_usage: SystemUsageModel,
-    process_schedule: ProcessSamplingSchedule,
+    system_usage_sampling: SystemUsageSamplingCoordinator,
+    process_proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
 }
 
 impl RuntimeSamplers {
-    fn new() -> Self {
+    fn new(process_proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>) -> Self {
         let mut metrics = MacSampler::new();
         metrics.prime_cpu();
         Self {
@@ -399,7 +409,8 @@ impl RuntimeSamplers {
             clock: ContinuousClock::new().expect("initialize the macOS continuous clock"),
             gpu: MacGpuSampler::new(),
             system_usage: SystemUsageModel::new(),
-            process_schedule: ProcessSamplingSchedule::new(),
+            system_usage_sampling: SystemUsageSamplingCoordinator::new(),
+            process_proxy,
         }
     }
 
@@ -417,20 +428,25 @@ impl RuntimeSamplers {
         objc2::rc::autoreleasepool(|_| {
             let now = self.clock.now();
             self.system_usage.set_visible(system_usage_visible);
-            self.process_schedule.set_visible(system_usage_visible, now);
             match self.metrics.sample() {
                 Some(snapshot) => {
                     core.handle(AppEvent::MetricsSample(snapshot.compact));
-                    self.system_usage.record_memory(now, Ok(snapshot.memory));
+                    if system_usage_visible {
+                        self.system_usage.record_memory(now, Ok(snapshot.memory));
+                    }
                 }
-                None => self.system_usage.record_memory(now, Err(())),
+                None if system_usage_visible => self.system_usage.record_memory(now, Err(())),
+                None => {}
             }
-            if system_usage_visible {
-                self.system_usage.record_gpu(now, self.gpu.sample());
-                if self.process_schedule.take_due(now) {
-                    self.system_usage
-                        .record_processes(Ok(self.metrics.sample_processes()));
-                }
+            let mut ports = RuntimeSystemUsagePorts {
+                gpu: &mut self.gpu,
+                process_proxy: &self.process_proxy,
+            };
+            if let Some(gpu) =
+                self.system_usage_sampling
+                    .collect_if_visible(now, system_usage_visible, &mut ports)
+            {
+                self.system_usage.record_gpu(now, gpu);
             }
             let effects = if self.disk_schedule.take_due(now) {
                 match self.disk.sample(now) {
@@ -456,5 +472,38 @@ impl RuntimeSamplers {
         section: SystemUsageSection,
     ) -> statlet::stats::SystemUsageViewModel {
         self.system_usage.view_model(section)
+    }
+
+    fn record_processes(&mut self, generation: u64, processes: Vec<statlet::stats::ProcessMemory>) {
+        self.system_usage_sampling.record_processes_if_current(
+            generation,
+            Ok(processes),
+            &mut self.system_usage,
+        );
+    }
+}
+
+struct RuntimeSystemUsagePorts<'a> {
+    gpu: &'a mut MacGpuSampler,
+    process_proxy: &'a tao::event_loop::EventLoopProxy<RuntimeEvent>,
+}
+
+impl SystemUsageSamplingPorts for RuntimeSystemUsagePorts<'_> {
+    fn sample_gpu(&mut self) -> statlet::stats::GpuSampleOutcome {
+        self.gpu.sample()
+    }
+
+    fn request_process_sample(&mut self, generation: u64) -> bool {
+        let proxy = self.process_proxy.clone();
+        thread::Builder::new()
+            .name("statlet-process-sample".to_owned())
+            .spawn(move || {
+                let processes = MacSampler::sample_processes();
+                let _ = proxy.send_event(RuntimeEvent::ProcessesSampled {
+                    generation,
+                    processes,
+                });
+            })
+            .is_ok()
     }
 }

@@ -1,5 +1,6 @@
 use statlet::core::AppEvent;
 use statlet::mole::MoleDetection;
+use statlet::stats::ProcessMemory;
 
 pub mod gpu;
 pub mod notifications;
@@ -13,5 +14,9 @@ pub enum RuntimeEvent {
     MoleDetected {
         generation: u64,
         detection: MoleDetection,
+    },
+    ProcessesSampled {
+        generation: u64,
+        processes: Vec<ProcessMemory>,
     },
 }

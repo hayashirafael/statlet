@@ -78,6 +78,10 @@ struct GpuKeys {
     allocated_system_memory: CfKey,
 }
 
+fn missing_performance_statistics_outcome() -> GpuSampleOutcome {
+    GpuSampleOutcome::Unavailable
+}
+
 impl GpuKeys {
     fn new() -> Self {
         Self {
@@ -145,7 +149,7 @@ impl MacGpuSampler {
             )
         };
         if dictionary.is_null() {
-            return GpuSampleOutcome::Failed;
+            return missing_performance_statistics_outcome();
         }
         let outcome = unsafe { self.read_dictionary(dictionary) };
         unsafe { CFRelease(dictionary) };
@@ -236,7 +240,7 @@ unsafe fn dictionary_u64(dictionary: CfDictionaryRef, key: CfStringRef) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use super::MacGpuSampler;
+    use super::{missing_performance_statistics_outcome, MacGpuSampler};
     use statlet::stats::GpuSampleOutcome;
 
     #[test]
@@ -246,5 +250,13 @@ mod tests {
         if let GpuSampleOutcome::Available(reading) = sampler.sample() {
             assert!((0.0..=100.0).contains(&reading.utilization_percent));
         }
+    }
+
+    #[test]
+    fn missing_performance_statistics_is_an_unavailable_capability() {
+        assert_eq!(
+            missing_performance_statistics_outcome(),
+            GpuSampleOutcome::Unavailable
+        );
     }
 }
