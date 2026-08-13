@@ -27,8 +27,10 @@ use objc2_foundation::{
 };
 use statlet::core::{AppState, WindowKind};
 use statlet::history::History;
+use statlet::icon_assets::IconAssetStore;
 use statlet::indicator::LayoutDiagnostics;
 use statlet::indicator_preferences::FontFamilyPreference;
+use statlet::runtime_profile::RuntimePresentation;
 use statlet::system_usage::{
     graph_pointer_selection, history_x_position, GraphNavigation, GraphNavigationCommand,
     MemoryCompositionSegment, ProcessListStatus, ProcessRowViewModel, SurfaceObservation,
@@ -607,6 +609,8 @@ pub struct WindowManager {
     history: Option<HistoryWindow>,
     free_space: Option<FreeSpaceWindow>,
     system_usage: Option<SystemUsageWindow>,
+    presentation: RuntimePresentation,
+    icon_asset_store: IconAssetStore,
 }
 
 trait RetainedStateConsumer {
@@ -822,7 +826,12 @@ fn accessibility_object_is_inside(mut object: Retained<AnyObject>, ancestor: &An
 }
 
 impl WindowManager {
-    pub fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Self {
+    pub fn new(
+        mtm: MainThreadMarker,
+        proxy: EventLoopProxy<RuntimeEvent>,
+        presentation: RuntimePresentation,
+        icon_asset_store: IconAssetStore,
+    ) -> Self {
         let system_usage_visible = Arc::new(AtomicBool::new(false));
         let system_usage_generation = Arc::new(AtomicU64::new(0));
         let control_target = ControlTarget::new(
@@ -838,6 +847,8 @@ impl WindowManager {
             history: None,
             free_space: None,
             system_usage: None,
+            presentation,
+            icon_asset_store,
         }
     }
 
@@ -851,7 +862,14 @@ impl WindowManager {
                     &mut self.preferences,
                     self.free_space.as_ref(),
                     state,
-                    || PreferencesWindow::new(mtm, &target),
+                    || {
+                        PreferencesWindow::new(
+                            mtm,
+                            &target,
+                            self.presentation.clone(),
+                            self.icon_asset_store.clone(),
+                        )
+                    },
                 );
                 &preferences.window
             }
@@ -888,6 +906,7 @@ impl WindowManager {
                     .window
             }
         };
+        window.setTitle(&NSString::from_str(&window_title(kind, &self.presentation)));
 
         let app = NSApplication::sharedApplication(mtm);
         // A window is shown only after an explicit launch, menu choice, or
@@ -966,6 +985,16 @@ impl WindowManager {
     pub fn release_preferences(&mut self) {
         release_preferences(&mut self.preferences);
     }
+}
+
+fn window_title(kind: WindowKind, presentation: &RuntimePresentation) -> String {
+    let production_title = match kind {
+        WindowKind::Preferences => "Preferências do Statlet",
+        WindowKind::History => "Histórico do Statlet",
+        WindowKind::FreeSpace => "Liberar espaço",
+        WindowKind::SystemUsage => "Uso do sistema",
+    };
+    presentation.window_title(production_title)
 }
 
 fn system_usage_interaction_observation(
@@ -1392,9 +1421,45 @@ fn system_usage_shortcut_keys() -> [&'static str; 3] {
 mod tests {
     use std::cell::RefCell;
 
-    use statlet::core::{AppState, StatletCore};
+    use statlet::core::{AppState, StatletCore, WindowKind};
 
-    use super::{prepare_preferences_for_show, release_preferences, RetainedStateConsumer};
+    use super::{
+        prepare_preferences_for_show, release_preferences, window_title, RetainedStateConsumer,
+    };
+
+    #[test]
+    fn every_window_kind_uses_the_runtime_presentation_title() {
+        let profile = statlet::runtime_profile::RuntimeProfile::resolve(
+            statlet::runtime_profile::BundleProfileMetadata {
+                bundle_identifier: Some(
+                    "io.github.hayashirafael.Statlet.dev.task-a-0123456789ab".into(),
+                ),
+                runtime_profile: Some("development".into()),
+                dev_instance_id: Some("task-a-0123456789ab".into()),
+                dev_display_name: Some("Task A".into()),
+                dev_short_marker: Some("0123".into()),
+            },
+        )
+        .unwrap();
+        let presentation = profile.presentation();
+
+        assert_eq!(
+            window_title(WindowKind::Preferences, &presentation),
+            "Preferências do Statlet — Dev 0123: Task A"
+        );
+        assert_eq!(
+            window_title(WindowKind::History, &presentation),
+            "Histórico do Statlet — Dev 0123: Task A"
+        );
+        assert_eq!(
+            window_title(WindowKind::FreeSpace, &presentation),
+            "Liberar espaço — Dev 0123: Task A"
+        );
+        assert_eq!(
+            window_title(WindowKind::SystemUsage, &presentation),
+            "Uso do sistema — Dev 0123: Task A"
+        );
+    }
 
     #[test]
     fn system_usage_shortcuts_include_the_native_close_command() {

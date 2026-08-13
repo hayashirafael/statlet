@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -13,7 +13,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint,
-    NSRect, NSSize,
+    NSRect, NSSize, NSString,
 };
 use statlet::core::{AppEvent, IndicatorPreferenceChange};
 use statlet::icon_assets::IconAssetStore;
@@ -26,6 +26,7 @@ use statlet::preferences_view::{
     ColorEditorState, IdentifierDetailPresentation, IndicatorControlsLayout,
     IndicatorControlsVisibility, IntervalDraft, MetricIdentifierControlPresentation,
 };
+use statlet::runtime_profile::RuntimePresentation;
 use tao::event_loop::EventLoopProxy;
 
 use super::color_editor::{ColorBinding, ColorEditor};
@@ -39,6 +40,7 @@ use crate::macos::RuntimeEvent;
 
 struct IndicatorControlsTargetIvars {
     proxy: EventLoopProxy<RuntimeEvent>,
+    presentation: RuntimePresentation,
     applying: Cell<bool>,
     selected_family: RefCell<FontFamilyPreference>,
     selected_font_size: Cell<FontSize>,
@@ -65,6 +67,33 @@ struct IndicatorControlsTargetIvars {
 struct FontResources {
     picker: FontPicker,
     catalog: FontCatalog,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PngPanelPresentation {
+    title: Option<String>,
+    prompt: String,
+    message: String,
+}
+
+fn png_panel_presentation(
+    metric: MetricKind,
+    presentation: &RuntimePresentation,
+) -> PngPanelPresentation {
+    const PROMPT: &str = "Escolher PNG";
+    const MESSAGE: &str =
+        "Escolha um PNG com transparência. O Statlet reduzirá e otimizará uma cópia.";
+    let production_title = match metric {
+        MetricKind::Cpu => "Escolher PNG da CPU",
+        MetricKind::Ram => "Escolher PNG da RAM",
+    };
+    PngPanelPresentation {
+        title: presentation
+            .dev_marker()
+            .map(|_| presentation.window_title(production_title)),
+        prompt: PROMPT.to_owned(),
+        message: presentation.status_metadata(MESSAGE),
+    }
 }
 
 fn get_or_create_font_resources<T>(slot: &mut Option<T>, create: impl FnOnce() -> T) -> &mut T {
@@ -217,7 +246,7 @@ define_class!(
             let proxy = self.ivars().proxy.clone();
             let mut slot = self.ivars().font_resources.borrow_mut();
             let resources = get_or_create_font_resources(&mut slot, || FontResources {
-                picker: FontPicker::new(marker, proxy),
+                picker: FontPicker::new(marker, proxy, self.ivars().presentation.clone()),
                 catalog: FontCatalog::new(marker),
             });
             resources.catalog.refresh();
@@ -375,16 +404,18 @@ impl IndicatorControlsTarget {
         };
         let marker = MainThreadMarker::new().expect("PNG picker actions run on main thread");
         let panel = NSOpenPanel::openPanel(marker);
+        let panel_presentation = png_panel_presentation(metric, &self.ivars().presentation);
         panel.setCanChooseDirectories(false);
         panel.setCanChooseFiles(true);
         panel.setAllowsMultipleSelection(false);
         panel.setResolvesAliases(true);
         #[allow(deprecated)]
         panel.setAllowedFileTypes(Some(&NSArray::from_slice(&[ns_string!("png")])));
-        panel.setPrompt(Some(ns_string!("Escolher PNG")));
-        panel.setMessage(Some(ns_string!(
-            "Escolha um PNG com transparência. O Statlet reduzirá e otimizará uma cópia."
-        )));
+        if let Some(title) = panel_presentation.title.as_deref() {
+            panel.setTitle(Some(&NSString::from_str(title)));
+        }
+        panel.setPrompt(Some(&NSString::from_str(&panel_presentation.prompt)));
+        panel.setMessage(Some(&NSString::from_str(&panel_presentation.message)));
 
         let proxy = self.ivars().proxy.clone();
         let panel_for_completion = panel.clone();
@@ -603,6 +634,21 @@ struct MetricIdentifierControls {
     remove: Retained<NSButton>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct ThumbnailAssetPlan {
+    store: IconAssetStore,
+}
+
+impl ThumbnailAssetPlan {
+    pub(super) fn new(store: IconAssetStore) -> Self {
+        Self { store }
+    }
+
+    fn path_for(&self, metric: MetricKind, should_load: bool) -> Option<PathBuf> {
+        should_load.then(|| self.store.path_for(metric))
+    }
+}
+
 impl MetricIdentifierControls {
     fn retained(&self) -> Self {
         Self {
@@ -660,7 +706,7 @@ impl MetricIdentifierControls {
         preferences: &statlet::indicator_preferences::MetricIdentifierPreferences,
         error: Option<&str>,
         processing: bool,
-        store: &IconAssetStore,
+        thumbnail_assets: &ThumbnailAssetPlan,
     ) {
         restore_identifier_segment(&self.mode, preferences.mode);
         if let Some(index) = SystemSymbolName::curated_options()
@@ -713,15 +759,17 @@ impl MetricIdentifierControls {
                     .setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(
                         status.unwrap_or("Nenhum PNG escolhido."),
                     )));
-                if can_remove && !presentation.processing {
-                    if let Some(path) = store.path_for(self.metric).to_str() {
-                        if let Some(image) = NSImage::initWithContentsOfFile(
-                            NSImage::alloc(),
-                            &objc2_foundation::NSString::from_str(path),
-                        ) {
-                            self.thumbnail.setImage(Some(&image));
-                            self.thumbnail.setHidden(false);
-                        }
+                if let Some(path) = thumbnail_assets
+                    .path_for(self.metric, can_remove && !presentation.processing)
+                    .as_deref()
+                    .and_then(Path::to_str)
+                {
+                    if let Some(image) = NSImage::initWithContentsOfFile(
+                        NSImage::alloc(),
+                        &objc2_foundation::NSString::from_str(path),
+                    ) {
+                        self.thumbnail.setImage(Some(&image));
+                        self.thumbnail.setHidden(false);
                     }
                 }
             }
@@ -1167,7 +1215,7 @@ pub(super) struct IndicatorControls {
     ram_mode: Retained<NSSegmentedControl>,
     cpu_identifier: MetricIdentifierControls,
     ram_identifier: MetricIdentifierControls,
-    icon_asset_store: IconAssetStore,
+    thumbnail_assets: ThumbnailAssetPlan,
     labels_visible: Retained<NSButton>,
     label_spacing: Retained<NSSlider>,
     labels_mode: Retained<NSSegmentedControl>,
@@ -1186,7 +1234,12 @@ pub(super) struct IndicatorControls {
 }
 
 impl IndicatorControls {
-    pub(super) fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Self {
+    pub(super) fn new(
+        mtm: MainThreadMarker,
+        proxy: EventLoopProxy<RuntimeEvent>,
+        presentation: RuntimePresentation,
+        thumbnail_assets: ThumbnailAssetPlan,
+    ) -> Self {
         let view = NSStackView::initWithFrame(
             NSStackView::alloc(mtm),
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 0.0)),
@@ -1395,6 +1448,7 @@ impl IndicatorControls {
             mtm,
             IndicatorControlsTargetIvars {
                 proxy: proxy.clone(),
+                presentation,
                 applying: Cell::new(false),
                 selected_family: RefCell::new(defaults.typography.family.clone()),
                 selected_font_size: Cell::new(defaults.typography.size),
@@ -1589,8 +1643,7 @@ impl IndicatorControls {
             ram_mode,
             cpu_identifier,
             ram_identifier,
-            icon_asset_store: IconAssetStore::for_current_user()
-                .expect("resolve the current user's indicator icon directory"),
+            thumbnail_assets,
             labels_visible,
             label_spacing,
             labels_mode,
@@ -1643,13 +1696,13 @@ impl IndicatorControls {
             &preferences.identifiers.cpu,
             cpu_icon_error,
             cpu_icon_pending,
-            &self.icon_asset_store,
+            &self.thumbnail_assets,
         );
         self.ram_identifier.apply(
             &preferences.identifiers.ram,
             ram_icon_error,
             ram_icon_pending,
-            &self.icon_asset_store,
+            &self.thumbnail_assets,
         );
         self.cpu_mode
             .setSelectedSegment(match preferences.cpu_color.mode {
@@ -2320,8 +2373,13 @@ fn set_warning_text(field: &NSTextField, message: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::path::PathBuf;
 
-    use super::{get_or_create_font_resources, IndicatorAreaVisibility};
+    use statlet::icon_assets::IconAssetStore;
+    use statlet::indicator_preferences::MetricKind;
+    use statlet::runtime_profile::{BundleProfileMetadata, RuntimeProfile};
+
+    use super::{get_or_create_font_resources, png_panel_presentation, IndicatorAreaVisibility};
     use crate::macos::windows::preferences::PreferencesArea;
 
     #[test]
@@ -2379,5 +2437,60 @@ mod tests {
 
         assert_eq!((first, second), (7, 7));
         assert_eq!(creations.get(), 1);
+    }
+
+    #[test]
+    fn injected_store_drives_the_preferences_thumbnail_plan() {
+        let store = IconAssetStore::new(PathBuf::from(
+            "/Users/example/Library/Application Support/Statlet/Dev/task-a-0123456789ab/indicator-icons",
+        ));
+
+        let plan = super::ThumbnailAssetPlan::new(store);
+
+        assert_eq!(
+            plan.path_for(MetricKind::Cpu, true),
+            Some(PathBuf::from(
+                "/Users/example/Library/Application Support/Statlet/Dev/task-a-0123456789ab/indicator-icons/cpu.png"
+            ))
+        );
+        assert_eq!(plan.path_for(MetricKind::Cpu, false), None);
+    }
+
+    #[test]
+    fn production_png_panel_copy_remains_byte_for_byte_unchanged() {
+        let panel = png_panel_presentation(MetricKind::Cpu, &Default::default());
+
+        assert_eq!(panel.title, None);
+        assert_eq!(panel.prompt, "Escolher PNG");
+        assert_eq!(
+            panel.message,
+            "Escolha um PNG com transparência. O Statlet reduzirá e otimizará uma cópia."
+        );
+    }
+
+    #[test]
+    fn development_png_panel_identifies_the_profile_in_title_and_message() {
+        let profile = RuntimeProfile::resolve(BundleProfileMetadata {
+            bundle_identifier: Some(
+                "io.github.hayashirafael.Statlet.dev.task-a-0123456789ab".into(),
+            ),
+            runtime_profile: Some("development".into()),
+            dev_instance_id: Some("task-a-0123456789ab".into()),
+            dev_display_name: Some("Task A".into()),
+            dev_short_marker: Some("0123".into()),
+        })
+        .unwrap();
+
+        let panel = png_panel_presentation(MetricKind::Ram, &profile.presentation());
+
+        assert_eq!(
+            panel.title.as_deref(),
+            Some("Escolher PNG da RAM — Dev 0123: Task A")
+        );
+        assert_eq!(panel.prompt, "Escolher PNG");
+        assert_eq!(
+            panel.message,
+            "Statlet Dev — Task A (task-a-0123456789ab): Escolha um PNG com transparência. O Statlet reduzirá e otimizará uma cópia."
+        );
     }
 }

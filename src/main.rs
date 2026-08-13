@@ -32,6 +32,7 @@ use statlet::metrics::MemoryReading;
 use statlet::metrics_schedule::MetricsSamplingSchedule;
 use statlet::mole::{MoleDetection, MoleDetector, MoleInstallation, MoleStatus};
 use statlet::preferences::{PreferencesCommitState, PreferencesSaveError, PreferencesStore};
+use statlet::runtime_profile::{RuntimeProfile, StorageOverrides};
 use statlet::runtime_schedule::{RedrawRequest, RuntimeSchedule};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -55,6 +56,24 @@ use statlet::system_usage::{
 };
 
 fn main() {
+    let profile = RuntimeProfile::resolve(macos::bundle_profile_metadata())
+        .expect("resolve the Statlet bundle runtime profile");
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .expect("HOME is required to resolve Statlet storage");
+    let storage = profile
+        .storage(
+            &home,
+            StorageOverrides {
+                preferences_path: std::env::var_os("STATLET_PREFERENCES_PATH")
+                    .map(std::path::PathBuf::from),
+                icon_assets_directory: std::env::var_os("STATLET_ICON_ASSETS_DIR")
+                    .map(std::path::PathBuf::from),
+            },
+        )
+        .expect("resolve Statlet storage for the runtime profile");
+    let presentation = profile.presentation();
+
     let mut event_loop = EventLoopBuilder::<RuntimeEvent>::with_user_event().build();
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
     let proxy = event_loop.create_proxy();
@@ -70,6 +89,13 @@ fn main() {
     let quit = MenuItem::new("Sair", true, None);
     let quit_id: MenuId = quit.id().clone();
     let menu = Menu::new();
+    let dev_identity_item = presentation
+        .menu_identity()
+        .map(|identity| MenuItem::new(identity, false, None));
+    if let Some(identity) = &dev_identity_item {
+        menu.append(identity)
+            .expect("build Dev identity menu header");
+    }
     menu.append(&system_usage_item).expect("build menu");
     menu.append(&review_space_item).expect("build menu");
     menu.append(&preferences_item).expect("build menu");
@@ -96,26 +122,26 @@ fn main() {
         }
     }));
 
-    let preferences_store = PreferencesStore::for_current_user()
-        .expect("resolve the current user's preferences directory");
-    let history_store =
-        HistoryStore::for_current_user().expect("resolve the current user's history directory");
-    let icon_asset_store = IconAssetStore::for_current_user()
-        .expect("resolve the current user's indicator icon directory");
+    let preferences_store = PreferencesStore::new(storage.preferences_path);
+    let history_store = HistoryStore::new(storage.history_path);
+    let icon_asset_store = IconAssetStore::new(storage.icon_assets_directory);
     let history = history_store.load();
     let initial_preferences = preferences_store.load();
     let initial_metrics_interval = initial_preferences.indicator.refresh_interval;
     let (mut core, startup_effects) = StatletCore::with_preferences(initial_preferences);
+    let mut renderer = Renderer::new(icon_asset_store.clone(), presentation.clone());
     let mut runtime = RuntimeAdapters::new(
-        preferences_store,
-        icon_asset_store,
-        history_store,
+        RuntimeStores {
+            preferences: preferences_store,
+            icon_assets: icon_asset_store,
+            history: history_store,
+        },
         history,
         review_space_item,
         proxy.clone(),
         initial_metrics_interval,
+        presentation,
     );
-    let mut renderer = Renderer::new();
     // tray-icon removes the status item when its owner is dropped.
     let mut _retained_tray: Option<TrayIcon> = None;
     let mut button = None;
@@ -322,22 +348,28 @@ struct RuntimeAdapters {
     png_import_generations: [u64; 2],
     prepared_png_imports: [Option<PreparedPngAsset>; 2],
     system_usage: SystemUsageSession,
+    presentation: statlet::runtime_profile::RuntimePresentation,
+}
+
+struct RuntimeStores {
+    preferences: PreferencesStore,
+    icon_assets: IconAssetStore,
+    history: HistoryStore,
 }
 
 impl RuntimeAdapters {
     fn new(
-        preferences_store: PreferencesStore,
-        icon_asset_store: IconAssetStore,
-        history_store: HistoryStore,
+        stores: RuntimeStores,
         history: History,
         review_space_item: MenuItem,
         proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
         metrics_interval: MetricsRefreshInterval,
+        presentation: statlet::runtime_profile::RuntimePresentation,
     ) -> Self {
         Self {
-            preferences_store,
-            icon_asset_store,
-            history_store,
+            preferences_store: stores.preferences,
+            icon_asset_store: stores.icon_assets,
+            history_store: stores.history,
             history,
             windows: None,
             samplers: RuntimeSamplers::new(metrics_interval, Some(proxy.clone())),
@@ -351,6 +383,7 @@ impl RuntimeAdapters {
             event_proxy: proxy,
             png_import_generations: [0; 2],
             prepared_png_imports: [None, None],
+            presentation,
         }
     }
 
@@ -387,8 +420,14 @@ impl RuntimeAdapters {
         proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
         button: Option<&objc2_app_kit::NSStatusBarButton>,
     ) {
-        self.windows = Some(WindowManager::new(marker, proxy.clone()));
-        self.notifications = NotificationManager::new(marker, proxy.clone());
+        self.windows = Some(WindowManager::new(
+            marker,
+            proxy.clone(),
+            self.presentation.clone(),
+            self.icon_asset_store.clone(),
+        ));
+        self.notifications =
+            NotificationManager::new(marker, proxy.clone(), self.presentation.clone());
         let mut observer = VisualEnvironmentObserver::new(marker, proxy);
         observer.rebind_status_button(button);
         self.visual_environment_observer = Some(observer);
