@@ -926,10 +926,13 @@ impl WindowManager {
     }
 
     pub fn system_usage_observation(&self) -> SurfaceObservation {
+        let visible = self.system_usage_visible();
         SurfaceObservation {
-            visible: self.system_usage_visible(),
+            visible,
             native_visibility_epoch: self.system_usage_visibility_generation(),
-            process_interaction_active: self.system_usage_process_interaction_active(),
+            process_interaction_active: system_usage_interaction_observation(visible, || {
+                self.system_usage_process_interaction_active()
+            }),
         }
     }
 
@@ -963,6 +966,13 @@ impl WindowManager {
     pub fn release_preferences(&mut self) {
         release_preferences(&mut self.preferences);
     }
+}
+
+fn system_usage_interaction_observation(
+    visible: bool,
+    observe_interaction: impl FnOnce() -> bool,
+) -> bool {
+    visible && observe_interaction()
 }
 
 impl SystemUsageWindow {
@@ -1451,12 +1461,14 @@ mod tests {
 
 #[cfg(test)]
 mod system_usage_tests {
+    use std::cell::Cell;
+
     use super::{
         accessibility_announcement_user_info, detail_label_display_text, detail_label_frame,
         detail_value_display_text, focused_process_disappearance_announcement,
         memory_composition_stroke_style, process_cell_presentation, process_selection_after_update,
-        process_table_column_widths, process_table_height_for_visible_rows, system_usage_layout,
-        system_usage_min_content_size,
+        process_table_column_widths, process_table_height_for_visible_rows,
+        system_usage_interaction_observation, system_usage_layout, system_usage_min_content_size,
     };
     use objc2::msg_send;
     use objc2_app_kit::{
@@ -1464,6 +1476,26 @@ mod system_usage_tests {
     };
     use objc2_foundation::NSSize;
     use statlet::system_usage::ProcessRowViewModel;
+
+    #[test]
+    fn hidden_system_usage_surface_does_not_query_process_interaction() {
+        let interaction_queries = Cell::new(0);
+        let interaction_active = system_usage_interaction_observation(false, || {
+            interaction_queries.set(interaction_queries.get() + 1);
+            true
+        });
+
+        assert!(!interaction_active);
+        assert_eq!(interaction_queries.get(), 0);
+
+        let interaction_active = system_usage_interaction_observation(true, || {
+            interaction_queries.set(interaction_queries.get() + 1);
+            true
+        });
+
+        assert!(interaction_active);
+        assert_eq!(interaction_queries.get(), 1);
+    }
 
     #[test]
     fn native_announcement_payload_includes_message_and_medium_priority() {
