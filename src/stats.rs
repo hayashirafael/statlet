@@ -1,4 +1,8 @@
 use std::collections::VecDeque;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use crate::core::MemoryPressure;
@@ -8,12 +12,125 @@ pub const USAGE_HISTORY_CAPACITY: usize = 150;
 pub const USAGE_HISTORY_WINDOW: Duration = Duration::from_secs(5 * 60);
 const MAX_CONTINUOUS_SAMPLE_GAP: Duration = Duration::from_secs(6);
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
-const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(4);
+const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(6);
+const MAX_PROCESS_REORDER_DEFERRAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UsagePoint {
     pub observed_at: Duration,
     pub value: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphNavigationCommand {
+    Previous,
+    Next,
+    First,
+    Last,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphSampleSelection {
+    pub index: usize,
+    pub accessibility_value: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphNavigation {
+    selected_observed_at: Option<Duration>,
+    follows_latest: bool,
+}
+
+impl Default for GraphNavigation {
+    fn default() -> Self {
+        Self {
+            selected_observed_at: None,
+            follows_latest: true,
+        }
+    }
+}
+
+impl GraphNavigation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update_points(&mut self, points: &[UsagePoint]) -> Option<GraphSampleSelection> {
+        let valid_indices = valid_graph_indices(points);
+        let index = if self.follows_latest {
+            valid_indices.last().copied()
+        } else {
+            self.selected_observed_at
+                .and_then(|observed_at| {
+                    valid_indices
+                        .iter()
+                        .copied()
+                        .find(|&index| points[index].observed_at == observed_at)
+                })
+                .or_else(|| valid_indices.first().copied())
+        }?;
+        self.selected_observed_at = Some(points[index].observed_at);
+        Some(graph_selection(points, index))
+    }
+
+    pub fn move_selection(
+        &mut self,
+        points: &[UsagePoint],
+        command: GraphNavigationCommand,
+    ) -> Option<GraphSampleSelection> {
+        let valid_indices = valid_graph_indices(points);
+        let current = self
+            .selected_observed_at
+            .and_then(|observed_at| {
+                valid_indices
+                    .iter()
+                    .position(|&index| points[index].observed_at == observed_at)
+            })
+            .unwrap_or_else(|| valid_indices.len().saturating_sub(1));
+        let position = match command {
+            GraphNavigationCommand::Previous => current.saturating_sub(1),
+            GraphNavigationCommand::Next => {
+                (current + 1).min(valid_indices.len().saturating_sub(1))
+            }
+            GraphNavigationCommand::First => 0,
+            GraphNavigationCommand::Last => valid_indices.len().saturating_sub(1),
+        };
+        let index = *valid_indices.get(position)?;
+        self.follows_latest = index == *valid_indices.last()?;
+        self.selected_observed_at = Some(points[index].observed_at);
+        Some(graph_selection(points, index))
+    }
+}
+
+fn valid_graph_indices(points: &[UsagePoint]) -> Vec<usize> {
+    points
+        .iter()
+        .enumerate()
+        .filter_map(|(index, point)| point.value.filter(|value| value.is_finite()).map(|_| index))
+        .collect()
+}
+
+fn graph_selection(points: &[UsagePoint], index: usize) -> GraphSampleSelection {
+    let point = points[index];
+    let window_end = points
+        .last()
+        .map_or(point.observed_at, |last| last.observed_at);
+    let age = window_end.saturating_sub(point.observed_at).as_secs();
+    let time = match age {
+        0 => "agora".to_owned(),
+        1 => "há 1 segundo".to_owned(),
+        seconds => format!("há {seconds} segundos"),
+    };
+    GraphSampleSelection {
+        index,
+        accessibility_value: format!(
+            "{}%, {time}",
+            point
+                .value
+                .expect("selection only contains valid points")
+                .round() as u8
+        ),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -51,6 +168,12 @@ pub struct StatsDetailRow {
     pub value: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryCompositionSegment {
+    pub label: &'static str,
+    pub fraction: f64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessMemory {
     pub pid: u32,
@@ -58,12 +181,52 @@ pub struct ProcessMemory {
     pub memory_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProcessListStatus {
+    #[default]
+    Collecting,
+    Available,
+    Unavailable,
+    Failed,
+    Stale,
+}
+
+impl ProcessListStatus {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Collecting => "Coletando detalhes por processo…",
+            Self::Available => "",
+            Self::Unavailable => "Detalhes por processo não estão disponíveis nesta leitura.",
+            Self::Failed => "Não foi possível ler os detalhes por processo.",
+            Self::Stale => "Detalhes por processo desatualizados; última leitura preservada.",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProcessSampleOutcome {
+    Available(Vec<ProcessMemory>),
+    Unavailable,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessSampleCompletion {
+    pub observed_at: Duration,
+    pub live_visible: bool,
+    pub interaction_active: bool,
+    pub request_visibility_generation: u64,
+    pub live_visibility_generation: u64,
+    pub generation: u64,
+    pub outcome: ProcessSampleOutcome,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessRowViewModel {
     pub pid: u32,
     pub name: String,
     pub memory: String,
-    pub accessibility_label: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -73,9 +236,35 @@ pub struct SystemUsageViewModel {
     pub secondary_value: String,
     pub status: String,
     pub details: Vec<StatsDetailRow>,
+    pub memory_composition: Vec<MemoryCompositionSegment>,
+    pub memory_composition_accessibility_label: String,
     pub history: Vec<UsagePoint>,
     pub history_accessibility_label: String,
     pub process_rows: Vec<ProcessRowViewModel>,
+    pub process_status: ProcessListStatus,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SystemUsageRenderCoalescer {
+    last_rendered: Option<SystemUsageViewModel>,
+}
+
+impl SystemUsageRenderCoalescer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn take_changed(&mut self, view_model: &SystemUsageViewModel) -> bool {
+        if self.last_rendered.as_ref() == Some(view_model) {
+            return false;
+        }
+        self.last_rendered = Some(view_model.clone());
+        true
+    }
+
+    pub fn reset(&mut self) {
+        self.last_rendered = None;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -113,6 +302,15 @@ impl GpuReading {
             device_name,
         })
     }
+
+    fn human_device_name(&self) -> Option<&str> {
+        self.device_name.as_deref().filter(|name| {
+            let normalized = name.trim().to_ascii_lowercase();
+            !normalized.is_empty()
+                && !normalized.starts_with("agx")
+                && !normalized.contains("accelerator")
+        })
+    }
 }
 
 fn normalize_required_percent(value: f64) -> Option<f64> {
@@ -136,6 +334,14 @@ pub struct SystemUsageModel {
     gpu_state: GpuReadingState,
     gpu_history: UsageHistory,
     processes: Vec<ProcessMemory>,
+    process_status: ProcessListStatus,
+    deferred_processes: Option<DeferredProcessRows>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeferredProcessRows {
+    started_at: Duration,
+    rows: Vec<ProcessMemory>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -144,16 +350,38 @@ pub struct ProcessSamplingSchedule {
     next_due: Option<Duration>,
 }
 
-pub trait SystemUsageSamplingPorts {
-    fn sample_gpu(&mut self) -> GpuSampleOutcome;
-    fn request_process_sample(&mut self, generation: u64) -> bool;
+#[derive(Clone, Debug)]
+pub struct ProcessSampleCancellation(Arc<AtomicBool>);
+
+impl ProcessSampleCancellation {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub trait SystemUsageSamplingPorts {
+    fn sample_gpu(&mut self) -> GpuSampleOutcome;
+    fn request_process_sample(
+        &mut self,
+        generation: u64,
+        cancellation: ProcessSampleCancellation,
+    ) -> bool;
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct SystemUsageSamplingCoordinator {
     visible: bool,
     generation: u64,
-    process_in_flight: bool,
+    process_in_flight: Option<u64>,
+    process_cancellation: Option<ProcessSampleCancellation>,
     process_schedule: ProcessSamplingSchedule,
 }
 
@@ -220,11 +448,11 @@ impl SystemUsageModel {
 
     pub fn set_visible(&mut self, visible: bool) {
         if self.visible && !visible {
-            self.ram_history.clear();
-            self.memory_state = MemoryReadingState::Collecting;
             self.gpu_history.clear();
             self.gpu_state = GpuReadingState::Collecting;
             self.processes.clear();
+            self.process_status = ProcessListStatus::Collecting;
+            self.deferred_processes = None;
         }
         self.visible = visible;
     }
@@ -278,19 +506,63 @@ impl SystemUsageModel {
         self.gpu_history.push(observed_at, value);
     }
 
-    pub fn record_processes(&mut self, outcome: Result<Vec<ProcessMemory>, ()>) {
+    pub fn record_process_sample(
+        &mut self,
+        observed_at: Duration,
+        outcome: ProcessSampleOutcome,
+        interaction_active: bool,
+    ) {
         if !self.visible {
             return;
         }
-        if let Ok(mut processes) = outcome {
-            processes.sort_by(|left, right| {
-                right
-                    .memory_bytes
-                    .cmp(&left.memory_bytes)
-                    .then_with(|| left.pid.cmp(&right.pid))
-            });
-            processes.truncate(20);
-            self.processes = processes;
+        match outcome {
+            ProcessSampleOutcome::Available(mut processes) => {
+                normalize_process_rows(&mut processes);
+                if interaction_active && !self.processes.is_empty() {
+                    let started_at = self
+                        .deferred_processes
+                        .as_ref()
+                        .map_or(observed_at, |pending| pending.started_at);
+                    self.deferred_processes = Some(DeferredProcessRows {
+                        started_at,
+                        rows: processes,
+                    });
+                } else {
+                    self.processes = processes;
+                    self.process_status = ProcessListStatus::Available;
+                    self.deferred_processes = None;
+                }
+            }
+            ProcessSampleOutcome::Unavailable => {
+                self.processes.clear();
+                self.process_status = ProcessListStatus::Unavailable;
+                self.deferred_processes = None;
+            }
+            ProcessSampleOutcome::Failed => {
+                self.process_status = if self.processes.is_empty() {
+                    ProcessListStatus::Failed
+                } else {
+                    ProcessListStatus::Stale
+                };
+                self.deferred_processes = None;
+            }
+            ProcessSampleOutcome::Cancelled => {}
+        }
+        self.apply_deferred_processes(observed_at, interaction_active);
+    }
+
+    pub fn apply_deferred_processes(&mut self, now: Duration, interaction_active: bool) {
+        let should_apply = self.deferred_processes.as_ref().is_some_and(|pending| {
+            !interaction_active
+                || now.saturating_sub(pending.started_at) >= MAX_PROCESS_REORDER_DEFERRAL
+        });
+        if should_apply {
+            let pending = self
+                .deferred_processes
+                .take()
+                .expect("deferred rows were checked above");
+            self.processes = pending.rows;
+            self.process_status = ProcessListStatus::Available;
         }
     }
 
@@ -314,6 +586,7 @@ impl SystemUsageModel {
                     &self.ram_history,
                 );
                 view_model.process_rows = self.process_rows();
+                view_model.process_status = self.process_status;
                 return view_model;
             }
             MemoryReadingState::Failed => {
@@ -323,6 +596,7 @@ impl SystemUsageModel {
                     &self.ram_history,
                 );
                 view_model.process_rows = self.process_rows();
+                view_model.process_status = self.process_status;
                 return view_model;
             }
             MemoryReadingState::Available(reading) => (reading, false),
@@ -334,6 +608,14 @@ impl SystemUsageModel {
             MemoryPressure::Critical => ("!", "Pressão crítica"),
         };
         let history = self.ram_history.points.iter().copied().collect::<Vec<_>>();
+        let memory_composition = memory_composition(memory);
+        let memory_composition_accessibility_label = format!(
+            "Composição da memória física: Apps {}; Reservada {}; Comprimida {}; Disponível {}.",
+            format_bytes(memory.app_bytes),
+            format_bytes(memory.wired_bytes),
+            format_bytes(memory.compressed_bytes),
+            format_bytes(memory.available_bytes),
+        );
         SystemUsageViewModel {
             section: SystemUsageSection::Ram,
             primary_value: format!("{}% em uso", memory.percent.round() as u8),
@@ -355,9 +637,12 @@ impl SystemUsageModel {
                 detail("Cache recuperável", memory.cached_bytes),
                 detail("Swap em uso", memory.swap_used_bytes),
             ],
+            memory_composition,
+            memory_composition_accessibility_label,
             history_accessibility_label: history_summary(SystemUsageSection::Ram, &history),
             history,
             process_rows: self.process_rows(),
+            process_status: self.process_status,
         }
     }
 
@@ -369,7 +654,6 @@ impl SystemUsageModel {
                 ProcessRowViewModel {
                     pid: process.pid,
                     name: process.name.clone(),
-                    accessibility_label: format!("{}, {memory}", process.name),
                     memory,
                 }
             })
@@ -427,15 +711,15 @@ impl SystemUsageModel {
         SystemUsageViewModel {
             section: SystemUsageSection::Gpu,
             primary_value: format!("{}% de uso", reading.utilization_percent.round() as u8),
-            secondary_value: reading
-                .device_name
-                .clone()
-                .unwrap_or_else(|| "GPU Apple".to_owned()),
+            secondary_value: reading.human_device_name().unwrap_or_default().to_owned(),
             status: status.to_owned(),
             details,
+            memory_composition: Vec::new(),
+            memory_composition_accessibility_label: String::new(),
             history_accessibility_label: history_summary(SystemUsageSection::Gpu, &history),
             history,
             process_rows: Vec::new(),
+            process_status: ProcessListStatus::Collecting,
         }
     }
 }
@@ -476,41 +760,60 @@ impl SystemUsageSamplingCoordinator {
         visible: bool,
         ports: &mut P,
     ) -> Option<GpuSampleOutcome> {
-        if visible != self.visible {
-            self.visible = visible;
-            self.generation = self.generation.wrapping_add(1);
-            self.process_in_flight = false;
-            self.process_schedule.set_visible(visible, now);
-        }
+        self.set_visible(now, visible);
         if !visible {
             return None;
         }
 
         let gpu = ports.sample_gpu();
-        if !self.process_in_flight && self.process_schedule.take_due(now) {
-            self.process_in_flight = ports.request_process_sample(self.generation);
+        if self.process_in_flight.is_none() && self.process_schedule.take_due(now) {
+            let cancellation = ProcessSampleCancellation::new();
+            if ports.request_process_sample(self.generation, cancellation.clone()) {
+                self.process_in_flight = Some(self.generation);
+                self.process_cancellation = Some(cancellation);
+            }
         }
         Some(gpu)
     }
 
+    pub fn set_visible(&mut self, now: Duration, visible: bool) {
+        if visible != self.visible {
+            self.visible = visible;
+            self.generation = self.generation.wrapping_add(1);
+            self.process_schedule.set_visible(visible, now);
+            if !visible {
+                if let Some(cancellation) = &self.process_cancellation {
+                    cancellation.cancel();
+                }
+            }
+        }
+    }
+
     pub fn accept_process_sample(&mut self, generation: u64) -> bool {
-        if !self.visible || !self.process_in_flight || generation != self.generation {
+        if self.process_in_flight != Some(generation) {
             return false;
         }
-        self.process_in_flight = false;
-        true
+        self.process_in_flight = None;
+        self.process_cancellation = None;
+        self.visible && generation == self.generation
     }
 
     pub fn record_processes_if_current(
         &mut self,
-        generation: u64,
-        outcome: Result<Vec<ProcessMemory>, ()>,
+        completion: ProcessSampleCompletion,
         model: &mut SystemUsageModel,
     ) -> bool {
-        if !self.accept_process_sample(generation) {
+        self.set_visible(completion.observed_at, completion.live_visible);
+        if !self.accept_process_sample(completion.generation)
+            || completion.request_visibility_generation != completion.live_visibility_generation
+        {
             return false;
         }
-        model.record_processes(outcome);
+        model.record_process_sample(
+            completion.observed_at,
+            completion.outcome,
+            completion.interaction_active,
+        );
         true
     }
 }
@@ -524,6 +827,8 @@ impl Default for SystemUsageModel {
             gpu_state: GpuReadingState::Collecting,
             gpu_history: UsageHistory::new(),
             processes: Vec::new(),
+            process_status: ProcessListStatus::Collecting,
+            deferred_processes: None,
         }
     }
 }
@@ -540,9 +845,12 @@ fn empty_view_model(
         secondary_value: String::new(),
         status: status.to_owned(),
         details: Vec::new(),
+        memory_composition: Vec::new(),
+        memory_composition_accessibility_label: String::new(),
         history_accessibility_label: history_summary(section, &points),
         history: points,
         process_rows: Vec::new(),
+        process_status: ProcessListStatus::Collecting,
     }
 }
 
@@ -594,6 +902,32 @@ fn detail(label: &'static str, bytes: u64) -> StatsDetailRow {
         label,
         value: format_bytes(bytes),
     }
+}
+
+fn memory_composition(memory: MemoryReading) -> Vec<MemoryCompositionSegment> {
+    let denominator = memory.total_bytes.max(1) as f64;
+    [
+        ("Apps", memory.app_bytes),
+        ("Reservada", memory.wired_bytes),
+        ("Comprimida", memory.compressed_bytes),
+        ("Disponível", memory.available_bytes),
+    ]
+    .into_iter()
+    .map(|(label, bytes)| MemoryCompositionSegment {
+        label,
+        fraction: bytes as f64 / denominator,
+    })
+    .collect()
+}
+
+fn normalize_process_rows(processes: &mut Vec<ProcessMemory>) {
+    processes.sort_by(|left, right| {
+        right
+            .memory_bytes
+            .cmp(&left.memory_bytes)
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+    processes.truncate(20);
 }
 
 fn format_bytes(bytes: u64) -> String {

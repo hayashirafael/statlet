@@ -1,4 +1,4 @@
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{c_char, c_void, CString};
 use std::ptr;
 
 use statlet::stats::{GpuReading, GpuSampleOutcome};
@@ -11,7 +11,6 @@ type CfTypeId = usize;
 type IoObject = u32;
 
 const KERN_SUCCESS: i32 = 0;
-const IO_NAME_SIZE: usize = 128;
 const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 const CF_NUMBER_SINT64_TYPE: i32 = 4;
 const CF_NUMBER_DOUBLE_TYPE: i32 = 13;
@@ -32,7 +31,6 @@ extern "C" {
         allocator: CfAllocatorRef,
         options: u32,
     ) -> CfTypeRef;
-    fn IORegistryEntryGetName(entry: IoObject, name: *mut c_char) -> i32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -76,10 +74,6 @@ struct GpuKeys {
     tiler_utilization: CfKey,
     in_use_system_memory: CfKey,
     allocated_system_memory: CfKey,
-}
-
-fn missing_performance_statistics_outcome() -> GpuSampleOutcome {
-    GpuSampleOutcome::Unavailable
 }
 
 impl GpuKeys {
@@ -140,16 +134,23 @@ impl MacGpuSampler {
     }
 
     fn read_current_service(&self) -> GpuSampleOutcome {
-        let dictionary = unsafe {
+        self.read_performance_statistics_with(|| unsafe {
             IORegistryEntryCreateCFProperty(
                 self.service,
                 self.keys.performance_statistics.0,
                 ptr::null(),
                 0,
             )
-        };
+        })
+    }
+
+    fn read_performance_statistics_with<F>(&self, read_property: F) -> GpuSampleOutcome
+    where
+        F: FnOnce() -> CfTypeRef,
+    {
+        let dictionary = read_property();
         if dictionary.is_null() {
-            return missing_performance_statistics_outcome();
+            return GpuSampleOutcome::Unavailable;
         }
         let outcome = unsafe { self.read_dictionary(dictionary) };
         unsafe { CFRelease(dictionary) };
@@ -170,24 +171,11 @@ impl MacGpuSampler {
             dictionary_number(dictionary, self.keys.tiler_utilization.0),
             dictionary_u64(dictionary, self.keys.in_use_system_memory.0),
             dictionary_u64(dictionary, self.keys.allocated_system_memory.0),
-            self.device_name(),
+            None,
         );
         reading
             .map(GpuSampleOutcome::Available)
             .unwrap_or(GpuSampleOutcome::Unavailable)
-    }
-
-    fn device_name(&self) -> Option<String> {
-        let mut name = [0 as c_char; IO_NAME_SIZE];
-        let result = unsafe { IORegistryEntryGetName(self.service, name.as_mut_ptr()) };
-        if result != KERN_SUCCESS {
-            return None;
-        }
-        Some(
-            unsafe { CStr::from_ptr(name.as_ptr()) }
-                .to_string_lossy()
-                .into_owned(),
-        )
     }
 
     fn release_service(&mut self) {
@@ -240,7 +228,9 @@ unsafe fn dictionary_u64(dictionary: CfDictionaryRef, key: CfStringRef) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use super::{missing_performance_statistics_outcome, MacGpuSampler};
+    use std::ptr;
+
+    use super::MacGpuSampler;
     use statlet::stats::GpuSampleOutcome;
 
     #[test]
@@ -254,8 +244,10 @@ mod tests {
 
     #[test]
     fn missing_performance_statistics_is_an_unavailable_capability() {
+        let sampler = MacGpuSampler::new();
+
         assert_eq!(
-            missing_performance_statistics_outcome(),
+            sampler.read_performance_statistics_with(ptr::null),
             GpuSampleOutcome::Unavailable
         );
     }

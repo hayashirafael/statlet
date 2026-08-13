@@ -12,7 +12,7 @@ block2 = "0.6.2"
 libc = "0.2"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSAccessibility", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSControl", "NSStatusBarButton", "NSFont", "NSFontDescriptor", "NSAttributedString", "NSText", "NSTextField", "NSTextFieldCell", "NSButton", "NSPopUpButton", "NSMenu", "NSResponder", "NSColor", "NSImage", "NSStringDrawing", "NSGraphics", "NSGraphicsContext", "NSCell", "NSActionCell", "NSParagraphStyle", "NSAlert", "NSScrollView", "NSClipView", "NSSegmentedControl", "NSTableView", "NSTableColumn", "NSTableHeaderCell", "NSBezierPath", "NSWorkspace", "NSEvent", "NSUserInterfaceItemIdentification"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSArray", "NSIndexSet", "NSDictionary", "NSAttributedString", "NSBundle", "NSURL", "NSError", "NSValue", "NSFileManager", "NSDate", "NSDateFormatter", "NSFormatter"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSArray", "NSIndexSet", "NSDictionary", "NSAttributedString", "NSBundle", "NSURL", "NSError", "NSValue", "NSFileManager", "NSDate", "NSDateFormatter", "NSFormatter", "NSNotification"] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["block2", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

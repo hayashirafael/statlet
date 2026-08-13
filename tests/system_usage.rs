@@ -3,7 +3,9 @@ use std::time::Duration;
 use statlet::core::MemoryPressure;
 use statlet::metrics::{detailed_memory_from_counters, VmCounters};
 use statlet::stats::{
-    GpuReading, GpuSampleOutcome, ProcessMemory, ProcessSamplingSchedule, SystemUsageModel,
+    GpuReading, GpuSampleOutcome, GraphNavigation, GraphNavigationCommand, ProcessListStatus,
+    ProcessMemory, ProcessSampleCancellation, ProcessSampleCompletion, ProcessSampleOutcome,
+    ProcessSamplingSchedule, SystemUsageModel, SystemUsageRenderCoalescer,
     SystemUsageSamplingCoordinator, SystemUsageSamplingPorts, SystemUsageSection, UsageHistory,
 };
 
@@ -95,7 +97,7 @@ fn gpu_history_exists_only_for_the_visible_window_session() {
 }
 
 #[test]
-fn reopening_detail_does_not_present_the_previous_ram_session_as_current() {
+fn reopening_detail_preserves_ram_history_and_current_reading() {
     let memory = detailed_memory_from_counters(
         1_000,
         100,
@@ -119,9 +121,10 @@ fn reopening_detail_does_not_present_the_previous_ram_session_as_current() {
     model.set_visible(true);
 
     let view = model.view_model(SystemUsageSection::Ram);
-    assert_eq!(view.primary_value, "—");
-    assert_eq!(view.status, "Coletando a primeira leitura…");
-    assert!(view.history.is_empty());
+    assert_eq!(view.primary_value, "20% em uso");
+    assert_eq!(view.status, "✓ Pressão normal");
+    assert_eq!(view.history.len(), 1);
+    assert_eq!(view.history[0].value, Some(20.0));
 }
 
 #[test]
@@ -171,6 +174,26 @@ fn ram_view_model_remains_complete_when_gpu_is_unavailable() {
     assert_eq!(ram.secondary_value, "3,2 GB de 16 GB");
     assert_eq!(ram.status, "△ Pressão em atenção");
     assert_eq!(
+        ram.memory_composition
+            .iter()
+            .map(|segment| segment.label)
+            .collect::<Vec<_>>(),
+        vec!["Apps", "Reservada", "Comprimida", "Disponível"]
+    );
+    assert!(
+        (ram.memory_composition
+            .iter()
+            .map(|segment| segment.fraction)
+            .sum::<f64>()
+            - 1.0)
+            .abs()
+            < f64::EPSILON
+    );
+    assert_eq!(
+        ram.memory_composition_accessibility_label,
+        "Composição da memória física: Apps 2,3 GB; Reservada 500 MB; Comprimida 400 MB; Disponível 12,8 GB."
+    );
+    assert_eq!(
         ram.details.iter().map(|row| row.label).collect::<Vec<_>>(),
         vec![
             "Apps",
@@ -198,14 +221,22 @@ fn top_processes_are_ephemeral_sorted_and_limited_to_twenty() {
         .collect::<Vec<_>>();
     let mut model = SystemUsageModel::new();
 
-    model.record_processes(Ok(processes.clone()));
+    model.record_process_sample(
+        Duration::ZERO,
+        ProcessSampleOutcome::Available(processes.clone()),
+        false,
+    );
     assert!(model
         .view_model(SystemUsageSection::Ram)
         .process_rows
         .is_empty());
 
     model.set_visible(true);
-    model.record_processes(Ok(processes));
+    model.record_process_sample(
+        Duration::from_secs(1),
+        ProcessSampleOutcome::Available(processes),
+        false,
+    );
     let view = model.view_model(SystemUsageSection::Ram);
     assert_eq!(view.process_rows.len(), 20);
     assert_eq!(view.process_rows.first().unwrap().pid, 24);
@@ -219,6 +250,175 @@ fn top_processes_are_ephemeral_sorted_and_limited_to_twenty() {
 }
 
 #[test]
+fn process_list_distinguishes_collecting_unavailable_and_failed_states() {
+    let mut model = SystemUsageModel::new();
+    model.set_visible(true);
+
+    assert_eq!(
+        model.view_model(SystemUsageSection::Ram).process_status,
+        ProcessListStatus::Collecting
+    );
+
+    model.record_process_sample(Duration::ZERO, ProcessSampleOutcome::Unavailable, false);
+    assert_eq!(
+        model.view_model(SystemUsageSection::Ram).process_status,
+        ProcessListStatus::Unavailable
+    );
+
+    model.record_process_sample(Duration::from_secs(6), ProcessSampleOutcome::Failed, false);
+    assert_eq!(
+        model.view_model(SystemUsageSection::Ram).process_status,
+        ProcessListStatus::Failed
+    );
+    assert_eq!(
+        ProcessListStatus::Unavailable.message(),
+        "Detalhes por processo não estão disponíveis nesta leitura."
+    );
+    assert_eq!(
+        ProcessListStatus::Stale.message(),
+        "Detalhes por processo desatualizados; última leitura preservada."
+    );
+}
+
+#[test]
+fn failed_process_refresh_marks_existing_rows_stale_instead_of_erasing_them() {
+    let mut model = SystemUsageModel::new();
+    model.set_visible(true);
+    model.record_process_sample(
+        Duration::ZERO,
+        ProcessSampleOutcome::Available(vec![ProcessMemory {
+            pid: 42,
+            name: "Safari".to_owned(),
+            memory_bytes: 512_000_000,
+        }]),
+        false,
+    );
+
+    model.record_process_sample(Duration::from_secs(6), ProcessSampleOutcome::Failed, false);
+
+    let view = model.view_model(SystemUsageSection::Ram);
+    assert_eq!(view.process_status, ProcessListStatus::Stale);
+    assert_eq!(view.process_rows.len(), 1);
+    assert_eq!(view.process_rows[0].pid, 42);
+}
+
+#[test]
+fn process_reordering_waits_for_focus_release_but_never_longer_than_fifteen_seconds() {
+    let row = |pid, memory_bytes| ProcessMemory {
+        pid,
+        name: format!("process-{pid}"),
+        memory_bytes,
+    };
+    let mut model = SystemUsageModel::new();
+    model.set_visible(true);
+    model.record_process_sample(
+        Duration::ZERO,
+        ProcessSampleOutcome::Available(vec![row(1, 200), row(2, 100)]),
+        false,
+    );
+
+    model.record_process_sample(
+        Duration::from_secs(6),
+        ProcessSampleOutcome::Available(vec![row(1, 100), row(2, 300)]),
+        true,
+    );
+    assert_eq!(
+        model.view_model(SystemUsageSection::Ram).process_rows[0].pid,
+        1
+    );
+
+    model.apply_deferred_processes(Duration::from_secs(20), true);
+    assert_eq!(
+        model.view_model(SystemUsageSection::Ram).process_rows[0].pid,
+        1
+    );
+
+    model.apply_deferred_processes(Duration::from_secs(21), true);
+    assert_eq!(
+        model.view_model(SystemUsageSection::Ram).process_rows[0].pid,
+        2
+    );
+
+    model.record_process_sample(
+        Duration::from_secs(27),
+        ProcessSampleOutcome::Available(vec![row(1, 400), row(2, 100)]),
+        true,
+    );
+    model.apply_deferred_processes(Duration::from_secs(28), false);
+    assert_eq!(
+        model.view_model(SystemUsageSection::Ram).process_rows[0].pid,
+        1
+    );
+}
+
+#[test]
+fn system_usage_rendering_suppresses_duplicate_models_and_accepts_each_change_once() {
+    let mut model = SystemUsageModel::new();
+    let mut coalescer = SystemUsageRenderCoalescer::new();
+    let collecting = model.view_model(SystemUsageSection::Ram);
+
+    assert!(coalescer.take_changed(&collecting));
+    assert!(!coalescer.take_changed(&collecting));
+
+    model.record_memory(Duration::ZERO, Err(()));
+    let failed = model.view_model(SystemUsageSection::Ram);
+    assert!(coalescer.take_changed(&failed));
+    assert!(!coalescer.take_changed(&failed));
+
+    coalescer.reset();
+    assert!(coalescer.take_changed(&failed));
+}
+
+#[test]
+fn graph_keyboard_navigation_skips_gaps_and_exposes_selected_value_and_time() {
+    let points = vec![
+        statlet::stats::UsagePoint {
+            observed_at: Duration::from_secs(10),
+            value: Some(10.0),
+        },
+        statlet::stats::UsagePoint {
+            observed_at: Duration::from_secs(12),
+            value: None,
+        },
+        statlet::stats::UsagePoint {
+            observed_at: Duration::from_secs(14),
+            value: Some(30.0),
+        },
+        statlet::stats::UsagePoint {
+            observed_at: Duration::from_secs(16),
+            value: Some(40.0),
+        },
+    ];
+    let mut navigation = GraphNavigation::new();
+
+    let latest = navigation.update_points(&points).unwrap();
+    assert_eq!(latest.index, 3);
+    assert_eq!(latest.accessibility_value, "40%, agora");
+
+    let previous = navigation
+        .move_selection(&points, GraphNavigationCommand::Previous)
+        .unwrap();
+    assert_eq!(previous.index, 2);
+    assert_eq!(previous.accessibility_value, "30%, há 2 segundos");
+
+    let first = navigation
+        .move_selection(&points, GraphNavigationCommand::First)
+        .unwrap();
+    assert_eq!(first.index, 0);
+    assert_eq!(first.accessibility_value, "10%, há 6 segundos");
+
+    let next = navigation
+        .move_selection(&points, GraphNavigationCommand::Next)
+        .unwrap();
+    assert_eq!(next.index, 2);
+
+    let last = navigation
+        .move_selection(&points, GraphNavigationCommand::Last)
+        .unwrap();
+    assert_eq!(last.index, 3);
+}
+
+#[test]
 fn process_sampling_reuses_ticks_and_never_catches_up() {
     let mut schedule = ProcessSamplingSchedule::new();
     assert!(!schedule.take_due(Duration::ZERO));
@@ -226,7 +426,8 @@ fn process_sampling_reuses_ticks_and_never_catches_up() {
     schedule.set_visible(true, Duration::from_secs(10));
     assert!(schedule.take_due(Duration::from_secs(10)));
     assert!(!schedule.take_due(Duration::from_secs(12)));
-    assert!(schedule.take_due(Duration::from_secs(14)));
+    assert!(!schedule.take_due(Duration::from_secs(14)));
+    assert!(schedule.take_due(Duration::from_secs(16)));
     assert!(schedule.take_due(Duration::from_secs(100)));
     assert!(!schedule.take_due(Duration::from_secs(100)));
 
@@ -240,6 +441,7 @@ fn process_sampling_reuses_ticks_and_never_catches_up() {
 struct CountingSamplingPorts {
     gpu_calls: usize,
     process_calls: Vec<u64>,
+    process_cancellations: Vec<ProcessSampleCancellation>,
 }
 
 impl SystemUsageSamplingPorts for CountingSamplingPorts {
@@ -248,8 +450,13 @@ impl SystemUsageSamplingPorts for CountingSamplingPorts {
         GpuSampleOutcome::Unavailable
     }
 
-    fn request_process_sample(&mut self, generation: u64) -> bool {
+    fn request_process_sample(
+        &mut self,
+        generation: u64,
+        cancellation: ProcessSampleCancellation,
+    ) -> bool {
         self.process_calls.push(generation);
+        self.process_cancellations.push(cancellation);
         true
     }
 }
@@ -272,11 +479,13 @@ fn closed_detail_sampling_causally_prevents_gpu_and_process_calls_without_catch_
     );
     assert_eq!(ports.gpu_calls, 1);
     assert_eq!(ports.process_calls.len(), 1);
+    assert!(!ports.process_cancellations[0].is_cancelled());
 
     assert_eq!(
         coordinator.collect_if_visible(Duration::from_secs(100), false, &mut ports),
         None
     );
+    assert!(ports.process_cancellations[0].is_cancelled());
     assert_eq!(
         coordinator.collect_if_visible(Duration::from_secs(200), false, &mut ports),
         None
@@ -286,6 +495,9 @@ fn closed_detail_sampling_causally_prevents_gpu_and_process_calls_without_catch_
 
     coordinator.collect_if_visible(Duration::from_secs(300), true, &mut ports);
     assert_eq!(ports.gpu_calls, 2);
+    assert_eq!(ports.process_calls.len(), 1);
+    assert!(!coordinator.accept_process_sample(ports.process_calls[0]));
+    coordinator.collect_if_visible(Duration::from_secs(302), true, &mut ports);
     assert_eq!(ports.process_calls.len(), 2);
     assert_ne!(ports.process_calls[0], ports.process_calls[1]);
 }
@@ -303,15 +515,22 @@ fn process_results_from_a_closed_window_generation_are_ignored() {
     coordinator.collect_if_visible(Duration::from_secs(2), false, &mut ports);
     model.set_visible(true);
     coordinator.collect_if_visible(Duration::from_secs(4), true, &mut ports);
-    let current_generation = ports.process_calls[1];
+    assert_eq!(ports.process_calls.len(), 1);
 
     assert!(!coordinator.record_processes_if_current(
-        stale_generation,
-        Ok(vec![ProcessMemory {
-            pid: 1,
-            name: "stale".to_owned(),
-            memory_bytes: 100,
-        }]),
+        ProcessSampleCompletion {
+            observed_at: Duration::from_secs(4),
+            live_visible: true,
+            interaction_active: false,
+            request_visibility_generation: 0,
+            live_visibility_generation: 0,
+            generation: stale_generation,
+            outcome: ProcessSampleOutcome::Available(vec![ProcessMemory {
+                pid: 1,
+                name: "stale".to_owned(),
+                memory_bytes: 100,
+            }]),
+        },
         &mut model,
     ));
     assert!(model
@@ -319,19 +538,92 @@ fn process_results_from_a_closed_window_generation_are_ignored() {
         .process_rows
         .is_empty());
 
+    coordinator.collect_if_visible(Duration::from_secs(6), true, &mut ports);
+    assert_eq!(ports.process_calls.len(), 2);
+    let current_generation = ports.process_calls[1];
+
     assert!(coordinator.record_processes_if_current(
-        current_generation,
-        Ok(vec![ProcessMemory {
-            pid: 2,
-            name: "current".to_owned(),
-            memory_bytes: 200,
-        }]),
+        ProcessSampleCompletion {
+            observed_at: Duration::from_secs(6),
+            live_visible: true,
+            interaction_active: false,
+            request_visibility_generation: 0,
+            live_visibility_generation: 0,
+            generation: current_generation,
+            outcome: ProcessSampleOutcome::Available(vec![ProcessMemory {
+                pid: 2,
+                name: "current".to_owned(),
+                memory_bytes: 200,
+            }]),
+        },
         &mut model,
     ));
     assert_eq!(
         model.view_model(SystemUsageSection::Ram).process_rows[0].name,
         "current"
     );
+}
+
+#[test]
+fn process_result_is_rejected_when_live_visibility_closed_before_polling_observed_it() {
+    let mut coordinator = SystemUsageSamplingCoordinator::new();
+    let mut ports = CountingSamplingPorts::default();
+    let mut model = SystemUsageModel::new();
+    model.set_visible(true);
+    coordinator.collect_if_visible(Duration::ZERO, true, &mut ports);
+    let generation = ports.process_calls[0];
+
+    assert!(!coordinator.record_processes_if_current(
+        ProcessSampleCompletion {
+            observed_at: Duration::from_secs(1),
+            live_visible: false,
+            interaction_active: false,
+            request_visibility_generation: 0,
+            live_visibility_generation: 0,
+            generation,
+            outcome: ProcessSampleOutcome::Available(vec![ProcessMemory {
+                pid: 1,
+                name: "stale".to_owned(),
+                memory_bytes: 100,
+            }]),
+        },
+        &mut model,
+    ));
+    assert!(model
+        .view_model(SystemUsageSection::Ram)
+        .process_rows
+        .is_empty());
+}
+
+#[test]
+fn process_result_is_rejected_after_a_quick_close_and_reopen_visibility_epoch() {
+    let mut coordinator = SystemUsageSamplingCoordinator::new();
+    let mut ports = CountingSamplingPorts::default();
+    let mut model = SystemUsageModel::new();
+    model.set_visible(true);
+    coordinator.collect_if_visible(Duration::ZERO, true, &mut ports);
+    let generation = ports.process_calls[0];
+
+    assert!(!coordinator.record_processes_if_current(
+        ProcessSampleCompletion {
+            observed_at: Duration::from_secs(1),
+            live_visible: true,
+            interaction_active: false,
+            request_visibility_generation: 1,
+            live_visibility_generation: 3,
+            generation,
+            outcome: ProcessSampleOutcome::Available(vec![ProcessMemory {
+                pid: 1,
+                name: "stale".to_owned(),
+                memory_bytes: 100,
+            }]),
+        },
+        &mut model,
+    ));
+    assert!(model
+        .view_model(SystemUsageSection::Ram)
+        .process_rows
+        .is_empty());
 }
 
 #[test]
@@ -457,6 +749,27 @@ fn gpu_failure_keeps_the_last_value_marked_as_stale() {
         "Atualização interrompida; última leitura preservada"
     );
     assert_eq!(view.history.last().unwrap().value, None);
+}
+
+#[test]
+fn gpu_secondary_value_omits_internal_agx_names_but_keeps_human_models() {
+    let mut model = SystemUsageModel::new();
+    model.set_visible(true);
+    let mut internal = gpu(30.0);
+    internal.device_name = Some("AGXAcceleratorG16G".to_owned());
+    model.record_gpu(Duration::ZERO, GpuSampleOutcome::Available(internal));
+    assert_eq!(
+        model.view_model(SystemUsageSection::Gpu).secondary_value,
+        ""
+    );
+
+    let mut human = gpu(40.0);
+    human.device_name = Some("Apple M4".to_owned());
+    model.record_gpu(Duration::from_secs(2), GpuSampleOutcome::Available(human));
+    assert_eq!(
+        model.view_model(SystemUsageSection::Gpu).secondary_value,
+        "Apple M4"
+    );
 }
 
 #[test]

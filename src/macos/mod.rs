@@ -1,6 +1,6 @@
 use statlet::core::AppEvent;
 use statlet::mole::MoleDetection;
-use statlet::stats::ProcessMemory;
+use statlet::stats::ProcessSampleOutcome;
 
 pub mod gpu;
 pub mod notifications;
@@ -17,6 +17,8 @@ pub enum RuntimeEvent {
     },
     ProcessesSampled {
         generation: u64,
-        processes: Vec<ProcessMemory>,
+        visibility_generation: u64,
+        outcome: ProcessSampleOutcome,
     },
+    SystemUsageVisibilityChanged(bool),
 }

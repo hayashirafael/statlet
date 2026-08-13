@@ -29,7 +29,9 @@ use macos::sampler::MacSampler;
 use macos::windows::WindowManager;
 use macos::RuntimeEvent;
 use statlet::stats::{
-    SystemUsageModel, SystemUsageSamplingCoordinator, SystemUsageSamplingPorts, SystemUsageSection,
+    ProcessSampleCancellation, ProcessSampleCompletion, SystemUsageModel,
+    SystemUsageRenderCoalescer, SystemUsageSamplingCoordinator, SystemUsageSamplingPorts,
+    SystemUsageSection,
 };
 
 const METRICS_REFRESH: Duration = Duration::from_secs(2);
@@ -138,9 +140,24 @@ fn main() {
                     .unwrap_or_default(),
                 RuntimeEvent::ProcessesSampled {
                     generation,
-                    processes,
+                    visibility_generation,
+                    outcome,
                 } => {
-                    runtime.samplers.record_processes(generation, processes);
+                    let live_visible = runtime.system_usage_visible();
+                    let live_visibility_generation = runtime.system_usage_visibility_generation();
+                    let interaction_active = runtime.system_usage_process_interaction_active();
+                    runtime.samplers.record_processes(
+                        generation,
+                        visibility_generation,
+                        live_visibility_generation,
+                        outcome,
+                        live_visible,
+                        interaction_active,
+                    );
+                    Vec::new()
+                }
+                RuntimeEvent::SystemUsageVisibilityChanged(visible) => {
+                    runtime.samplers.set_system_usage_visible(visible);
                     Vec::new()
                 }
             };
@@ -170,6 +187,7 @@ struct RuntimeAdapters {
     mole: RuntimeMole,
     notifications: Option<NotificationManager>,
     review_space_item: MenuItem,
+    system_usage_rendering: SystemUsageRenderCoalescer,
 }
 
 impl RuntimeAdapters {
@@ -189,6 +207,7 @@ impl RuntimeAdapters {
             mole: RuntimeMole::new(proxy),
             notifications: None,
             review_space_item,
+            system_usage_rendering: SystemUsageRenderCoalescer::new(),
         }
     }
 
@@ -211,19 +230,47 @@ impl RuntimeAdapters {
             .windows
             .as_ref()
             .is_some_and(WindowManager::system_usage_visible);
-        let effects = self
-            .samplers
-            .refresh(core, renderer, button, system_usage_visible);
+        let process_interaction_active = self.system_usage_process_interaction_active();
+        let system_usage_visibility_generation = self.system_usage_visibility_generation();
+        let effects = self.samplers.refresh(
+            core,
+            renderer,
+            button,
+            system_usage_visible,
+            process_interaction_active,
+            system_usage_visibility_generation,
+        );
         self.update_system_usage_window(core.state().system_usage_section);
         effects
     }
 
-    fn update_system_usage_window(&self, section: SystemUsageSection) {
+    fn update_system_usage_window(&mut self, section: SystemUsageSection) {
         if let Some(windows) = &self.windows {
             if windows.system_usage_visible() {
-                windows.update_system_usage(&self.samplers.system_usage_view_model(section));
+                let view_model = self.samplers.system_usage_view_model(section);
+                if self.system_usage_rendering.take_changed(&view_model) {
+                    windows.update_system_usage(&view_model);
+                }
             }
         }
+    }
+
+    fn system_usage_visible(&self) -> bool {
+        self.windows
+            .as_ref()
+            .is_some_and(WindowManager::system_usage_visible)
+    }
+
+    fn system_usage_process_interaction_active(&self) -> bool {
+        self.windows
+            .as_ref()
+            .is_some_and(WindowManager::system_usage_process_interaction_active)
+    }
+
+    fn system_usage_visibility_generation(&self) -> u64 {
+        self.windows
+            .as_ref()
+            .map_or(0, WindowManager::system_usage_visibility_generation)
     }
 
     fn apply_effects(&mut self, effects: &[AppEffect], core: &mut StatletCore) -> bool {
@@ -234,6 +281,9 @@ impl RuntimeAdapters {
                 AppEffect::ShowWindow(kind) => {
                     if let Some(windows) = &mut self.windows {
                         windows.show(kind, core.state(), &self.history);
+                    }
+                    if kind == statlet::core::WindowKind::SystemUsage {
+                        self.system_usage_rendering.reset();
                     }
                 }
                 AppEffect::SavePreferences(preferences) => {
@@ -418,29 +468,37 @@ impl RuntimeSamplers {
         self.disk_schedule.set_enabled(enabled, self.clock.now());
     }
 
+    fn set_system_usage_visible(&mut self, visible: bool) {
+        let now = self.clock.now();
+        self.system_usage.set_visible(visible);
+        self.system_usage_sampling.set_visible(now, visible);
+    }
+
     fn refresh(
         &mut self,
         core: &mut StatletCore,
         renderer: &Renderer,
         button: Option<&objc2_app_kit::NSStatusBarButton>,
         system_usage_visible: bool,
+        process_interaction_active: bool,
+        system_usage_visibility_generation: u64,
     ) -> Vec<AppEffect> {
         objc2::rc::autoreleasepool(|_| {
             let now = self.clock.now();
             self.system_usage.set_visible(system_usage_visible);
+            self.system_usage
+                .apply_deferred_processes(now, process_interaction_active);
             match self.metrics.sample() {
                 Some(snapshot) => {
                     core.handle(AppEvent::MetricsSample(snapshot.compact));
-                    if system_usage_visible {
-                        self.system_usage.record_memory(now, Ok(snapshot.memory));
-                    }
+                    self.system_usage.record_memory(now, Ok(snapshot.memory));
                 }
-                None if system_usage_visible => self.system_usage.record_memory(now, Err(())),
-                None => {}
+                None => self.system_usage.record_memory(now, Err(())),
             }
             let mut ports = RuntimeSystemUsagePorts {
                 gpu: &mut self.gpu,
                 process_proxy: &self.process_proxy,
+                visibility_generation: system_usage_visibility_generation,
             };
             if let Some(gpu) =
                 self.system_usage_sampling
@@ -474,10 +532,27 @@ impl RuntimeSamplers {
         self.system_usage.view_model(section)
     }
 
-    fn record_processes(&mut self, generation: u64, processes: Vec<statlet::stats::ProcessMemory>) {
+    fn record_processes(
+        &mut self,
+        generation: u64,
+        request_visibility_generation: u64,
+        live_visibility_generation: u64,
+        outcome: statlet::stats::ProcessSampleOutcome,
+        live_visible: bool,
+        interaction_active: bool,
+    ) {
+        let now = self.clock.now();
+        self.system_usage.set_visible(live_visible);
         self.system_usage_sampling.record_processes_if_current(
-            generation,
-            Ok(processes),
+            ProcessSampleCompletion {
+                observed_at: now,
+                live_visible,
+                interaction_active,
+                request_visibility_generation,
+                live_visibility_generation,
+                generation,
+                outcome,
+            },
             &mut self.system_usage,
         );
     }
@@ -486,6 +561,7 @@ impl RuntimeSamplers {
 struct RuntimeSystemUsagePorts<'a> {
     gpu: &'a mut MacGpuSampler,
     process_proxy: &'a tao::event_loop::EventLoopProxy<RuntimeEvent>,
+    visibility_generation: u64,
 }
 
 impl SystemUsageSamplingPorts for RuntimeSystemUsagePorts<'_> {
@@ -493,17 +569,32 @@ impl SystemUsageSamplingPorts for RuntimeSystemUsagePorts<'_> {
         self.gpu.sample()
     }
 
-    fn request_process_sample(&mut self, generation: u64) -> bool {
+    fn request_process_sample(
+        &mut self,
+        generation: u64,
+        cancellation: ProcessSampleCancellation,
+    ) -> bool {
         let proxy = self.process_proxy.clone();
+        let visibility_generation = self.visibility_generation;
         thread::Builder::new()
             .name("statlet-process-sample".to_owned())
             .spawn(move || {
-                let processes = MacSampler::sample_processes();
+                let outcome = MacSampler::sample_processes(&cancellation);
                 let _ = proxy.send_event(RuntimeEvent::ProcessesSampled {
                     generation,
-                    processes,
+                    visibility_generation,
+                    outcome,
                 });
             })
-            .is_ok()
+            .map(|_| true)
+            .unwrap_or_else(|_| {
+                self.process_proxy
+                    .send_event(RuntimeEvent::ProcessesSampled {
+                        generation,
+                        visibility_generation,
+                        outcome: statlet::stats::ProcessSampleOutcome::Failed,
+                    })
+                    .is_ok()
+            })
     }
 }

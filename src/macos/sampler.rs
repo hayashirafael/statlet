@@ -6,7 +6,7 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use statlet::core::{MemoryPressure, SystemSnapshot};
 use statlet::metrics::{detailed_memory_from_counters, MemoryReading, VmCounters};
-use statlet::stats::ProcessMemory;
+use statlet::stats::{ProcessMemory, ProcessSampleCancellation, ProcessSampleOutcome};
 
 pub struct MacSystemSample {
     pub compact: SystemSnapshot,
@@ -43,33 +43,41 @@ impl MacSampler {
         })
     }
 
-    pub fn sample_processes() -> Vec<ProcessMemory> {
+    pub fn sample_processes(cancellation: &ProcessSampleCancellation) -> ProcessSampleOutcome {
+        if cancellation.is_cancelled() {
+            return ProcessSampleOutcome::Cancelled;
+        }
         let mut system = System::new();
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing().with_memory(),
         );
-        select_top_process_ids(
-            system
-                .processes()
-                .iter()
-                .map(|(pid, process)| (pid.as_u32(), process.memory())),
-            20,
+        if cancellation.is_cancelled() {
+            return ProcessSampleOutcome::Cancelled;
+        }
+        ProcessSampleOutcome::Available(
+            select_top_process_ids(
+                system
+                    .processes()
+                    .iter()
+                    .map(|(pid, process)| (pid.as_u32(), process.memory())),
+                20,
+            )
+            .into_iter()
+            .filter_map(|(pid, memory_bytes)| {
+                system
+                    .processes()
+                    .iter()
+                    .find(|(candidate, _)| candidate.as_u32() == pid)
+                    .map(|(_, process)| ProcessMemory {
+                        pid,
+                        name: process.name().to_string_lossy().into_owned(),
+                        memory_bytes,
+                    })
+            })
+            .collect(),
         )
-        .into_iter()
-        .filter_map(|(pid, memory_bytes)| {
-            system
-                .processes()
-                .iter()
-                .find(|(candidate, _)| candidate.as_u32() == pid)
-                .map(|(_, process)| ProcessMemory {
-                    pid,
-                    name: process.name().to_string_lossy().into_owned(),
-                    memory_bytes,
-                })
-        })
-        .collect()
     }
 }
 

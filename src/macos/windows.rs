@@ -1,4 +1,8 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -6,21 +10,24 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAccessibility, NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSButton, NSColor,
-    NSControlStateValueOn, NSControlTextEditingDelegate, NSEventModifierFlags, NSLineBreakMode,
-    NSPopUpButton, NSScrollView, NSSegmentSwitchTracking, NSSegmentedControl, NSTableColumn,
-    NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags,
+    NSFocusRingType, NSLineBreakMode, NSPopUpButton, NSScrollView, NSSegmentSwitchTracking,
+    NSSegmentedControl, NSTableColumn, NSTableColumnResizingOptions, NSTableView,
+    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate, NSTextField,
+    NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSArray, NSDate, NSDateFormatter, NSDateFormatterStyle,
-    NSFileManager, NSIndexSet, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    NSFileManager, NSIndexSet, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    NSString,
 };
 use statlet::core::{AppEvent, AppState, Preferences, WarningThreshold, WindowKind};
 use statlet::disk::format_decimal_gigabytes;
 use statlet::history::{History, HistoryEventKind, HistoryRecord, MAX_HISTORY_RECORDS};
 use statlet::mole::MoleStatus;
 use statlet::stats::{
-    history_x_position, ProcessRowViewModel, SystemUsageSection, SystemUsageViewModel, UsagePoint,
+    history_x_position, GraphNavigation, GraphNavigationCommand, MemoryCompositionSegment,
+    ProcessListStatus, ProcessRowViewModel, SystemUsageSection, SystemUsageViewModel, UsagePoint,
 };
 use tao::event_loop::EventLoopProxy;
 
@@ -28,6 +35,8 @@ use super::RuntimeEvent;
 
 struct UsageGraphViewIvars {
     points: RefCell<Vec<UsagePoint>>,
+    navigation: RefCell<GraphNavigation>,
+    selected_index: Cell<Option<usize>>,
 }
 
 define_class!(
@@ -39,39 +48,128 @@ define_class!(
     unsafe impl NSObjectProtocol for UsageGraphView {}
 
     impl UsageGraphView {
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(becomeFirstResponder))]
+        fn become_first_responder(&self) -> bool {
+            let accepted: bool = unsafe { msg_send![super(self), becomeFirstResponder] };
+            self.setNeedsDisplay(true);
+            accepted
+        }
+
+        #[unsafe(method(resignFirstResponder))]
+        fn resign_first_responder(&self) -> bool {
+            let accepted: bool = unsafe { msg_send![super(self), resignFirstResponder] };
+            self.setNeedsDisplay(true);
+            accepted
+        }
+
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            let option = event
+                .modifierFlags()
+                .contains(NSEventModifierFlags::Option);
+            let command = match (event.keyCode(), option) {
+                (123, false) => Some(GraphNavigationCommand::Previous),
+                (124, false) => Some(GraphNavigationCommand::Next),
+                (123, true) => Some(GraphNavigationCommand::First),
+                (124, true) => Some(GraphNavigationCommand::Last),
+                _ => None,
+            };
+            let Some(command) = command else {
+                unsafe {
+                    let _: () = msg_send![super(self), keyDown: event];
+                }
+                return;
+            };
+            let points = self.ivars().points.borrow();
+            if let Some(selection) = self
+                .ivars()
+                .navigation
+                .borrow_mut()
+                .move_selection(&points, command)
+            {
+                self.ivars().selected_index.set(Some(selection.index));
+                let value = NSString::from_str(&selection.accessibility_value);
+                unsafe { self.setAccessibilityValue(Some(&value)) };
+                self.setNeedsDisplay(true);
+            }
+        }
+
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty_rect: NSRect) {
             let bounds = self.bounds();
             let points = self.ivars().points.borrow();
-            if points.len() < 2 {
-                return;
-            }
-            let path = NSBezierPath::new();
             let width = (bounds.size.width - 4.0).max(1.0);
             let height = (bounds.size.height - 4.0).max(1.0);
-            let window_end = points.last().expect("at least two points").observed_at;
-            let mut connected = false;
-            for point in points.iter() {
-                let Some(value) = point.value.filter(|value| value.is_finite()) else {
-                    connected = false;
-                    continue;
-                };
-                let graph_point = NSPoint::new(
-                    2.0 + width * history_x_position(point.observed_at, window_end),
-                    2.0 + height * value.clamp(0.0, 100.0) / 100.0,
-                );
-                if connected {
-                    path.lineToPoint(graph_point);
-                } else {
-                    path.moveToPoint(graph_point);
-                    connected = true;
+            if let Some(window_end) = points.last().map(|point| point.observed_at) {
+                if points.len() >= 2 {
+                    let path = NSBezierPath::new();
+                    let mut connected = false;
+                    for point in points.iter() {
+                        let Some(value) = point.value.filter(|value| value.is_finite()) else {
+                            connected = false;
+                            continue;
+                        };
+                        let graph_point = NSPoint::new(
+                            2.0 + width * history_x_position(point.observed_at, window_end),
+                            2.0 + height * value.clamp(0.0, 100.0) / 100.0,
+                        );
+                        if connected {
+                            path.lineToPoint(graph_point);
+                        } else {
+                            path.moveToPoint(graph_point);
+                            connected = true;
+                        }
+                    }
+                    let increase_contrast = NSWorkspace::sharedWorkspace()
+                        .accessibilityDisplayShouldIncreaseContrast();
+                    path.setLineWidth(if increase_contrast { 3.0 } else { 2.0 });
+                    NSColor::controlAccentColor().setStroke();
+                    path.stroke();
+                }
+
+                if let Some(index) = self.ivars().selected_index.get() {
+                    if let Some(point) = points.get(index).filter(|point| point.value.is_some()) {
+                        let marker = NSPoint::new(
+                            2.0 + width * history_x_position(point.observed_at, window_end),
+                            2.0
+                                + height
+                                    * point.value.unwrap_or_default().clamp(0.0, 100.0)
+                                    / 100.0,
+                        );
+                        NSColor::controlAccentColor().setFill();
+                        NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                            NSPoint::new(marker.x - 4.0, marker.y - 4.0),
+                            NSSize::new(8.0, 8.0),
+                        ))
+                        .fill();
+                    }
                 }
             }
-            let increase_contrast = NSWorkspace::sharedWorkspace()
-                .accessibilityDisplayShouldIncreaseContrast();
-            path.setLineWidth(if increase_contrast { 3.0 } else { 2.0 });
-            NSColor::controlAccentColor().setStroke();
-            path.stroke();
+
+            let focused = self.window().and_then(|window| window.firstResponder()).is_some_and(
+                |responder| unsafe { msg_send![&*responder, isEqual: self] },
+            );
+            if focused {
+                let ring = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                    NSRect::new(
+                        NSPoint::new(1.0, 1.0),
+                        NSSize::new(
+                            (bounds.size.width - 2.0).max(1.0),
+                            (bounds.size.height - 2.0).max(1.0),
+                        ),
+                    ),
+                    4.0,
+                    4.0,
+                );
+                ring.setLineWidth(2.0);
+                NSColor::keyboardFocusIndicatorColor().setStroke();
+                ring.stroke();
+            }
         }
     }
 );
@@ -80,14 +178,101 @@ impl UsageGraphView {
     fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(UsageGraphViewIvars {
             points: RefCell::new(Vec::new()),
+            navigation: RefCell::new(GraphNavigation::new()),
+            selected_index: Cell::new(None),
         });
-        unsafe { msg_send![super(this), initWithFrame: frame] }
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        this.setFocusRingType(NSFocusRingType::Exterior);
+        this
     }
 
     fn apply(&self, points: &[UsagePoint], accessibility_label: &str) {
         self.ivars().points.replace(points.to_vec());
+        let selection = self.ivars().navigation.borrow_mut().update_points(points);
+        self.ivars()
+            .selected_index
+            .set(selection.as_ref().map(|selection| selection.index));
         self.setAccessibilityElement(true);
         self.setAccessibilityLabel(Some(&NSString::from_str(accessibility_label)));
+        self.setAccessibilityHelp(Some(ns_string!(
+            "Use as setas esquerda e direita para percorrer as amostras; Option vai ao início ou fim."
+        )));
+        let accessibility_value = selection.map_or_else(
+            || "Nenhuma amostra válida.".to_owned(),
+            |selection| selection.accessibility_value,
+        );
+        let value = NSString::from_str(&accessibility_value);
+        unsafe { self.setAccessibilityValue(Some(&value)) };
+        self.setNeedsDisplay(true);
+    }
+}
+
+struct MemoryCompositionViewIvars {
+    fractions: RefCell<Vec<f64>>,
+}
+
+define_class!(
+    #[unsafe(super = NSView)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = MemoryCompositionViewIvars]
+    struct MemoryCompositionView;
+
+    unsafe impl NSObjectProtocol for MemoryCompositionView {}
+
+    impl MemoryCompositionView {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty_rect: NSRect) {
+            let bounds = self.bounds();
+            let fractions = self.ivars().fractions.borrow();
+            let colors = [
+                NSColor::systemBlueColor(),
+                NSColor::systemOrangeColor(),
+                NSColor::systemPurpleColor(),
+                NSColor::systemGrayColor(),
+            ];
+            let mut x = bounds.origin.x;
+            for (index, fraction) in fractions.iter().copied().enumerate() {
+                let remaining = bounds.origin.x + bounds.size.width - x;
+                let width = if index + 1 == fractions.len() {
+                    remaining
+                } else {
+                    (bounds.size.width * fraction.clamp(0.0, 1.0)).min(remaining)
+                };
+                colors[index.min(colors.len() - 1)].setFill();
+                NSBezierPath::fillRect(NSRect::new(
+                    NSPoint::new(x, bounds.origin.y),
+                    NSSize::new(width.max(0.0), bounds.size.height),
+                ));
+                x += width;
+                if index + 1 < fractions.len() {
+                    let divider = NSBezierPath::new();
+                    divider.moveToPoint(NSPoint::new(x, bounds.origin.y));
+                    divider.lineToPoint(NSPoint::new(x, bounds.origin.y + bounds.size.height));
+                    divider.setLineWidth(1.0);
+                    NSColor::windowBackgroundColor().setStroke();
+                    divider.stroke();
+                }
+            }
+        }
+    }
+);
+
+impl MemoryCompositionView {
+    fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(MemoryCompositionViewIvars {
+            fractions: RefCell::new(Vec::new()),
+        });
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    fn apply(&self, segments: &[MemoryCompositionSegment], accessibility_label: &str) {
+        self.ivars()
+            .fractions
+            .replace(segments.iter().map(|segment| segment.fraction).collect());
+        self.setAccessibilityElement(true);
+        self.setAccessibilityLabel(Some(ns_string!("Composição da memória física")));
+        let value = NSString::from_str(accessibility_label);
+        unsafe { self.setAccessibilityValue(Some(&value)) };
         self.setNeedsDisplay(true);
     }
 }
@@ -152,7 +337,7 @@ define_class!(
                     &NSString::from_str(text),
                     MainThreadMarker::new().expect("table cells are created on the main thread"),
                 );
-                field.setAccessibilityLabel(Some(&NSString::from_str(accessibility_label)));
+                field.setAccessibilityLabel(Some(&NSString::from_str(&accessibility_label)));
                 if column == "memory" {
                     field.setAlignment(objc2_app_kit::NSTextAlignment::Right);
                 }
@@ -162,13 +347,18 @@ define_class!(
     }
 );
 
-fn process_cell_presentation<'a>(row: &'a ProcessRowViewModel, column: &str) -> (&'a str, &'a str) {
+fn process_cell_presentation<'a>(row: &'a ProcessRowViewModel, column: &str) -> (&'a str, String) {
     let text = if column == "memory" {
         row.memory.as_str()
     } else {
         row.name.as_str()
     };
-    (text, row.accessibility_label.as_str())
+    let accessibility_label = if column == "memory" {
+        format!("Memória: {}", row.memory)
+    } else {
+        format!("Processo: {}", row.name)
+    };
+    (text, accessibility_label)
 }
 
 impl StatsTableDataSource {
@@ -179,8 +369,12 @@ impl StatsTableDataSource {
         unsafe { msg_send![super(this), init] }
     }
 
-    fn replace_rows(&self, rows: &[ProcessRowViewModel]) {
+    fn replace_rows(&self, rows: &[ProcessRowViewModel]) -> bool {
+        if self.ivars().rows.borrow().as_slice() == rows {
+            return false;
+        }
         self.ivars().rows.replace(rows.to_vec());
+        true
     }
 
     fn pid_at(&self, row: isize) -> Option<u32> {
@@ -188,18 +382,12 @@ impl StatsTableDataSource {
             .ok()
             .and_then(|row| self.ivars().rows.borrow().get(row).map(|row| row.pid))
     }
-
-    fn index_of_pid(&self, pid: u32) -> Option<usize> {
-        self.ivars()
-            .rows
-            .borrow()
-            .iter()
-            .position(|row| row.pid == pid)
-    }
 }
 
 struct ControlTargetIvars {
     proxy: EventLoopProxy<RuntimeEvent>,
+    system_usage_visible: Arc<AtomicBool>,
+    system_usage_generation: Arc<AtomicU64>,
 }
 
 define_class!(
@@ -209,6 +397,28 @@ define_class!(
     struct ControlTarget;
 
     unsafe impl NSObjectProtocol for ControlTarget {}
+
+    unsafe impl NSWindowDelegate for ControlTarget {
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn system_usage_became_key(&self, _notification: &NSNotification) {
+            self.update_system_usage_visibility(true);
+        }
+
+        #[unsafe(method(windowWillClose:))]
+        fn system_usage_will_close(&self, _notification: &NSNotification) {
+            self.update_system_usage_visibility(false);
+        }
+
+        #[unsafe(method(windowDidMiniaturize:))]
+        fn system_usage_did_miniaturize(&self, _notification: &NSNotification) {
+            self.update_system_usage_visibility(false);
+        }
+
+        #[unsafe(method(windowDidDeminiaturize:))]
+        fn system_usage_did_deminiaturize(&self, _notification: &NSNotification) {
+            self.update_system_usage_visibility(true);
+        }
+    }
 
     impl ControlTarget {
         #[unsafe(method(toggleMoleIntegration:))]
@@ -295,14 +505,41 @@ define_class!(
 );
 
 impl ControlTarget {
-    fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(ControlTargetIvars { proxy });
+    fn new(
+        mtm: MainThreadMarker,
+        proxy: EventLoopProxy<RuntimeEvent>,
+        system_usage_visible: Arc<AtomicBool>,
+        system_usage_generation: Arc<AtomicU64>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ControlTargetIvars {
+            proxy,
+            system_usage_visible,
+            system_usage_generation,
+        });
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn update_system_usage_visibility(&self, visible: bool) {
+        let changed = self
+            .ivars()
+            .system_usage_visible
+            .swap(visible, Ordering::AcqRel)
+            != visible;
+        if changed {
+            self.ivars()
+                .system_usage_generation
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        let _ = self
+            .ivars()
+            .proxy
+            .send_event(RuntimeEvent::SystemUsageVisibilityChanged(visible));
     }
 }
 
 pub struct WindowManager {
     control_target: Retained<ControlTarget>,
+    system_usage_generation: Arc<AtomicU64>,
     preferences: Option<PreferencesWindow>,
     history: Option<HistoryWindow>,
     free_space: Option<FreeSpaceWindow>,
@@ -339,6 +576,7 @@ struct SystemUsageWindow {
     primary_value: Retained<NSTextField>,
     secondary_value: Retained<NSTextField>,
     status: Retained<NSTextField>,
+    memory_composition: Retained<MemoryCompositionView>,
     graph: Retained<UsageGraphView>,
     history_summary: Retained<NSTextField>,
     detail_labels: Vec<Retained<NSTextField>>,
@@ -354,6 +592,7 @@ struct SystemUsageLayout {
     primary: NSRect,
     secondary: NSRect,
     status: NSRect,
+    memory_composition: NSRect,
     detail_labels: [NSRect; 6],
     detail_values: [NSRect; 6],
     history_heading: NSRect,
@@ -385,6 +624,10 @@ fn system_usage_layout(size: NSSize) -> SystemUsageLayout {
         primary: NSRect::new(NSPoint::new(24.0, top - 110.0), NSSize::new(240.0, 38.0)),
         secondary: NSRect::new(NSPoint::new(24.0, top - 140.0), NSSize::new(240.0, 24.0)),
         status: NSRect::new(NSPoint::new(24.0, top - 172.0), NSSize::new(240.0, 28.0)),
+        memory_composition: NSRect::new(
+            NSPoint::new(size.width - 354.0, top - 76.0),
+            NSSize::new(330.0, 12.0),
+        ),
         detail_labels,
         detail_values,
         history_heading: NSRect::new(NSPoint::new(24.0, top - 250.0), NSSize::new(240.0, 26.0)),
@@ -407,11 +650,40 @@ fn system_usage_layout(size: NSSize) -> SystemUsageLayout {
     }
 }
 
+fn process_table_column_widths(viewport_width: f64) -> (f64, f64) {
+    let memory = 130.0_f64.min((viewport_width * 0.28).max(120.0));
+    let process = (viewport_width - memory - 4.0).max(240.0);
+    (process, memory)
+}
+
+fn process_selection_after_update(
+    selected_pid: Option<u32>,
+    selected_row: isize,
+    rows: &[ProcessRowViewModel],
+) -> Option<usize> {
+    selected_pid
+        .and_then(|pid| rows.iter().position(|row| row.pid == pid))
+        .or_else(|| {
+            usize::try_from(selected_row)
+                .ok()
+                .filter(|_| !rows.is_empty())
+                .map(|row| row.min(rows.len() - 1))
+        })
+}
+
 impl WindowManager {
     pub fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Self {
-        let control_target = ControlTarget::new(mtm, proxy);
+        let system_usage_visible = Arc::new(AtomicBool::new(false));
+        let system_usage_generation = Arc::new(AtomicU64::new(0));
+        let control_target = ControlTarget::new(
+            mtm,
+            proxy,
+            system_usage_visible,
+            Arc::clone(&system_usage_generation),
+        );
         Self {
             control_target,
+            system_usage_generation,
             preferences: None,
             history: None,
             free_space: None,
@@ -420,6 +692,7 @@ impl WindowManager {
     }
 
     pub fn show(&mut self, kind: WindowKind, state: &AppState, history: &History) {
+        let shows_system_usage = kind == WindowKind::SystemUsage;
         let mtm = MainThreadMarker::new().expect("native window actions run on the main thread");
         let window = match kind {
             WindowKind::Preferences => {
@@ -472,6 +745,9 @@ impl WindowManager {
         // notification click, so request cooperative activation before
         // promoting the retained window.
         app.activate();
+        if shows_system_usage {
+            self.control_target.update_system_usage_visibility(true);
+        }
         window.makeKeyAndOrderFront(None);
     }
 
@@ -493,7 +769,33 @@ impl WindowManager {
     pub fn system_usage_visible(&self) -> bool {
         self.system_usage
             .as_ref()
-            .is_some_and(|window| window.window.isVisible())
+            .is_some_and(|window| window.window.isVisible() && !window.window.isMiniaturized())
+    }
+
+    pub fn system_usage_visibility_generation(&self) -> u64 {
+        self.system_usage_generation.load(Ordering::Acquire)
+    }
+
+    pub fn system_usage_process_interaction_active(&self) -> bool {
+        let Some(system_usage) = &self.system_usage else {
+            return false;
+        };
+        let keyboard_focused =
+            system_usage
+                .window
+                .firstResponder()
+                .is_some_and(|responder| unsafe {
+                    msg_send![&*responder, isEqual: &*system_usage.process_table]
+                });
+        if keyboard_focused {
+            return true;
+        }
+        let mtm = MainThreadMarker::new().expect("focus is inspected on the main thread");
+        NSApplication::sharedApplication(mtm)
+            .accessibilityApplicationFocusedUIElement()
+            .is_some_and(|focused| {
+                accessibility_object_is_inside(focused, &system_usage.process_table)
+            })
     }
 
     pub fn update_system_usage(&self, view_model: &SystemUsageViewModel) {
@@ -501,6 +803,22 @@ impl WindowManager {
             window.apply(view_model);
         }
     }
+}
+
+fn accessibility_object_is_inside(mut object: Retained<AnyObject>, ancestor: &AnyObject) -> bool {
+    for _ in 0..16 {
+        let matches: bool = unsafe { msg_send![&*object, isEqual: ancestor] };
+        if matches {
+            return true;
+        }
+        let parent: Option<Retained<AnyObject>> =
+            unsafe { msg_send![&*object, accessibilityParent] };
+        let Some(parent) = parent else {
+            return false;
+        };
+        object = parent;
+    }
+    false
 }
 
 impl FreeSpaceWindow {
@@ -600,6 +918,14 @@ impl SystemUsageWindow {
             .setHidden(view_model.secondary_value.is_empty());
         self.status
             .setStringValue(&NSString::from_str(&view_model.status));
+        self.memory_composition.apply(
+            &view_model.memory_composition,
+            &view_model.memory_composition_accessibility_label,
+        );
+        self.memory_composition.setHidden(
+            view_model.section != SystemUsageSection::Ram
+                || view_model.memory_composition.is_empty(),
+        );
         self.primary_value
             .setAccessibilityLabel(Some(&NSString::from_str(&format!(
                 "{}, {}, {}",
@@ -628,23 +954,42 @@ impl SystemUsageWindow {
 
         let shows_processes = view_model.section == SystemUsageSection::Ram;
         self.process_heading.setHidden(!shows_processes);
-        self.process_scroll.setHidden(!shows_processes);
-        let selected_pid = self
+        let process_heading = match view_model.process_status {
+            ProcessListStatus::Available => "Maiores usos de memória agora".to_owned(),
+            ProcessListStatus::Stale => {
+                "Maiores usos de memória agora — dados desatualizados".to_owned()
+            }
+            status => status.message().to_owned(),
+        };
+        self.process_heading
+            .setStringValue(&NSString::from_str(&process_heading));
+        self.process_heading
+            .setAccessibilityLabel(Some(&NSString::from_str(&process_heading)));
+        let shows_process_rows = matches!(
+            view_model.process_status,
+            ProcessListStatus::Available | ProcessListStatus::Stale
+        );
+        self.process_scroll
+            .setHidden(!shows_processes || !shows_process_rows);
+        let selected_row = self.process_table.selectedRow();
+        let selected_pid = self.process_data_source.pid_at(selected_row);
+        let selection =
+            process_selection_after_update(selected_pid, selected_row, &view_model.process_rows);
+        if self
             .process_data_source
-            .pid_at(self.process_table.selectedRow());
-        let clip_view = self.process_scroll.contentView();
-        let scroll_origin = clip_view.bounds().origin;
-        self.process_data_source
-            .replace_rows(&view_model.process_rows);
-        self.process_table.reloadData();
-        clip_view.scrollToPoint(scroll_origin);
-        self.process_scroll.reflectScrolledClipView(&clip_view);
-        if let Some(index) = selected_pid.and_then(|pid| self.process_data_source.index_of_pid(pid))
+            .replace_rows(&view_model.process_rows)
         {
-            self.process_table.selectRowIndexes_byExtendingSelection(
-                &NSIndexSet::indexSetWithIndex(index),
-                false,
-            );
+            let clip_view = self.process_scroll.contentView();
+            let scroll_origin = clip_view.bounds().origin;
+            self.process_table.reloadData();
+            clip_view.scrollToPoint(scroll_origin);
+            self.process_scroll.reflectScrolledClipView(&clip_view);
+            if let Some(index) = selection {
+                self.process_table.selectRowIndexes_byExtendingSelection(
+                    &NSIndexSet::indexSetWithIndex(index),
+                    false,
+                );
+            }
         }
     }
 }
@@ -663,6 +1008,7 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
         )
     };
     unsafe { window.setReleasedWhenClosed(false) };
+    window.setDelegate(Some(ProtocolObject::from_ref(target)));
     window.setCollectionBehavior(NSWindowCollectionBehavior::MoveToActiveSpace);
     window.setTitle(ns_string!("Uso do sistema"));
     window.setContentMinSize(NSSize::new(620.0, 520.0));
@@ -705,6 +1051,9 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
     let status = text_label(mtm, "Coletando a primeira leitura…", layout.status);
     status.setAutoresizingMask(top_left_mask);
     status.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    let memory_composition = MemoryCompositionView::new(mtm, layout.memory_composition);
+    memory_composition.setAutoresizingMask(top_right_mask);
+    memory_composition.setHidden(true);
 
     let mut detail_labels = Vec::with_capacity(6);
     let mut detail_values = Vec::with_capacity(6);
@@ -748,17 +1097,34 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
     );
     let process_table = NSTableView::initWithFrame(
         NSTableView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(612.0, 188.0)),
+        NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new((layout.process_scroll.size.width - 20.0).max(1.0), 188.0),
+        ),
     );
+    process_table.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    process_table.setColumnAutoresizingStyle(
+        NSTableViewColumnAutoresizingStyle::FirstColumnOnlyAutoresizingStyle,
+    );
+    let (process_width, memory_width) =
+        process_table_column_widths((layout.process_scroll.size.width - 20.0).max(1.0));
     let process_column =
         NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("process"));
-    process_column.setWidth(440.0);
+    process_column.setWidth(process_width);
+    process_column.setMinWidth(240.0);
+    process_column.setResizingMask(
+        NSTableColumnResizingOptions::AutoresizingMask
+            | NSTableColumnResizingOptions::UserResizingMask,
+    );
     process_column
         .headerCell()
         .setStringValue(ns_string!("Processo"));
     let memory_column =
         NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("memory"));
-    memory_column.setWidth(160.0);
+    memory_column.setWidth(memory_width);
+    memory_column.setMinWidth(120.0);
+    memory_column.setMaxWidth(160.0);
+    memory_column.setResizingMask(NSTableColumnResizingOptions::UserResizingMask);
     memory_column
         .headerCell()
         .setStringValue(ns_string!("Memória"));
@@ -781,6 +1147,7 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
     content.addSubview(&primary_value);
     content.addSubview(&secondary_value);
     content.addSubview(&status);
+    content.addSubview(&memory_composition);
     content.addSubview(&history_heading);
     content.addSubview(&graph);
     content.addSubview(&history_summary);
@@ -796,6 +1163,7 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
         primary_value,
         secondary_value,
         status,
+        memory_composition,
         graph,
         history_summary,
         detail_labels,
@@ -1204,26 +1572,28 @@ fn threshold_title(threshold: WarningThreshold) -> Retained<objc2_foundation::NS
 
 #[cfg(test)]
 mod tests {
-    use super::{process_cell_presentation, system_usage_layout};
+    use super::{
+        process_cell_presentation, process_selection_after_update, process_table_column_widths,
+        system_usage_layout,
+    };
     use objc2_foundation::NSSize;
     use statlet::stats::ProcessRowViewModel;
 
     #[test]
-    fn native_process_cells_use_the_complete_row_accessibility_label() {
+    fn native_process_cells_have_distinct_column_aware_accessibility_labels() {
         let row = ProcessRowViewModel {
             pid: 42,
             name: "Safari".to_owned(),
             memory: "512 MB".to_owned(),
-            accessibility_label: "Safari, 512 MB".to_owned(),
         };
 
         assert_eq!(
             process_cell_presentation(&row, "process"),
-            ("Safari", "Safari, 512 MB")
+            ("Safari", "Processo: Safari".to_owned())
         );
         assert_eq!(
             process_cell_presentation(&row, "memory"),
-            ("512 MB", "Safari, 512 MB")
+            ("512 MB", "Memória: 512 MB".to_owned())
         );
     }
 
@@ -1236,11 +1606,43 @@ mod tests {
         assert!(max_x(layout.segmented) <= 620.0);
         assert!(max_y(layout.segmented) <= 520.0);
         assert!(max_x(layout.primary) < layout.detail_labels[0].origin.x);
+        assert!(max_x(layout.memory_composition) <= 620.0);
+        assert!(max_y(layout.detail_labels[0]) <= layout.memory_composition.origin.y);
+        assert!(max_y(layout.memory_composition) < layout.segmented.origin.y);
         assert!(max_x(layout.history_heading) < layout.detail_labels[4].origin.x);
         assert!(max_y(layout.graph) < layout.detail_values[5].origin.y);
         assert!(max_y(layout.history_summary) < layout.graph.origin.y);
         assert!(max_y(layout.process_heading) < layout.history_summary.origin.y);
         assert!(max_y(layout.process_scroll) < layout.process_heading.origin.y);
         assert!(layout.process_scroll.size.height >= 50.0);
+    }
+
+    #[test]
+    fn process_table_columns_fit_the_minimum_viewport_without_hiding_memory() {
+        let (process, memory) = process_table_column_widths(552.0);
+
+        assert!(process + memory <= 552.0);
+        assert!(process >= 400.0);
+        assert!(memory >= 120.0);
+    }
+
+    #[test]
+    fn process_selection_is_preserved_by_pid_or_moves_to_the_nearest_row() {
+        let rows = [
+            ProcessRowViewModel {
+                pid: 7,
+                name: "A".to_owned(),
+                memory: "2 GB".to_owned(),
+            },
+            ProcessRowViewModel {
+                pid: 42,
+                name: "B".to_owned(),
+                memory: "1 GB".to_owned(),
+            },
+        ];
+
+        assert_eq!(process_selection_after_update(Some(42), 0, &rows), Some(1));
+        assert_eq!(process_selection_after_update(Some(99), 8, &rows), Some(1));
+        assert_eq!(process_selection_after_update(None, -1, &rows), None);
     }
 }
