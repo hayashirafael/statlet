@@ -9,7 +9,7 @@ use statlet::disk::DiskObservation;
 use statlet::history::HistoryEventKind;
 use statlet::indicator::compose_indicator;
 use statlet::indicator_preferences::{IndicatorAppearance, MetricColorMode, MetricKind, SrgbColor};
-use statlet::stats::SystemUsageSection;
+use statlet::system_usage::SystemUsageSection;
 
 fn enabled_core() -> StatletCore {
     StatletCore::with_preferences(Preferences {

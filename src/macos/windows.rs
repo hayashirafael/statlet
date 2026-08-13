@@ -29,9 +29,9 @@ use statlet::core::{AppState, WindowKind};
 use statlet::history::History;
 use statlet::indicator::LayoutDiagnostics;
 use statlet::indicator_preferences::FontFamilyPreference;
-use statlet::stats::{
+use statlet::system_usage::{
     graph_pointer_selection, history_x_position, GraphNavigation, GraphNavigationCommand,
-    MemoryCompositionSegment, ProcessListStatus, ProcessRowViewModel,
+    MemoryCompositionSegment, ProcessListStatus, ProcessRowViewModel, SurfaceObservation,
     SystemUsageAccessibilityCoordinator, SystemUsageSection, SystemUsageViewModel, UsagePoint,
 };
 use tao::event_loop::EventLoopProxy;
@@ -925,6 +925,17 @@ impl WindowManager {
             .is_some_and(SystemUsageWindow::process_interaction_active)
     }
 
+    pub fn system_usage_observation(&self) -> SurfaceObservation {
+        let visible = self.system_usage_visible();
+        SurfaceObservation {
+            visible,
+            native_visibility_epoch: self.system_usage_visibility_generation(),
+            process_interaction_active: system_usage_interaction_observation(visible, || {
+                self.system_usage_process_interaction_active()
+            }),
+        }
+    }
+
     pub fn request_system_usage_summary_focus(&self, section: SystemUsageSection) {
         if let Some(window) = &self.system_usage {
             window
@@ -955,6 +966,13 @@ impl WindowManager {
     pub fn release_preferences(&mut self) {
         release_preferences(&mut self.preferences);
     }
+}
+
+fn system_usage_interaction_observation(
+    visible: bool,
+    observe_interaction: impl FnOnce() -> bool,
+) -> bool {
+    visible && observe_interaction()
 }
 
 impl SystemUsageWindow {
@@ -1295,8 +1313,21 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
     }
     process_scroll.setDocumentView(Some(&process_table));
 
-    let ram_shortcut = shortcut_button(mtm, target, "1", sel!(selectSystemUsageRam:));
-    let gpu_shortcut = shortcut_button(mtm, target, "2", sel!(selectSystemUsageGpu:));
+    let [ram_key, gpu_key, close_key] = system_usage_shortcut_keys();
+    let ram_shortcut = shortcut_button(
+        mtm,
+        target as &AnyObject,
+        ram_key,
+        sel!(selectSystemUsageRam:),
+    );
+    let gpu_shortcut = shortcut_button(
+        mtm,
+        target as &AnyObject,
+        gpu_key,
+        sel!(selectSystemUsageGpu:),
+    );
+    let close_shortcut =
+        shortcut_button(mtm, &*window as &AnyObject, close_key, sel!(performClose:));
 
     content.addSubview(&segmented_control);
     content.addSubview(&primary_value);
@@ -1310,6 +1341,7 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
     content.addSubview(&process_scroll);
     content.addSubview(&ram_shortcut);
     content.addSubview(&gpu_shortcut);
+    content.addSubview(&close_shortcut);
     window.setInitialFirstResponder(Some(&segmented_control));
 
     SystemUsageWindow {
@@ -1335,17 +1367,12 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
 
 fn shortcut_button(
     mtm: MainThreadMarker,
-    target: &ControlTarget,
+    target: &AnyObject,
     key: &str,
     action: objc2::runtime::Sel,
 ) -> Retained<NSButton> {
     let button = unsafe {
-        NSButton::buttonWithTitle_target_action(
-            ns_string!(""),
-            Some(target as &AnyObject),
-            Some(action),
-            mtm,
-        )
+        NSButton::buttonWithTitle_target_action(ns_string!(""), Some(target), Some(action), mtm)
     };
     button.setFrame(NSRect::new(
         NSPoint::new(-20.0, -20.0),
@@ -1357,6 +1384,10 @@ fn shortcut_button(
     button
 }
 
+fn system_usage_shortcut_keys() -> [&'static str; 3] {
+    ["1", "2", "w"]
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -1364,6 +1395,11 @@ mod tests {
     use statlet::core::{AppState, StatletCore};
 
     use super::{prepare_preferences_for_show, release_preferences, RetainedStateConsumer};
+
+    #[test]
+    fn system_usage_shortcuts_include_the_native_close_command() {
+        assert_eq!(super::system_usage_shortcut_keys(), ["1", "2", "w"]);
+    }
 
     #[derive(Default)]
     struct RecordingStateConsumer {
@@ -1425,19 +1461,41 @@ mod tests {
 
 #[cfg(test)]
 mod system_usage_tests {
+    use std::cell::Cell;
+
     use super::{
         accessibility_announcement_user_info, detail_label_display_text, detail_label_frame,
         detail_value_display_text, focused_process_disappearance_announcement,
         memory_composition_stroke_style, process_cell_presentation, process_selection_after_update,
-        process_table_column_widths, process_table_height_for_visible_rows, system_usage_layout,
-        system_usage_min_content_size,
+        process_table_column_widths, process_table_height_for_visible_rows,
+        system_usage_interaction_observation, system_usage_layout, system_usage_min_content_size,
     };
     use objc2::msg_send;
     use objc2_app_kit::{
         NSAccessibilityAnnouncementKey, NSAccessibilityPriorityKey, NSAccessibilityPriorityLevel,
     };
     use objc2_foundation::NSSize;
-    use statlet::stats::ProcessRowViewModel;
+    use statlet::system_usage::ProcessRowViewModel;
+
+    #[test]
+    fn hidden_system_usage_surface_does_not_query_process_interaction() {
+        let interaction_queries = Cell::new(0);
+        let interaction_active = system_usage_interaction_observation(false, || {
+            interaction_queries.set(interaction_queries.get() + 1);
+            true
+        });
+
+        assert!(!interaction_active);
+        assert_eq!(interaction_queries.get(), 0);
+
+        let interaction_active = system_usage_interaction_observation(true, || {
+            interaction_queries.set(interaction_queries.get() + 1);
+            true
+        });
+
+        assert!(interaction_active);
+        assert_eq!(interaction_queries.get(), 1);
+    }
 
     #[test]
     fn native_announcement_payload_includes_message_and_medium_priority() {

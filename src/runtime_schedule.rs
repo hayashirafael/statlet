@@ -112,23 +112,20 @@ impl<T> RuntimeSchedule<T> {
         self.pending_save.as_ref()
     }
 
-    pub fn next_deadline(
+    pub fn next_deadline<I>(
         &self,
-        metrics_deadline: Duration,
-        system_usage_deadline: Option<Duration>,
-        disk_deadline: Option<Duration>,
-    ) -> Duration {
-        [
-            Some(metrics_deadline),
-            system_usage_deadline,
-            disk_deadline,
-            self.redraw_deadline(),
-            self.save_deadline(),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-        .expect("metrics always supplies a deadline")
+        mandatory_deadline: Duration,
+        additional_deadlines: I,
+    ) -> Duration
+    where
+        I: IntoIterator<Item = Option<Duration>>,
+    {
+        std::iter::once(Some(mandatory_deadline))
+            .chain(additional_deadlines)
+            .chain([self.redraw_deadline(), self.save_deadline()])
+            .flatten()
+            .min()
+            .expect("a mandatory deadline is always supplied")
     }
 }
 

@@ -1,7 +1,7 @@
 use std::ffi::{c_char, c_void, CString};
 use std::ptr;
 
-use statlet::stats::{GpuReading, GpuSampleOutcome};
+use statlet::system_usage::{GpuReading, GpuSampleOutcome};
 
 type CfTypeRef = *const c_void;
 type CfStringRef = *const c_void;
@@ -231,7 +231,7 @@ mod tests {
     use std::ptr;
 
     use super::MacGpuSampler;
-    use statlet::stats::GpuSampleOutcome;
+    use statlet::system_usage::GpuSampleOutcome;
 
     #[test]
     fn iokit_gpu_smoke_is_safe_and_best_effort() {
