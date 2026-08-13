@@ -10,4 +10,4 @@ pub mod mole;
 pub mod preferences;
 pub mod preferences_view;
 pub mod runtime_schedule;
-pub mod stats;
+pub mod system_usage;

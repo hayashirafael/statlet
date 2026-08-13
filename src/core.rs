@@ -10,7 +10,7 @@ use crate::indicator_preferences::{
     MetricKind, MetricsRefreshInterval, PngIconMetadata, SrgbColor, SystemSymbolName,
 };
 use crate::mole::MoleStatus;
-use crate::stats::SystemUsageSection;
+use crate::system_usage::SystemUsageSection;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryPressure {

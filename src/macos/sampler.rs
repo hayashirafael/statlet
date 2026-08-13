@@ -6,21 +6,44 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use statlet::core::{MemoryPressure, SystemSnapshot};
 use statlet::metrics::{detailed_memory_from_counters, MemoryReading, VmCounters};
-use statlet::stats::{ProcessMemory, ProcessSampleCancellation, ProcessSampleOutcome};
+use statlet::system_usage::{
+    ProcessMemory, ProcessSampleCancellation, ProcessSampleOutcome, SamplingCycle,
+};
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MacSystemSample {
     pub compact: SystemSnapshot,
     pub memory: MemoryReading,
 }
 
+#[derive(Default)]
+struct CycleSampleCache<T> {
+    entry: Option<(SamplingCycle, T)>,
+}
+
+impl<T: Copy> CycleSampleCache<T> {
+    fn get_or_sample(&mut self, cycle: SamplingCycle, sample: impl FnOnce() -> T) -> T {
+        if let Some((cached_cycle, value)) = self.entry {
+            if cached_cycle == cycle {
+                return value;
+            }
+        }
+        let value = sample();
+        self.entry = Some((cycle, value));
+        value
+    }
+}
+
 pub struct MacSampler {
     system: System,
+    samples: CycleSampleCache<Option<MacSystemSample>>,
 }
 
 impl MacSampler {
     pub fn new() -> Self {
         Self {
             system: System::new(),
+            samples: CycleSampleCache::default(),
         }
     }
 
@@ -28,19 +51,9 @@ impl MacSampler {
         self.system.refresh_cpu_usage();
     }
 
-    pub fn sample(&mut self) -> Option<MacSystemSample> {
-        self.system.refresh_cpu_usage();
-        self.system.refresh_memory();
-        let memory = read_memory(self.system.total_memory(), self.system.used_swap())?;
-
-        Some(MacSystemSample {
-            compact: SystemSnapshot {
-                cpu_percent: self.system.global_cpu_usage() as f64,
-                ram_percent: memory.percent,
-                memory_pressure: memory.pressure,
-            },
-            memory,
-        })
+    pub fn sample_in_cycle(&mut self, cycle: SamplingCycle) -> Option<MacSystemSample> {
+        let system = &mut self.system;
+        self.samples.get_or_sample(cycle, || sample_system(system))
     }
 
     pub fn sample_processes(cancellation: &ProcessSampleCancellation) -> ProcessSampleOutcome {
@@ -79,6 +92,21 @@ impl MacSampler {
             .collect(),
         )
     }
+}
+
+fn sample_system(system: &mut System) -> Option<MacSystemSample> {
+    system.refresh_cpu_usage();
+    system.refresh_memory();
+    let memory = read_memory(system.total_memory(), system.used_swap())?;
+
+    Some(MacSystemSample {
+        compact: SystemSnapshot {
+            cpu_percent: system.global_cpu_usage() as f64,
+            ram_percent: memory.percent,
+            memory_pressure: memory.pressure,
+        },
+        memory,
+    })
 }
 
 fn select_top_process_ids<I>(candidates: I, limit: usize) -> Vec<(u32, u64)>
@@ -170,7 +198,26 @@ fn read_memory_pressure() -> Option<MemoryPressure> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::select_top_process_ids;
+    use super::CycleSampleCache;
+    use statlet::system_usage::SamplingCycle;
+
+    #[test]
+    fn one_sampling_cycle_performs_one_physical_read_for_two_consumers() {
+        let reads = Cell::new(0);
+        let mut cache = CycleSampleCache::default();
+        let cycle = SamplingCycle::new(7);
+        let read = || {
+            reads.set(reads.get() + 1);
+            42_u8
+        };
+
+        assert_eq!(cache.get_or_sample(cycle, read), 42);
+        assert_eq!(cache.get_or_sample(cycle, read), 42);
+        assert_eq!(reads.get(), 1);
+    }
 
     #[test]
     fn process_candidates_are_bounded_and_sorted_before_names_are_allocated() {

@@ -77,23 +77,26 @@ fn next_deadline_is_the_earliest_of_metrics_disk_redraw_and_save() {
     schedule.queue_save(millis(0), "document");
 
     assert_eq!(
-        schedule.next_deadline(millis(500), None, Some(millis(250))),
+        schedule.next_deadline(millis(500), [None, Some(millis(250))]),
         millis(116)
     );
 
     schedule.take_due_redraw(millis(116));
     assert_eq!(
-        schedule.next_deadline(millis(500), None, Some(millis(250))),
+        schedule.next_deadline(millis(500), [None, Some(millis(250))]),
         millis(250)
     );
 }
 
 #[test]
-fn visible_system_usage_deadline_preempts_a_slower_indicator_interval() {
+fn an_additional_deadline_preempts_the_mandatory_indicator_interval() {
     let schedule = RuntimeSchedule::<()>::new();
 
     assert_eq!(
-        schedule.next_deadline(Duration::from_secs(60), Some(Duration::from_secs(2)), None,),
+        schedule.next_deadline(
+            Duration::from_secs(60),
+            [Some(Duration::from_secs(2)), None],
+        ),
         Duration::from_secs(2)
     );
 }

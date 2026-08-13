@@ -16,7 +16,7 @@ use objc2_foundation::{
     NSSize,
 };
 use statlet::core::{AppEvent, WarningThreshold};
-use statlet::stats::SystemUsageSection;
+use statlet::system_usage::SystemUsageSection;
 use tao::event_loop::EventLoopProxy;
 
 use super::super::RuntimeEvent;
@@ -206,7 +206,7 @@ impl ControlTarget {
         let _ = self
             .ivars()
             .proxy
-            .send_event(RuntimeEvent::SystemUsageVisibilityChanged(visible));
+            .send_event(RuntimeEvent::SystemUsageSurfaceChanged);
     }
 }
 

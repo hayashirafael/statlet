@@ -8,8 +8,8 @@ use std::time::Duration;
 use crate::core::MemoryPressure;
 use crate::metrics::MemoryReading;
 
-pub const USAGE_HISTORY_CAPACITY: usize = 150;
-pub const USAGE_HISTORY_WINDOW: Duration = Duration::from_secs(5 * 60);
+const USAGE_HISTORY_CAPACITY: usize = 150;
+const USAGE_HISTORY_WINDOW: Duration = Duration::from_secs(5 * 60);
 const MAX_CONTINUOUS_SAMPLE_GAP: Duration = Duration::from_secs(6);
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(6);
@@ -142,7 +142,7 @@ fn graph_selection(
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct UsageHistory {
+struct UsageHistory {
     points: VecDeque<UsagePoint>,
 }
 
@@ -358,15 +358,86 @@ pub enum ProcessSampleOutcome {
     Cancelled,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProcessSampleCompletion {
-    pub observed_at: Duration,
-    pub live_visible: bool,
-    pub interaction_active: bool,
-    pub request_visibility_generation: u64,
-    pub live_visibility_generation: u64,
-    pub generation: u64,
-    pub outcome: ProcessSampleOutcome,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SamplingCycle(u64);
+
+impl SamplingCycle {
+    pub const fn new(sequence: u64) -> Self {
+        Self(sequence)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SurfaceObservation {
+    pub visible: bool,
+    pub native_visibility_epoch: u64,
+    pub process_interaction_active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SystemUsagePresentation {
+    pub view_model: SystemUsageViewModel,
+    pub focus_summary: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SessionEpoch(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessRequestId(u64);
+
+#[derive(Clone, Debug)]
+pub struct ProcessSampleRequest {
+    request: ProcessRequestId,
+    epoch: SessionEpoch,
+    cancellation: ProcessSampleCancellation,
+}
+
+impl ProcessSampleRequest {
+    pub fn cancellation(&self) -> ProcessSampleCancellation {
+        self.cancellation.clone()
+    }
+
+    pub fn finish(&self, outcome: ProcessSampleOutcome) -> ProcessSampleFinished {
+        ProcessSampleFinished {
+            request: self.request,
+            epoch: self.epoch,
+            outcome,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProcessSampleFinished {
+    request: ProcessRequestId,
+    epoch: SessionEpoch,
+    outcome: ProcessSampleOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessStart {
+    Started,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub enum SystemUsageCause {
+    Wake(SamplingCycle),
+    SurfaceChanged,
+    SelectSection(SystemUsageSection),
+    ProcessesFinished(ProcessSampleFinished),
+}
+
+pub trait SystemUsageSampling {
+    #[allow(clippy::result_unit_err)]
+    fn memory(&mut self, cycle: SamplingCycle) -> Result<MemoryReading, ()>;
+    fn gpu(&mut self) -> GpuSampleOutcome;
+    fn start_processes(&mut self, request: ProcessSampleRequest) -> ProcessStart;
+}
+
+pub trait SystemUsageSurface {
+    fn observe(&self) -> SurfaceObservation;
+    fn apply(&mut self, presentation: SystemUsagePresentation);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -390,29 +461,6 @@ pub struct SystemUsageViewModel {
     pub history_accessibility_label: String,
     pub process_rows: Vec<ProcessRowViewModel>,
     pub process_status: ProcessListStatus,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct SystemUsageRenderCoalescer {
-    last_rendered: Option<SystemUsageViewModel>,
-}
-
-impl SystemUsageRenderCoalescer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn take_changed(&mut self, view_model: &SystemUsageViewModel) -> bool {
-        if self.last_rendered.as_ref() == Some(view_model) {
-            return false;
-        }
-        self.last_rendered = Some(view_model.clone());
-        true
-    }
-
-    pub fn reset(&mut self) {
-        self.last_rendered = None;
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -495,7 +543,7 @@ pub fn graph_pointer_selection(
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct SystemUsageModel {
+struct UsageModel {
     visible: bool,
     memory_state: MemoryReadingState,
     ram_history: UsageHistory,
@@ -511,18 +559,6 @@ pub struct SystemUsageModel {
 struct DeferredProcessRows {
     started_at: Duration,
     rows: Vec<ProcessMemory>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ProcessSamplingSchedule {
-    visible: bool,
-    next_due: Option<Duration>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SystemUsageSamplingSchedule {
-    visible: bool,
-    next_due: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -542,32 +578,14 @@ impl ProcessSampleCancellation {
     }
 }
 
-pub trait SystemUsageSamplingPorts {
-    fn sample_gpu(&mut self) -> GpuSampleOutcome;
-    fn request_process_sample(
-        &mut self,
-        generation: u64,
-        cancellation: ProcessSampleCancellation,
-    ) -> bool;
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct SystemUsageSamplingCoordinator {
-    visible: bool,
-    generation: u64,
-    process_in_flight: Option<u64>,
-    process_cancellation: Option<ProcessSampleCancellation>,
-    process_schedule: ProcessSamplingSchedule,
-}
-
 impl UsageHistory {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             points: VecDeque::with_capacity(USAGE_HISTORY_CAPACITY),
         }
     }
 
-    pub fn push(&mut self, observed_at: Duration, value: Option<f64>) {
+    fn push(&mut self, observed_at: Duration, value: Option<f64>) {
         if self
             .points
             .back()
@@ -607,21 +625,17 @@ impl UsageHistory {
         }
     }
 
-    pub fn points(&self) -> &VecDeque<UsagePoint> {
-        &self.points
-    }
-
     fn clear(&mut self) {
         self.points.clear();
     }
 }
 
-impl SystemUsageModel {
-    pub fn new() -> Self {
+impl UsageModel {
+    fn new() -> Self {
         Self::default()
     }
 
-    pub fn set_visible(&mut self, visible: bool) {
+    fn set_visible(&mut self, visible: bool) {
         if self.visible && !visible {
             self.gpu_history.clear();
             self.gpu_state = GpuReadingState::Collecting;
@@ -632,7 +646,10 @@ impl SystemUsageModel {
         self.visible = visible;
     }
 
-    pub fn record_memory(&mut self, observed_at: Duration, outcome: Result<MemoryReading, ()>) {
+    fn record_memory(&mut self, observed_at: Duration, outcome: Result<MemoryReading, ()>) -> bool {
+        let before_state = self.memory_state;
+        let before_history = self.ram_history.clone();
+        let before_latest = self.latest_observed_at;
         self.latest_observed_at = self.latest_observed_at.max(observed_at);
         match outcome {
             Ok(reading) => {
@@ -652,12 +669,18 @@ impl SystemUsageModel {
                 };
             }
         }
+        self.memory_state != before_state
+            || self.ram_history != before_history
+            || self.latest_observed_at != before_latest
     }
 
-    pub fn record_gpu(&mut self, observed_at: Duration, outcome: GpuSampleOutcome) {
+    fn record_gpu(&mut self, observed_at: Duration, outcome: GpuSampleOutcome) -> bool {
         if !self.visible {
-            return;
+            return false;
         }
+        let before_state = self.gpu_state.clone();
+        let before_history = self.gpu_history.clone();
+        let before_latest = self.latest_observed_at;
         self.latest_observed_at = self.latest_observed_at.max(observed_at);
         let value = match outcome {
             GpuSampleOutcome::Available(reading) => {
@@ -683,17 +706,22 @@ impl SystemUsageModel {
             }
         };
         self.gpu_history.push(observed_at, value);
+        self.gpu_state != before_state
+            || self.gpu_history != before_history
+            || self.latest_observed_at != before_latest
     }
 
-    pub fn record_process_sample(
+    fn record_process_sample(
         &mut self,
         observed_at: Duration,
         outcome: ProcessSampleOutcome,
         interaction_active: bool,
-    ) {
+    ) -> bool {
         if !self.visible {
-            return;
+            return false;
         }
+        let before_processes = self.processes.clone();
+        let before_status = self.process_status;
         match outcome {
             ProcessSampleOutcome::Available(mut processes) => {
                 normalize_process_rows(&mut processes);
@@ -728,9 +756,12 @@ impl SystemUsageModel {
             ProcessSampleOutcome::Cancelled => {}
         }
         self.apply_deferred_processes(observed_at, interaction_active);
+        self.processes != before_processes || self.process_status != before_status
     }
 
-    pub fn apply_deferred_processes(&mut self, now: Duration, interaction_active: bool) {
+    fn apply_deferred_processes(&mut self, now: Duration, interaction_active: bool) -> bool {
+        let before_processes = self.processes.clone();
+        let before_status = self.process_status;
         let should_apply = self.deferred_processes.as_ref().is_some_and(|pending| {
             !interaction_active
                 || now.saturating_sub(pending.started_at) >= MAX_PROCESS_REORDER_DEFERRAL
@@ -743,13 +774,16 @@ impl SystemUsageModel {
             self.processes = pending.rows;
             self.process_status = ProcessListStatus::Available;
         }
+        self.processes != before_processes || self.process_status != before_status
     }
 
-    pub fn gpu_history(&self) -> &UsageHistory {
-        &self.gpu_history
+    fn deferred_process_deadline(&self) -> Option<Duration> {
+        self.deferred_processes
+            .as_ref()
+            .map(|pending| pending.started_at + MAX_PROCESS_REORDER_DEFERRAL)
     }
 
-    pub fn view_model(&self, section: SystemUsageSection) -> SystemUsageViewModel {
+    fn view_model(&self, section: SystemUsageSection) -> SystemUsageViewModel {
         match section {
             SystemUsageSection::Ram => self.ram_view_model(),
             SystemUsageSection::Gpu => self.gpu_view_model(),
@@ -932,130 +966,7 @@ impl SystemUsageModel {
     }
 }
 
-impl ProcessSamplingSchedule {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn set_visible(&mut self, visible: bool, now: Duration) {
-        if visible == self.visible {
-            return;
-        }
-        self.visible = visible;
-        self.next_due = visible.then_some(now);
-    }
-
-    pub fn take_due(&mut self, now: Duration) -> bool {
-        let Some(next_due) = self.next_due else {
-            return false;
-        };
-        if now < next_due {
-            return false;
-        }
-        self.next_due = Some(now.saturating_add(PROCESS_SAMPLE_INTERVAL));
-        true
-    }
-}
-
-impl SystemUsageSamplingSchedule {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn set_visible(&mut self, visible: bool, now: Duration) {
-        if visible == self.visible {
-            return;
-        }
-        self.visible = visible;
-        self.next_due = visible.then_some(now);
-    }
-
-    pub fn remaining(&self, now: Duration) -> Option<Duration> {
-        self.next_due.map(|deadline| deadline.saturating_sub(now))
-    }
-
-    pub fn take_due(&mut self, now: Duration) -> bool {
-        let Some(next_due) = self.next_due else {
-            return false;
-        };
-        if now < next_due {
-            return false;
-        }
-        self.next_due = Some(now.saturating_add(SAMPLE_INTERVAL));
-        true
-    }
-}
-
-impl SystemUsageSamplingCoordinator {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn collect_if_visible<P: SystemUsageSamplingPorts>(
-        &mut self,
-        now: Duration,
-        visible: bool,
-        ports: &mut P,
-    ) -> Option<GpuSampleOutcome> {
-        self.set_visible(now, visible);
-        if !visible {
-            return None;
-        }
-
-        let gpu = ports.sample_gpu();
-        if self.process_in_flight.is_none() && self.process_schedule.take_due(now) {
-            let cancellation = ProcessSampleCancellation::new();
-            if ports.request_process_sample(self.generation, cancellation.clone()) {
-                self.process_in_flight = Some(self.generation);
-                self.process_cancellation = Some(cancellation);
-            }
-        }
-        Some(gpu)
-    }
-
-    pub fn set_visible(&mut self, now: Duration, visible: bool) {
-        if visible != self.visible {
-            self.visible = visible;
-            self.generation = self.generation.wrapping_add(1);
-            self.process_schedule.set_visible(visible, now);
-            if !visible {
-                if let Some(cancellation) = &self.process_cancellation {
-                    cancellation.cancel();
-                }
-            }
-        }
-    }
-
-    pub fn accept_process_sample(&mut self, generation: u64) -> bool {
-        if self.process_in_flight != Some(generation) {
-            return false;
-        }
-        self.process_in_flight = None;
-        self.process_cancellation = None;
-        self.visible && generation == self.generation
-    }
-
-    pub fn record_processes_if_current(
-        &mut self,
-        completion: ProcessSampleCompletion,
-        model: &mut SystemUsageModel,
-    ) -> bool {
-        self.set_visible(completion.observed_at, completion.live_visible);
-        if !self.accept_process_sample(completion.generation)
-            || completion.request_visibility_generation != completion.live_visibility_generation
-        {
-            return false;
-        }
-        model.record_process_sample(
-            completion.observed_at,
-            completion.outcome,
-            completion.interaction_active,
-        );
-        true
-    }
-}
-
-impl Default for SystemUsageModel {
+impl Default for UsageModel {
     fn default() -> Self {
         Self {
             visible: false,
@@ -1068,6 +979,265 @@ impl Default for SystemUsageModel {
             deferred_processes: None,
             latest_observed_at: Duration::ZERO,
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct InFlightProcessSample {
+    request: ProcessRequestId,
+    epoch: SessionEpoch,
+    cancellation: ProcessSampleCancellation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenderedRevision {
+    epoch: SessionEpoch,
+    semantic: u64,
+    section: SystemUsageSection,
+}
+
+#[derive(Debug)]
+pub struct SystemUsageSession {
+    visible: bool,
+    native_visibility_epoch: Option<u64>,
+    next_epoch: u64,
+    epoch: SessionEpoch,
+    next_request: u64,
+    sample_deadline: Option<Duration>,
+    process_deadline: Option<Duration>,
+    in_flight_process: Option<InFlightProcessSample>,
+    model: UsageModel,
+    section: SystemUsageSection,
+    semantic_revision: u64,
+    rendered_revision: Option<RenderedRevision>,
+}
+
+impl Default for SystemUsageSession {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            native_visibility_epoch: None,
+            next_epoch: 0,
+            epoch: SessionEpoch(0),
+            next_request: 0,
+            sample_deadline: None,
+            process_deadline: None,
+            in_flight_process: None,
+            model: UsageModel::new(),
+            section: SystemUsageSection::Ram,
+            semantic_revision: 0,
+            rendered_revision: None,
+        }
+    }
+}
+
+impl SystemUsageSession {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn advance(
+        &mut self,
+        cause: SystemUsageCause,
+        now: Duration,
+        sampling: &mut impl SystemUsageSampling,
+        surface: &mut impl SystemUsageSurface,
+    ) {
+        let observation = surface.observe();
+        let force_render = self.reconcile_surface(observation, now);
+        let mut focus_summary = false;
+
+        match cause {
+            SystemUsageCause::Wake(cycle) => {
+                self.sample_due(cycle, now, observation, sampling);
+            }
+            SystemUsageCause::SurfaceChanged => {}
+            SystemUsageCause::SelectSection(section) => {
+                if self.section != section {
+                    self.section = section;
+                    self.bump_revision();
+                }
+                focus_summary = self.visible;
+            }
+            SystemUsageCause::ProcessesFinished(completion) => {
+                self.finish_process_sample(completion, now, observation);
+            }
+        }
+
+        self.apply_presentation(force_render, focus_summary, surface);
+    }
+
+    pub fn next_deadline(&self) -> Option<Duration> {
+        if !self.visible {
+            return None;
+        }
+        [
+            self.sample_deadline,
+            self.in_flight_process
+                .is_none()
+                .then_some(self.process_deadline)
+                .flatten(),
+            self.model.deferred_process_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    fn reconcile_surface(&mut self, observation: SurfaceObservation, now: Duration) -> bool {
+        let native_epoch_changed = self
+            .native_visibility_epoch
+            .is_some_and(|epoch| epoch != observation.native_visibility_epoch);
+        self.native_visibility_epoch = Some(observation.native_visibility_epoch);
+
+        let mut force_render = false;
+        if observation.visible && (!self.visible || native_epoch_changed) {
+            if self.visible {
+                self.close_session();
+            }
+            self.open_session(now);
+            force_render = true;
+        } else if !observation.visible && self.visible {
+            self.close_session();
+        }
+
+        if self.visible
+            && self
+                .model
+                .apply_deferred_processes(now, observation.process_interaction_active)
+        {
+            self.bump_revision();
+        }
+        force_render
+    }
+
+    fn open_session(&mut self, now: Duration) {
+        self.next_epoch = self.next_epoch.wrapping_add(1);
+        self.epoch = SessionEpoch(self.next_epoch);
+        self.visible = true;
+        self.model.set_visible(true);
+        self.sample_deadline = Some(now);
+        self.process_deadline = Some(now);
+        self.rendered_revision = None;
+    }
+
+    fn close_session(&mut self) {
+        self.visible = false;
+        self.sample_deadline = None;
+        self.process_deadline = None;
+        self.model.set_visible(false);
+        self.rendered_revision = None;
+        if let Some(in_flight) = &self.in_flight_process {
+            in_flight.cancellation.cancel();
+        }
+    }
+
+    fn sample_due(
+        &mut self,
+        cycle: SamplingCycle,
+        now: Duration,
+        observation: SurfaceObservation,
+        sampling: &mut impl SystemUsageSampling,
+    ) {
+        if !self.visible {
+            return;
+        }
+        let mut changed = false;
+        if self.sample_deadline.is_some_and(|deadline| now >= deadline) {
+            self.sample_deadline = Some(now + SAMPLE_INTERVAL);
+            changed |= self.model.record_memory(now, sampling.memory(cycle));
+            changed |= self.model.record_gpu(now, sampling.gpu());
+        }
+
+        if self.in_flight_process.is_none()
+            && self
+                .process_deadline
+                .is_some_and(|deadline| now >= deadline)
+        {
+            self.process_deadline = Some(now + PROCESS_SAMPLE_INTERVAL);
+            self.next_request = self.next_request.wrapping_add(1);
+            let request = ProcessSampleRequest {
+                request: ProcessRequestId(self.next_request),
+                epoch: self.epoch,
+                cancellation: ProcessSampleCancellation::new(),
+            };
+            match sampling.start_processes(request.clone()) {
+                ProcessStart::Started => {
+                    self.in_flight_process = Some(InFlightProcessSample {
+                        request: request.request,
+                        epoch: request.epoch,
+                        cancellation: request.cancellation,
+                    });
+                }
+                ProcessStart::Failed => {
+                    changed |= self.model.record_process_sample(
+                        now,
+                        ProcessSampleOutcome::Failed,
+                        observation.process_interaction_active,
+                    );
+                }
+            }
+        }
+
+        if changed {
+            self.bump_revision();
+        }
+    }
+
+    fn finish_process_sample(
+        &mut self,
+        completion: ProcessSampleFinished,
+        now: Duration,
+        observation: SurfaceObservation,
+    ) {
+        let Some(in_flight) = self.in_flight_process.as_ref() else {
+            return;
+        };
+        if in_flight.request != completion.request || in_flight.epoch != completion.epoch {
+            return;
+        }
+        self.in_flight_process = None;
+
+        if self.visible
+            && completion.epoch == self.epoch
+            && self.model.record_process_sample(
+                now,
+                completion.outcome,
+                observation.process_interaction_active,
+            )
+        {
+            self.bump_revision();
+        }
+    }
+
+    fn bump_revision(&mut self) {
+        self.semantic_revision = self.semantic_revision.wrapping_add(1);
+    }
+
+    fn apply_presentation(
+        &mut self,
+        force: bool,
+        focus_summary: bool,
+        surface: &mut impl SystemUsageSurface,
+    ) {
+        if !self.visible {
+            return;
+        }
+        let revision = RenderedRevision {
+            epoch: self.epoch,
+            semantic: self.semantic_revision,
+            section: self.section,
+        };
+        if !force && !focus_summary && self.rendered_revision == Some(revision) {
+            return;
+        }
+
+        let presentation = SystemUsagePresentation {
+            view_model: self.model.view_model(self.section),
+            focus_summary,
+        };
+        surface.apply(presentation);
+        self.rendered_revision = Some(revision);
     }
 }
 

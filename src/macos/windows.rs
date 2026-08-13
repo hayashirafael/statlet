@@ -29,9 +29,9 @@ use statlet::core::{AppState, WindowKind};
 use statlet::history::History;
 use statlet::indicator::LayoutDiagnostics;
 use statlet::indicator_preferences::FontFamilyPreference;
-use statlet::stats::{
+use statlet::system_usage::{
     graph_pointer_selection, history_x_position, GraphNavigation, GraphNavigationCommand,
-    MemoryCompositionSegment, ProcessListStatus, ProcessRowViewModel,
+    MemoryCompositionSegment, ProcessListStatus, ProcessRowViewModel, SurfaceObservation,
     SystemUsageAccessibilityCoordinator, SystemUsageSection, SystemUsageViewModel, UsagePoint,
 };
 use tao::event_loop::EventLoopProxy;
@@ -925,6 +925,14 @@ impl WindowManager {
             .is_some_and(SystemUsageWindow::process_interaction_active)
     }
 
+    pub fn system_usage_observation(&self) -> SurfaceObservation {
+        SurfaceObservation {
+            visible: self.system_usage_visible(),
+            native_visibility_epoch: self.system_usage_visibility_generation(),
+            process_interaction_active: self.system_usage_process_interaction_active(),
+        }
+    }
+
     pub fn request_system_usage_summary_focus(&self, section: SystemUsageSection) {
         if let Some(window) = &self.system_usage {
             window
@@ -1437,7 +1445,7 @@ mod system_usage_tests {
         NSAccessibilityAnnouncementKey, NSAccessibilityPriorityKey, NSAccessibilityPriorityLevel,
     };
     use objc2_foundation::NSSize;
-    use statlet::stats::ProcessRowViewModel;
+    use statlet::system_usage::ProcessRowViewModel;
 
     #[test]
     fn native_announcement_payload_includes_message_and_medium_priority() {

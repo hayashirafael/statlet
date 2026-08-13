@@ -28,6 +28,7 @@ use statlet::indicator::{
     preview_visible_summary, resolve_identifier_fallbacks, PreviewBackground,
 };
 use statlet::indicator_preferences::{IndicatorAppearance, MetricKind, MetricsRefreshInterval};
+use statlet::metrics::MemoryReading;
 use statlet::metrics_schedule::MetricsSamplingSchedule;
 use statlet::mole::{MoleDetection, MoleDetector, MoleInstallation, MoleStatus};
 use statlet::preferences::{PreferencesCommitState, PreferencesSaveError, PreferencesStore};
@@ -48,10 +49,9 @@ use macos::windows::{
     PreviewContrastWarnings, PreviewSummaries, WindowManager,
 };
 use macos::RuntimeEvent;
-use statlet::stats::{
-    ProcessSampleCancellation, ProcessSampleCompletion, SystemUsageModel,
-    SystemUsageRenderCoalescer, SystemUsageSamplingCoordinator, SystemUsageSamplingPorts,
-    SystemUsageSamplingSchedule, SystemUsageSection,
+use statlet::system_usage::{
+    ProcessSampleRequest, ProcessStart, SamplingCycle, SurfaceObservation, SystemUsageCause,
+    SystemUsagePresentation, SystemUsageSampling, SystemUsageSession, SystemUsageSurface,
 };
 
 fn main() {
@@ -192,31 +192,18 @@ fn main() {
                     .apply_detection(generation, detection)
                     .map(|status| core.handle(AppEvent::MoleStatusObserved(status)))
                     .unwrap_or_default(),
-                RuntimeEvent::ProcessesSampled {
-                    generation,
-                    visibility_generation,
-                    outcome,
-                } => {
-                    let live_visible = runtime.system_usage_visible();
-                    let live_visibility_generation = runtime.system_usage_visibility_generation();
-                    let interaction_active = runtime.system_usage_process_interaction_active();
-                    runtime.samplers.record_processes(
-                        generation,
-                        visibility_generation,
-                        live_visibility_generation,
-                        outcome,
-                        live_visible,
-                        interaction_active,
-                    );
+                RuntimeEvent::ProcessesSampled(completion) => {
+                    runtime.advance_system_usage(SystemUsageCause::ProcessesFinished(completion));
                     Vec::new()
                 }
-                RuntimeEvent::SystemUsageVisibilityChanged(visible) => {
-                    runtime.samplers.set_system_usage_visible(visible);
+                RuntimeEvent::SystemUsageSurfaceChanged => {
+                    runtime.advance_system_usage(SystemUsageCause::SurfaceChanged);
                     Vec::new()
                 }
                 RuntimeEvent::SystemUsageSectionSelectedByUser(section) => {
-                    runtime.request_system_usage_summary_focus(section);
-                    core.handle(AppEvent::SelectSystemUsageSection(section))
+                    let effects = core.handle(AppEvent::SelectSystemUsageSection(section));
+                    runtime.advance_system_usage(SystemUsageCause::SelectSection(section));
+                    effects
                 }
             };
             if runtime.apply_effects(&effects, &mut core, &mut renderer, button.as_deref()) {
@@ -334,7 +321,7 @@ struct RuntimeAdapters {
     event_proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
     png_import_generations: [u64; 2],
     prepared_png_imports: [Option<PreparedPngAsset>; 2],
-    system_usage_rendering: SystemUsageRenderCoalescer,
+    system_usage: SystemUsageSession,
 }
 
 impl RuntimeAdapters {
@@ -360,7 +347,7 @@ impl RuntimeAdapters {
             visual_environment: VisualEnvironmentState::default(),
             schedule: RuntimeSchedule::new(),
             review_space_item,
-            system_usage_rendering: SystemUsageRenderCoalescer::new(),
+            system_usage: SystemUsageSession::new(),
             event_proxy: proxy,
             png_import_generations: [0; 2],
             prepared_png_imports: [None, None],
@@ -437,13 +424,9 @@ impl RuntimeAdapters {
             .disk_schedule
             .remaining(now)
             .map(|remaining| now + remaining);
-        let system_usage_deadline = self
-            .samplers
-            .system_usage_schedule
-            .remaining(now)
-            .map(|remaining| now + remaining);
+        let system_usage_deadline = self.system_usage.next_deadline();
         self.schedule
-            .next_deadline(metrics_deadline, system_usage_deadline, disk_deadline)
+            .next_deadline(metrics_deadline, [system_usage_deadline, disk_deadline])
             .saturating_sub(now)
     }
 
@@ -454,15 +437,8 @@ impl RuntimeAdapters {
         button: Option<&objc2_app_kit::NSStatusBarButton>,
     ) -> bool {
         let now = self.samplers.clock.now();
-        let system_usage_visible = self.system_usage_visible();
-        let process_interaction_active = self.system_usage_process_interaction_active();
-        let system_usage_visibility_generation = self.system_usage_visibility_generation();
-        let poll = self.samplers.poll_due(
-            core,
-            system_usage_visible,
-            process_interaction_active,
-            system_usage_visibility_generation,
-        );
+        let poll = self.samplers.poll_due(core);
+        self.advance_system_usage_at(SystemUsageCause::Wake(poll.cycle), now);
         if poll.metrics_ticked {
             self.schedule
                 .request_redraw_now(now, RedrawRequest::paint());
@@ -500,39 +476,17 @@ impl RuntimeAdapters {
         }
     }
 
-    fn update_system_usage_window(&mut self, section: SystemUsageSection) {
-        if let Some(windows) = &self.windows {
-            if windows.system_usage_visible() {
-                let view_model = self.samplers.system_usage_view_model(section);
-                if self.system_usage_rendering.take_changed(&view_model) {
-                    windows.update_system_usage(&view_model);
-                }
-            }
-        }
+    fn advance_system_usage(&mut self, cause: SystemUsageCause) {
+        let now = self.samplers.clock.now();
+        self.advance_system_usage_at(cause, now);
     }
 
-    fn system_usage_visible(&self) -> bool {
-        self.windows
-            .as_ref()
-            .is_some_and(WindowManager::system_usage_visible)
-    }
-
-    fn system_usage_process_interaction_active(&self) -> bool {
-        self.windows
-            .as_ref()
-            .is_some_and(WindowManager::system_usage_process_interaction_active)
-    }
-
-    fn system_usage_visibility_generation(&self) -> u64 {
-        self.windows
-            .as_ref()
-            .map_or(0, WindowManager::system_usage_visibility_generation)
-    }
-
-    fn request_system_usage_summary_focus(&self, section: SystemUsageSection) {
-        if let Some(windows) = &self.windows {
-            windows.request_system_usage_summary_focus(section);
-        }
+    fn advance_system_usage_at(&mut self, cause: SystemUsageCause, now: Duration) {
+        let mut surface = RuntimeSystemUsageSurface {
+            windows: self.windows.as_ref(),
+        };
+        self.system_usage
+            .advance(cause, now, &mut self.samplers, &mut surface);
     }
 
     fn apply_effects(
@@ -560,7 +514,7 @@ impl RuntimeAdapters {
                         self.request_redraw(RedrawRequest::paint());
                     }
                     if kind == statlet::core::WindowKind::SystemUsage {
-                        self.system_usage_rendering.reset();
+                        self.advance_system_usage(SystemUsageCause::SurfaceChanged);
                     }
                 }
                 AppEffect::QueuePreferencesSave(preferences) => {
@@ -728,7 +682,6 @@ impl RuntimeAdapters {
         if let Some(windows) = &self.windows {
             windows.update_state(core.state());
         }
-        self.update_system_usage_window(core.state().system_usage_section);
         should_quit
     }
 
@@ -1146,6 +1099,29 @@ impl RuntimeMole {
     }
 }
 
+struct RuntimeSystemUsageSurface<'a> {
+    windows: Option<&'a WindowManager>,
+}
+
+impl SystemUsageSurface for RuntimeSystemUsageSurface<'_> {
+    fn observe(&self) -> SurfaceObservation {
+        self.windows.map_or_else(
+            SurfaceObservation::default,
+            WindowManager::system_usage_observation,
+        )
+    }
+
+    fn apply(&mut self, presentation: SystemUsagePresentation) {
+        let Some(windows) = self.windows else {
+            return;
+        };
+        if presentation.focus_summary {
+            windows.request_system_usage_summary_focus(presentation.view_model.section);
+        }
+        windows.update_system_usage(&presentation.view_model);
+    }
+}
+
 struct RuntimeSamplers {
     metrics: MacSampler,
     metrics_schedule: MetricsSamplingSchedule,
@@ -1153,15 +1129,14 @@ struct RuntimeSamplers {
     disk_schedule: DiskSamplingSchedule,
     clock: ContinuousClock,
     gpu: MacGpuSampler,
-    system_usage: SystemUsageModel,
-    system_usage_schedule: SystemUsageSamplingSchedule,
-    system_usage_sampling: SystemUsageSamplingCoordinator,
     process_proxy: Option<tao::event_loop::EventLoopProxy<RuntimeEvent>>,
+    sampling_cycle: u64,
 }
 
 struct RuntimePoll {
     effects: Vec<AppEffect>,
     metrics_ticked: bool,
+    cycle: SamplingCycle,
 }
 
 impl RuntimeSamplers {
@@ -1179,10 +1154,8 @@ impl RuntimeSamplers {
             disk_schedule: DiskSamplingSchedule::new(),
             clock,
             gpu: MacGpuSampler::new(),
-            system_usage: SystemUsageModel::new(),
-            system_usage_schedule: SystemUsageSamplingSchedule::new(),
-            system_usage_sampling: SystemUsageSamplingCoordinator::new(),
             process_proxy,
+            sampling_cycle: 0,
         }
     }
 
@@ -1190,55 +1163,14 @@ impl RuntimeSamplers {
         self.disk_schedule.set_enabled(enabled, self.clock.now());
     }
 
-    fn set_system_usage_visible(&mut self, visible: bool) {
+    fn poll_due(&mut self, core: &mut StatletCore) -> RuntimePoll {
         let now = self.clock.now();
-        self.system_usage.set_visible(visible);
-        self.system_usage_schedule.set_visible(visible, now);
-        self.system_usage_sampling.set_visible(now, visible);
-    }
-
-    fn poll_due(
-        &mut self,
-        core: &mut StatletCore,
-        system_usage_visible: bool,
-        process_interaction_active: bool,
-        system_usage_visibility_generation: u64,
-    ) -> RuntimePoll {
-        let now = self.clock.now();
-        self.system_usage.set_visible(system_usage_visible);
-        self.system_usage_schedule
-            .set_visible(system_usage_visible, now);
-        self.system_usage_sampling
-            .set_visible(now, system_usage_visible);
-        self.system_usage
-            .apply_deferred_processes(now, process_interaction_active);
+        self.sampling_cycle = self.sampling_cycle.wrapping_add(1);
+        let cycle = SamplingCycle::new(self.sampling_cycle);
         let metrics_ticked = self.metrics_schedule.take_due(now);
-        let system_usage_ticked = self.system_usage_schedule.take_due(now);
-        if metrics_ticked || system_usage_ticked {
-            match self.metrics.sample() {
-                Some(snapshot) => {
-                    if metrics_ticked {
-                        core.handle(AppEvent::MetricsSample(snapshot.compact));
-                    }
-                    if system_usage_ticked {
-                        self.system_usage.record_memory(now, Ok(snapshot.memory));
-                    }
-                }
-                None if system_usage_ticked => self.system_usage.record_memory(now, Err(())),
-                None => {}
-            }
-        }
-        if system_usage_ticked {
-            let mut ports = RuntimeSystemUsagePorts {
-                gpu: &mut self.gpu,
-                process_proxy: self.process_proxy.as_ref(),
-                visibility_generation: system_usage_visibility_generation,
-            };
-            if let Some(gpu) =
-                self.system_usage_sampling
-                    .collect_if_visible(now, system_usage_visible, &mut ports)
-            {
-                self.system_usage.record_gpu(now, gpu);
+        if metrics_ticked {
+            if let Some(snapshot) = self.metrics.sample_in_cycle(cycle) {
+                core.handle(AppEvent::MetricsSample(snapshot.compact));
             }
         }
         let effects = if self.disk_schedule.take_due(now) {
@@ -1255,87 +1187,41 @@ impl RuntimeSamplers {
         RuntimePoll {
             effects,
             metrics_ticked,
+            cycle,
         }
     }
 
     fn reschedule_metrics(&mut self, interval: MetricsRefreshInterval) {
         self.metrics_schedule.reschedule(self.clock.now(), interval);
     }
-
-    fn system_usage_view_model(
-        &self,
-        section: SystemUsageSection,
-    ) -> statlet::stats::SystemUsageViewModel {
-        self.system_usage.view_model(section)
-    }
-
-    fn record_processes(
-        &mut self,
-        generation: u64,
-        request_visibility_generation: u64,
-        live_visibility_generation: u64,
-        outcome: statlet::stats::ProcessSampleOutcome,
-        live_visible: bool,
-        interaction_active: bool,
-    ) {
-        let now = self.clock.now();
-        self.system_usage.set_visible(live_visible);
-        self.system_usage_sampling.record_processes_if_current(
-            ProcessSampleCompletion {
-                observed_at: now,
-                live_visible,
-                interaction_active,
-                request_visibility_generation,
-                live_visibility_generation,
-                generation,
-                outcome,
-            },
-            &mut self.system_usage,
-        );
-    }
 }
 
-struct RuntimeSystemUsagePorts<'a> {
-    gpu: &'a mut MacGpuSampler,
-    process_proxy: Option<&'a tao::event_loop::EventLoopProxy<RuntimeEvent>>,
-    visibility_generation: u64,
-}
+impl SystemUsageSampling for RuntimeSamplers {
+    fn memory(&mut self, cycle: SamplingCycle) -> Result<MemoryReading, ()> {
+        self.metrics
+            .sample_in_cycle(cycle)
+            .map(|sample| sample.memory)
+            .ok_or(())
+    }
 
-impl SystemUsageSamplingPorts for RuntimeSystemUsagePorts<'_> {
-    fn sample_gpu(&mut self) -> statlet::stats::GpuSampleOutcome {
+    fn gpu(&mut self) -> statlet::system_usage::GpuSampleOutcome {
         self.gpu.sample()
     }
 
-    fn request_process_sample(
-        &mut self,
-        generation: u64,
-        cancellation: ProcessSampleCancellation,
-    ) -> bool {
-        let Some(process_proxy) = self.process_proxy else {
-            return false;
+    fn start_processes(&mut self, request: ProcessSampleRequest) -> ProcessStart {
+        let Some(process_proxy) = self.process_proxy.as_ref() else {
+            return ProcessStart::Failed;
         };
         let proxy = process_proxy.clone();
-        let visibility_generation = self.visibility_generation;
+        let cancellation = request.cancellation();
         thread::Builder::new()
             .name("statlet-process-sample".to_owned())
             .spawn(move || {
                 let outcome = MacSampler::sample_processes(&cancellation);
-                let _ = proxy.send_event(RuntimeEvent::ProcessesSampled {
-                    generation,
-                    visibility_generation,
-                    outcome,
-                });
+                let _ = proxy.send_event(RuntimeEvent::ProcessesSampled(request.finish(outcome)));
             })
-            .map(|_| true)
-            .unwrap_or_else(|_| {
-                process_proxy
-                    .send_event(RuntimeEvent::ProcessesSampled {
-                        generation,
-                        visibility_generation,
-                        outcome: statlet::stats::ProcessSampleOutcome::Failed,
-                    })
-                    .is_ok()
-            })
+            .map(|_| ProcessStart::Started)
+            .unwrap_or(ProcessStart::Failed)
     }
 }
 
