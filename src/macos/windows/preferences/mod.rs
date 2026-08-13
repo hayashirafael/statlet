@@ -76,6 +76,14 @@ impl PreferencesAreaState {
     }
 }
 
+fn select_visible_area(
+    state: &RefCell<PreferencesAreaState>,
+    select_area: impl FnOnce(PreferencesArea),
+) {
+    let area = state.borrow().visible();
+    select_area(area);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreferencesRegion {
     IndicatorGroups,
@@ -195,7 +203,7 @@ impl PreferencesControlTarget {
 
     fn set_sidebar(&self, sidebar: Retained<NSTableView>) {
         self.ivars().sidebar.replace(Some(sidebar));
-        self.select_area(self.ivars().state.borrow().visible());
+        select_visible_area(&self.ivars().state, |area| self.select_area(area));
     }
 
     fn select_area(&self, area: PreferencesArea) {
@@ -920,14 +928,27 @@ fn create_disk_and_mole_page(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use super::super::common::should_intercept_indicator_undo;
     use super::{
-        get_or_create_window, PreferencesArea, PreferencesAreaState, PreferencesFooterPresentation,
-        PreferencesRegion, PreferencesShellContract, RegionPlacement,
+        get_or_create_window, select_visible_area, PreferencesArea, PreferencesAreaState,
+        PreferencesFooterPresentation, PreferencesRegion, PreferencesShellContract,
+        RegionPlacement,
     };
+
+    #[test]
+    fn setting_the_sidebar_releases_the_visible_area_borrow_before_selection() {
+        let state = RefCell::new(PreferencesAreaState::new());
+
+        select_visible_area(&state, |area| {
+            let next = state.borrow().select(area);
+            state.replace(next);
+        });
+
+        assert_eq!(state.borrow().visible(), PreferencesArea::Indicator);
+    }
 
     #[test]
     fn selecting_an_area_shows_exactly_one_preferences_page() {
