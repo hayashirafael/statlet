@@ -519,6 +519,12 @@ pub struct ProcessSamplingSchedule {
     next_due: Option<Duration>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SystemUsageSamplingSchedule {
+    visible: bool,
+    next_due: Option<Duration>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ProcessSampleCancellation(Arc<AtomicBool>);
 
@@ -947,6 +953,35 @@ impl ProcessSamplingSchedule {
             return false;
         }
         self.next_due = Some(now.saturating_add(PROCESS_SAMPLE_INTERVAL));
+        true
+    }
+}
+
+impl SystemUsageSamplingSchedule {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_visible(&mut self, visible: bool, now: Duration) {
+        if visible == self.visible {
+            return;
+        }
+        self.visible = visible;
+        self.next_due = visible.then_some(now);
+    }
+
+    pub fn remaining(&self, now: Duration) -> Option<Duration> {
+        self.next_due.map(|deadline| deadline.saturating_sub(now))
+    }
+
+    pub fn take_due(&mut self, now: Duration) -> bool {
+        let Some(next_due) = self.next_due else {
+            return false;
+        };
+        if now < next_due {
+            return false;
+        }
+        self.next_due = Some(now.saturating_add(SAMPLE_INTERVAL));
         true
     }
 }

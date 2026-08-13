@@ -7,7 +7,7 @@ use statlet::stats::{
     ProcessMemory, ProcessSampleCancellation, ProcessSampleCompletion, ProcessSampleOutcome,
     ProcessSamplingSchedule, SystemUsageAccessibilityCoordinator, SystemUsageAccessibilityState,
     SystemUsageModel, SystemUsageRenderCoalescer, SystemUsageSamplingCoordinator,
-    SystemUsageSamplingPorts, SystemUsageSection, UsageHistory,
+    SystemUsageSamplingPorts, SystemUsageSamplingSchedule, SystemUsageSection, UsageHistory,
 };
 
 #[test]
@@ -610,6 +610,37 @@ fn process_sampling_reuses_ticks_and_never_catches_up() {
     assert!(!schedule.take_due(Duration::from_secs(104)));
     schedule.set_visible(true, Duration::from_secs(110));
     assert!(schedule.take_due(Duration::from_secs(110)));
+}
+
+#[test]
+fn visible_system_usage_has_its_own_two_second_schedule_without_catch_up() {
+    let mut schedule = SystemUsageSamplingSchedule::new();
+
+    assert_eq!(schedule.remaining(Duration::ZERO), None);
+
+    schedule.set_visible(true, Duration::from_secs(10));
+    assert_eq!(
+        schedule.remaining(Duration::from_secs(10)),
+        Some(Duration::ZERO)
+    );
+    assert!(schedule.take_due(Duration::from_secs(10)));
+    assert_eq!(
+        schedule.remaining(Duration::from_secs(10)),
+        Some(Duration::from_secs(2))
+    );
+    assert!(!schedule.take_due(Duration::from_secs(11)));
+    assert!(schedule.take_due(Duration::from_secs(12)));
+
+    assert!(schedule.take_due(Duration::from_secs(100)));
+    assert!(!schedule.take_due(Duration::from_secs(100)));
+    assert_eq!(
+        schedule.remaining(Duration::from_secs(100)),
+        Some(Duration::from_secs(2))
+    );
+
+    schedule.set_visible(false, Duration::from_secs(100));
+    assert_eq!(schedule.remaining(Duration::from_secs(100)), None);
+    assert!(!schedule.take_due(Duration::from_secs(102)));
 }
 
 #[derive(Default)]

@@ -115,10 +115,12 @@ impl<T> RuntimeSchedule<T> {
     pub fn next_deadline(
         &self,
         metrics_deadline: Duration,
+        system_usage_deadline: Option<Duration>,
         disk_deadline: Option<Duration>,
     ) -> Duration {
         [
             Some(metrics_deadline),
+            system_usage_deadline,
             disk_deadline,
             self.redraw_deadline(),
             self.save_deadline(),

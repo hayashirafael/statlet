@@ -51,7 +51,7 @@ use macos::RuntimeEvent;
 use statlet::stats::{
     ProcessSampleCancellation, ProcessSampleCompletion, SystemUsageModel,
     SystemUsageRenderCoalescer, SystemUsageSamplingCoordinator, SystemUsageSamplingPorts,
-    SystemUsageSection,
+    SystemUsageSamplingSchedule, SystemUsageSection,
 };
 
 fn main() {
@@ -437,8 +437,13 @@ impl RuntimeAdapters {
             .disk_schedule
             .remaining(now)
             .map(|remaining| now + remaining);
+        let system_usage_deadline = self
+            .samplers
+            .system_usage_schedule
+            .remaining(now)
+            .map(|remaining| now + remaining);
         self.schedule
-            .next_deadline(metrics_deadline, disk_deadline)
+            .next_deadline(metrics_deadline, system_usage_deadline, disk_deadline)
             .saturating_sub(now)
     }
 
@@ -1149,6 +1154,7 @@ struct RuntimeSamplers {
     clock: ContinuousClock,
     gpu: MacGpuSampler,
     system_usage: SystemUsageModel,
+    system_usage_schedule: SystemUsageSamplingSchedule,
     system_usage_sampling: SystemUsageSamplingCoordinator,
     process_proxy: Option<tao::event_loop::EventLoopProxy<RuntimeEvent>>,
 }
@@ -1174,6 +1180,7 @@ impl RuntimeSamplers {
             clock,
             gpu: MacGpuSampler::new(),
             system_usage: SystemUsageModel::new(),
+            system_usage_schedule: SystemUsageSamplingSchedule::new(),
             system_usage_sampling: SystemUsageSamplingCoordinator::new(),
             process_proxy,
         }
@@ -1186,6 +1193,7 @@ impl RuntimeSamplers {
     fn set_system_usage_visible(&mut self, visible: bool) {
         let now = self.clock.now();
         self.system_usage.set_visible(visible);
+        self.system_usage_schedule.set_visible(visible, now);
         self.system_usage_sampling.set_visible(now, visible);
     }
 
@@ -1198,17 +1206,29 @@ impl RuntimeSamplers {
     ) -> RuntimePoll {
         let now = self.clock.now();
         self.system_usage.set_visible(system_usage_visible);
+        self.system_usage_schedule
+            .set_visible(system_usage_visible, now);
+        self.system_usage_sampling
+            .set_visible(now, system_usage_visible);
         self.system_usage
             .apply_deferred_processes(now, process_interaction_active);
         let metrics_ticked = self.metrics_schedule.take_due(now);
-        if metrics_ticked {
+        let system_usage_ticked = self.system_usage_schedule.take_due(now);
+        if metrics_ticked || system_usage_ticked {
             match self.metrics.sample() {
                 Some(snapshot) => {
-                    core.handle(AppEvent::MetricsSample(snapshot.compact));
-                    self.system_usage.record_memory(now, Ok(snapshot.memory));
+                    if metrics_ticked {
+                        core.handle(AppEvent::MetricsSample(snapshot.compact));
+                    }
+                    if system_usage_ticked {
+                        self.system_usage.record_memory(now, Ok(snapshot.memory));
+                    }
                 }
-                None => self.system_usage.record_memory(now, Err(())),
+                None if system_usage_ticked => self.system_usage.record_memory(now, Err(())),
+                None => {}
             }
+        }
+        if system_usage_ticked {
             let mut ports = RuntimeSystemUsagePorts {
                 gpu: &mut self.gpu,
                 process_proxy: self.process_proxy.as_ref(),

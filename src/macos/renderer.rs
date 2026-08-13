@@ -292,40 +292,96 @@ struct SurfaceCache<I> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IdentifierImageKey {
-    identity: IdentifierIdentity,
+    identity: IdentifierImageIdentity,
     size: u8,
     weight: FontWeight,
 }
 
-struct IdentifierImageEntry {
-    key: IdentifierImageKey,
-    image: Retained<NSImage>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum IdentifierImageIdentity {
+    SystemSymbol {
+        name: String,
+        paint: PaintIdentity,
+    },
+    Png {
+        metric: MetricKind,
+        metadata: PngIconMetadata,
+    },
 }
 
-#[derive(Default)]
-struct IdentifierImageCache {
-    entries: Vec<IdentifierImageEntry>,
-}
-
-impl IdentifierImageCache {
-    fn get(&mut self, key: &IdentifierImageKey) -> Option<Retained<NSImage>> {
-        let index = self.entries.iter().position(|entry| &entry.key == key)?;
-        let entry = self.entries.remove(index);
-        let image = entry.image.clone();
-        self.entries.push(entry);
-        Some(image)
+fn identifier_image_key(
+    identifier: &MetricIdentifierVisual,
+    typography: &TypographyPreferences,
+    appearance: &str,
+) -> IdentifierImageKey {
+    let identity = match identifier {
+        MetricIdentifierVisual::SystemSymbol { name, color, .. } => {
+            IdentifierImageIdentity::SystemSymbol {
+                name: name.as_str().to_owned(),
+                paint: paint_identity(*color, appearance),
+            }
+        }
+        MetricIdentifierVisual::Png {
+            metric, metadata, ..
+        } => IdentifierImageIdentity::Png {
+            metric: *metric,
+            metadata: metadata.clone(),
+        },
+    };
+    IdentifierImageKey {
+        identity,
+        size: typography.size.points(),
+        weight: typography.weight,
     }
+}
 
-    fn insert(&mut self, key: IdentifierImageKey, image: Retained<NSImage>) {
+struct IdentifierImageEntry<I> {
+    key: IdentifierImageKey,
+    image: Option<I>,
+}
+
+struct IdentifierImageCache<I> {
+    entries: Vec<IdentifierImageEntry<I>>,
+}
+
+impl<I> Default for IdentifierImageCache<I> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<I: Clone> IdentifierImageCache<I> {
+    fn resolve(&mut self, key: IdentifierImageKey, load: impl FnOnce() -> Option<I>) -> Option<I> {
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let entry = self.entries.remove(index);
+            let image = entry.image.clone();
+            self.entries.push(entry);
+            return image;
+        }
+        let image = load();
         const CAPACITY: usize = 12;
         if self.entries.len() == CAPACITY {
             self.entries.remove(0);
         }
-        self.entries.push(IdentifierImageEntry { key, image });
+        self.entries.push(IdentifierImageEntry {
+            key,
+            image: image.clone(),
+        });
+        image
     }
 
-    fn clear(&mut self) {
-        self.entries.clear();
+    fn clear_semantic(&mut self) {
+        self.entries.retain(|entry| {
+            !matches!(
+                entry.key.identity,
+                IdentifierImageIdentity::SystemSymbol {
+                    paint: PaintIdentity::Semantic { .. },
+                    ..
+                }
+            )
+        });
     }
 }
 
@@ -528,7 +584,7 @@ pub struct Renderer {
     typography: ResolvedTypographyCache,
     attributes: AttributeCache,
     cache: SurfaceCache<Retained<NSImage>>,
-    identifier_images: IdentifierImageCache,
+    identifier_images: IdentifierImageCache<Retained<NSImage>>,
     icon_asset_store: IconAssetStore,
     default_width: f64,
     font_resolutions: usize,
@@ -668,13 +724,12 @@ impl Renderer {
         self.typography.clear();
         self.attributes.clear();
         self.cache.clear();
-        self.identifier_images.clear();
     }
 
     pub fn invalidate_semantic_colors(&mut self) {
         self.attributes.clear_semantic();
         self.cache.clear_semantic_paint();
-        self.identifier_images.clear();
+        self.identifier_images.clear_semantic();
     }
 
     fn resolve_typography(&mut self, preferences: &TypographyPreferences) -> ResolvedTypography {
@@ -702,33 +757,27 @@ impl Renderer {
         appearance: &str,
     ) -> Option<Retained<NSImage>> {
         let identifier = identifier?;
-        let key = IdentifierImageKey {
-            identity: identifier_identity(identifier, appearance),
-            size: typography.size.points(),
-            weight: typography.weight,
-        };
-        if let Some(image) = self.identifier_images.get(&key) {
-            return Some(image);
-        }
-        let image = match identifier {
-            MetricIdentifierVisual::SystemSymbol { name, color, .. } => create_system_symbol_image(
-                name,
-                &resolve_color(*color),
-                f64::from(typography.size.points()),
-                typography.weight,
-            ),
-            MetricIdentifierVisual::Png { metric, .. } => {
-                let path = self.icon_asset_store.path_for(*metric);
-                let path = path.to_str()?;
-                NSImage::initWithContentsOfFile(NSImage::alloc(), &NSString::from_str(path))
-            }
-        }?;
-        let image_size = image.size();
-        if image_size.width <= 0.0 || image_size.height <= 0.0 {
-            return None;
-        }
-        self.identifier_images.insert(key, image.clone());
-        Some(image)
+        let key = identifier_image_key(identifier, typography, appearance);
+        let icon_asset_store = &self.icon_asset_store;
+        self.identifier_images.resolve(key, || {
+            let image = match identifier {
+                MetricIdentifierVisual::SystemSymbol { name, color, .. } => {
+                    create_system_symbol_image(
+                        name,
+                        &resolve_color(*color),
+                        f64::from(typography.size.points()),
+                        typography.weight,
+                    )
+                }
+                MetricIdentifierVisual::Png { metric, .. } => {
+                    let path = icon_asset_store.path_for(*metric);
+                    let path = path.to_str()?;
+                    NSImage::initWithContentsOfFile(NSImage::alloc(), &NSString::from_str(path))
+                }
+            }?;
+            let image_size = image.size();
+            (image_size.width > 0.0 && image_size.height > 0.0).then_some(image)
+        })
     }
 
     #[cfg(test)]
@@ -1149,6 +1198,10 @@ fn find_button(view: &NSView) -> Option<Retained<NSStatusBarButton>> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::fs;
+    use std::io::Cursor;
+
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use tempfile::tempdir;
 
     use statlet::indicator::{
@@ -1163,6 +1216,63 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct TestEntry(u8);
+
+    #[test]
+    fn identifier_image_cache_keeps_failures_until_the_resolution_key_changes() {
+        let calls = Cell::new(0);
+        let mut cache = IdentifierImageCache::default();
+        let key = IdentifierImageKey {
+            identity: IdentifierImageIdentity::Png {
+                metric: MetricKind::Cpu,
+                metadata: PngIconMetadata::new("cpu.png", 12, 12, 400).unwrap(),
+            },
+            size: 12,
+            weight: FontWeight::Medium,
+        };
+
+        assert_eq!(
+            cache.resolve(key.clone(), || {
+                calls.set(calls.get() + 1);
+                None::<TestEntry>
+            }),
+            None
+        );
+        assert_eq!(
+            cache.resolve(key.clone(), || {
+                calls.set(calls.get() + 1);
+                Some(TestEntry(1))
+            }),
+            None
+        );
+        assert_eq!(calls.get(), 1);
+
+        cache.clear_semantic();
+        assert_eq!(
+            cache.resolve(key, || {
+                calls.set(calls.get() + 1);
+                Some(TestEntry(1))
+            }),
+            None
+        );
+        assert_eq!(calls.get(), 1);
+
+        let changed = IdentifierImageKey {
+            identity: IdentifierImageIdentity::Png {
+                metric: MetricKind::Cpu,
+                metadata: PngIconMetadata::new("cpu.png", 12, 12, 401).unwrap(),
+            },
+            size: 12,
+            weight: FontWeight::Medium,
+        };
+        assert_eq!(
+            cache.resolve(changed, || {
+                calls.set(calls.get() + 1);
+                Some(TestEntry(2))
+            }),
+            Some(TestEntry(2))
+        );
+        assert_eq!(calls.get(), 2);
+    }
 
     #[test]
     fn missing_png_is_reported_as_unresolved_for_preview_accessibility() {
@@ -1187,6 +1297,51 @@ mod tests {
         let output = renderer.render(RenderSlot::PreviewLight, &scene, &typography, &aqua);
 
         assert_eq!(output.identifier_resolved, [false, true]);
+    }
+
+    #[test]
+    fn failed_png_resolution_is_not_retried_until_the_asset_preference_changes() {
+        let Some(marker) = MainThreadMarker::new() else {
+            eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
+            return;
+        };
+        let directory = tempdir().unwrap();
+        let mut renderer = Renderer::with_main_thread_marker(marker);
+        renderer.icon_asset_store = IconAssetStore::new(directory.path().to_path_buf());
+        let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
+        let mut scene = scene_with_lines(&["42%"], &["R ", "68%"]);
+        scene.top_identifier = Some(MetricIdentifierVisual::Png {
+            metric: MetricKind::Cpu,
+            metadata: PngIconMetadata::new("missing.png", 12, 12, 400).unwrap(),
+            fallback_color: SegmentColor::Semantic(SemanticColor::Neutral),
+            fallback_text: "C ".into(),
+        });
+        let aqua =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameAqua }).unwrap();
+        let dark =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameDarkAqua })
+                .unwrap();
+
+        let first = renderer.render(RenderSlot::Status, &scene, &typography, &aqua);
+        assert_eq!(first.identifier_resolved, [false, true]);
+
+        fs::create_dir_all(directory.path()).unwrap();
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(12, 12, Rgba([0, 0, 0, 0xFF])))
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        let bytes = bytes.into_inner();
+        fs::write(renderer.icon_asset_store.path_for(MetricKind::Cpu), &bytes).unwrap();
+
+        renderer.invalidate_semantic_colors();
+        let redraw = renderer.render(RenderSlot::Status, &scene, &typography, &dark);
+        assert_eq!(redraw.identifier_resolved, [false, true]);
+
+        if let Some(MetricIdentifierVisual::Png { metadata, .. }) = &mut scene.top_identifier {
+            *metadata = PngIconMetadata::new("cpu.png", 12, 12, bytes.len() as u64).unwrap();
+        }
+        let changed = renderer.render(RenderSlot::Status, &scene, &typography, &dark);
+        assert_eq!(changed.identifier_resolved, [true, true]);
     }
 
     #[test]
