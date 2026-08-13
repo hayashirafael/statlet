@@ -32,6 +32,10 @@ impl VerticalSlot {
     pub const fn bottom(self) -> f64 {
         self.top + self.height
     }
+
+    pub const fn origin_y(self, content_height: f64) -> f64 {
+        content_height - self.bottom()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,12 +70,16 @@ impl RowSlot {
         self.control_x
     }
 
+    pub const fn origin_y(self, content_height: f64) -> f64 {
+        self.vertical.origin_y(content_height)
+    }
+
     pub const fn label_origin_y(self, content_height: f64) -> f64 {
-        content_height - self.bottom()
+        self.origin_y(content_height)
     }
 
     pub const fn control_origin_y(self, content_height: f64) -> f64 {
-        content_height - self.bottom()
+        self.origin_y(content_height)
     }
 }
 
@@ -108,7 +116,7 @@ impl ControlSlot {
     }
 
     pub const fn origin_y(self, content_height: f64) -> f64 {
-        content_height - self.bottom()
+        self.vertical.origin_y(content_height)
     }
 }
 
@@ -343,5 +351,25 @@ mod tests {
         assert_eq!(layout.colors_reset().vertical(), layout.colors_heading());
         assert!(layout.colors_reset().x() > layout.cpu_row().control_x());
         assert_eq!(GROUP_GAP, 24.0);
+    }
+
+    #[test]
+    fn top_down_slots_translate_to_appkit_without_changing_row_alignment() {
+        let layout = IndicatorControlsLayout::new(IndicatorControlsVisibility::default());
+        let cpu = layout.cpu_row();
+        let ram = layout.ram_row();
+
+        assert_eq!(
+            cpu.origin_y(layout.content_height()),
+            layout.content_height() - cpu.bottom()
+        );
+        assert_eq!(
+            cpu.label_origin_y(layout.content_height()),
+            cpu.control_origin_y(layout.content_height())
+        );
+        assert_eq!(
+            ram.label_origin_y(layout.content_height()),
+            ram.control_origin_y(layout.content_height())
+        );
     }
 }

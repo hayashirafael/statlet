@@ -13,6 +13,7 @@ use objc2_foundation::{
     NSRect, NSSize,
 };
 use statlet::core::{AppEvent, AppState, PreferencesSaveStatus, WarningThreshold};
+use statlet::indicator_preferences::IndicatorPreferences;
 
 use super::common::{threshold_title, ControlTarget, PreferencesWindowHost};
 use super::{IndicatorFontFallback, IndicatorLayoutDiagnostics, IndicatorSurfaceUpdate};
@@ -232,7 +233,24 @@ struct IndicatorPage {
     preview: PreviewPane,
     controls: IndicatorControls,
     _groups_scroll: Retained<NSScrollView>,
-    _groups_stack: Retained<NSStackView>,
+    groups_document: Retained<NSView>,
+    groups_stack: Retained<NSStackView>,
+}
+
+impl IndicatorPage {
+    fn apply_preferences(&self, preferences: &IndicatorPreferences) {
+        self.controls.apply(preferences);
+        let controls_height = self.controls.content_height();
+        self.controls
+            .view()
+            .setFrameSize(NSSize::new(560.0, controls_height));
+        self.groups_stack.setFrame(NSRect::new(
+            NSPoint::new(16.0, 16.0),
+            NSSize::new(580.0, controls_height),
+        ));
+        self.groups_document
+            .setFrameSize(NSSize::new(612.0, controls_height + 32.0));
+    }
 }
 
 struct DiskAndMolePage {
@@ -377,7 +395,8 @@ impl PreferencesWindow {
         self.disk_and_mole
             .warning_threshold
             .setEnabled(state.preferences.mole_integration_enabled);
-        self.indicator.controls.apply(&state.preferences.indicator);
+        self.indicator
+            .apply_preferences(&state.preferences.indicator);
         let save_failed = state.preferences_save_status == PreferencesSaveStatus::Failed;
         let footer =
             PreferencesFooterPresentation::new(state.can_undo_indicator_reset, save_failed);
@@ -474,17 +493,24 @@ fn create_indicator_page(
     ));
     groups_scroll.setDrawsBackground(false);
     groups_scroll.setAccessibilityLabel(Some(ns_string!("Grupos de preferências do indicador")));
+    let controls = IndicatorControls::new(mtm, proxy);
+    let controls_height = controls.content_height();
     let groups_document = NSView::initWithFrame(
         NSView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(612.0, 1200.0)),
+        NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(612.0, controls_height + 32.0),
+        ),
     );
     let groups_stack = NSStackView::initWithFrame(
         NSStackView::alloc(mtm),
-        NSRect::new(NSPoint::new(16.0, 16.0), NSSize::new(580.0, 1168.0)),
+        NSRect::new(
+            NSPoint::new(16.0, 16.0),
+            NSSize::new(580.0, controls_height),
+        ),
     );
     let _: () = unsafe { msg_send![&*groups_stack, setOrientation: 1isize] };
     groups_stack.setSpacing(24.0);
-    let controls = IndicatorControls::new(mtm, proxy);
     groups_stack.addSubview(controls.view());
     groups_document.addSubview(&groups_stack);
     groups_scroll.setDocumentView(Some(&groups_document));
@@ -495,7 +521,8 @@ fn create_indicator_page(
         preview,
         controls,
         _groups_scroll: groups_scroll,
-        _groups_stack: groups_stack,
+        groups_document,
+        groups_stack,
     }
 }
 

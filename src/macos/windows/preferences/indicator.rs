@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSAccessibility, NSButton, NSColor, NSColorWell, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSFont, NSSegmentSwitchTracking, NSSegmentedControl, NSStackView,
@@ -17,7 +17,9 @@ use statlet::indicator_preferences::{
     FontFamilyPreference, FontSize, FontWeight, IndicatorPreferenceGroup, IndicatorPreferences,
     LabelColorMode, MetricColorMode, MetricKind, TypographyPreferences,
 };
-use statlet::preferences_view::{ColorEditorState, IntervalDraft};
+use statlet::preferences_view::{
+    ColorEditorState, IndicatorControlsLayout, IndicatorControlsVisibility, IntervalDraft,
+};
 use tao::event_loop::EventLoopProxy;
 
 use super::color_editor::{ColorBinding, ColorEditor};
@@ -267,8 +269,175 @@ impl IndicatorControlsTarget {
     }
 }
 
+struct IndicatorLayoutViews {
+    colors_heading: Retained<NSTextField>,
+    reset_cpu_and_ram: Retained<NSButton>,
+    cpu_label: Retained<NSTextField>,
+    cpu_mode: Retained<NSSegmentedControl>,
+    cpu_editor: Retained<NSStackView>,
+    ram_label: Retained<NSTextField>,
+    ram_mode: Retained<NSSegmentedControl>,
+    ram_editor: Retained<NSStackView>,
+    labels_heading: Retained<NSTextField>,
+    labels_visible: Retained<NSButton>,
+    labels_mode: Retained<NSSegmentedControl>,
+    reset_labels: Retained<NSButton>,
+    labels_editor: Retained<NSStackView>,
+    typography_heading: Retained<NSTextField>,
+    family_label: Retained<NSTextField>,
+    font_family: Retained<NSButton>,
+    size_label: Retained<NSTextField>,
+    font_size: Retained<NSTextField>,
+    points_label: Retained<NSTextField>,
+    weight_label: Retained<NSTextField>,
+    font_weight: Retained<NSSegmentedControl>,
+    reset_typography: Retained<NSButton>,
+    font_fallback_warning: Retained<NSTextField>,
+    layout_warning: Retained<NSTextField>,
+    update_heading: Retained<NSTextField>,
+    interval_label: Retained<NSTextField>,
+    interval_field: Retained<NSTextField>,
+    interval_stepper: Retained<NSStepper>,
+    seconds_label: Retained<NSTextField>,
+    reset_refresh_interval: Retained<NSButton>,
+    interval_help: Retained<NSTextField>,
+    interval_error: Retained<NSTextField>,
+}
+
+impl IndicatorLayoutViews {
+    fn apply(&self, layout: &IndicatorControlsLayout) {
+        let content_height = layout.content_height();
+
+        let colors_heading = layout.colors_heading();
+        self.colors_heading
+            .setFrameOrigin(NSPoint::new(0.0, colors_heading.origin_y(content_height)));
+        let colors_reset = layout.colors_reset();
+        self.reset_cpu_and_ram.setFrameOrigin(NSPoint::new(
+            colors_reset.x(),
+            colors_reset.origin_y(content_height),
+        ));
+
+        let cpu_row = layout.cpu_row();
+        self.cpu_label.setFrameOrigin(NSPoint::new(
+            cpu_row.label_x(),
+            cpu_row.label_origin_y(content_height),
+        ));
+        self.cpu_mode.setFrameOrigin(NSPoint::new(
+            cpu_row.control_x(),
+            cpu_row.control_origin_y(content_height),
+        ));
+        if let Some(cpu_editor) = layout.cpu_editor() {
+            self.cpu_editor.setFrame(NSRect::new(
+                NSPoint::new(0.0, cpu_editor.origin_y(content_height)),
+                NSSize::new(540.0, cpu_editor.height()),
+            ));
+        }
+
+        let ram_row = layout.ram_row();
+        self.ram_label.setFrameOrigin(NSPoint::new(
+            ram_row.label_x(),
+            ram_row.label_origin_y(content_height),
+        ));
+        self.ram_mode.setFrameOrigin(NSPoint::new(
+            ram_row.control_x(),
+            ram_row.control_origin_y(content_height),
+        ));
+        if let Some(ram_editor) = layout.ram_editor() {
+            self.ram_editor.setFrame(NSRect::new(
+                NSPoint::new(0.0, ram_editor.origin_y(content_height)),
+                NSSize::new(540.0, ram_editor.height()),
+            ));
+        }
+
+        let labels_heading = layout.labels_heading();
+        self.labels_heading
+            .setFrameOrigin(NSPoint::new(0.0, labels_heading.origin_y(content_height)));
+        let labels_visibility = layout.labels_visibility_row();
+        let labels_visibility_y = labels_visibility.origin_y(content_height);
+        self.labels_visible.setFrameOrigin(NSPoint::new(
+            labels_visibility.label_x(),
+            labels_visibility_y,
+        ));
+        self.reset_labels
+            .setFrameOrigin(NSPoint::new(390.0, labels_visibility_y));
+        let labels_mode = layout.labels_mode_row();
+        self.labels_mode.setFrameOrigin(NSPoint::new(
+            labels_mode.control_x(),
+            labels_mode.control_origin_y(content_height),
+        ));
+        if let Some(labels_editor) = layout.labels_editor() {
+            self.labels_editor.setFrame(NSRect::new(
+                NSPoint::new(0.0, labels_editor.origin_y(content_height)),
+                NSSize::new(540.0, labels_editor.height()),
+            ));
+        }
+
+        let typography_heading = layout.typography_heading();
+        self.typography_heading.setFrameOrigin(NSPoint::new(
+            0.0,
+            typography_heading.origin_y(content_height),
+        ));
+        let family_row = layout.family_row();
+        let family_y = family_row.origin_y(content_height);
+        self.family_label
+            .setFrameOrigin(NSPoint::new(family_row.label_x(), family_y));
+        self.font_family
+            .setFrameOrigin(NSPoint::new(family_row.control_x(), family_y));
+        let size_row = layout.size_row();
+        let size_y = size_row.origin_y(content_height);
+        self.size_label
+            .setFrameOrigin(NSPoint::new(size_row.label_x(), size_y));
+        self.font_size
+            .setFrameOrigin(NSPoint::new(size_row.control_x(), size_y));
+        self.points_label
+            .setFrameOrigin(NSPoint::new(166.0, size_y));
+        let weight_row = layout.weight_row();
+        let weight_y = weight_row.origin_y(content_height);
+        self.weight_label
+            .setFrameOrigin(NSPoint::new(weight_row.label_x(), weight_y));
+        self.font_weight
+            .setFrameOrigin(NSPoint::new(weight_row.control_x(), weight_y));
+        self.reset_typography
+            .setFrameOrigin(NSPoint::new(400.0, weight_y));
+        self.font_fallback_warning.setFrameOrigin(NSPoint::new(
+            100.0,
+            layout.font_fallback_warning().origin_y(content_height),
+        ));
+        self.layout_warning.setFrameOrigin(NSPoint::new(
+            100.0,
+            layout.layout_warning().origin_y(content_height),
+        ));
+
+        let update_heading = layout.update_heading();
+        self.update_heading
+            .setFrameOrigin(NSPoint::new(0.0, update_heading.origin_y(content_height)));
+        let interval_row = layout.interval_row();
+        let interval_y = interval_row.origin_y(content_height);
+        self.interval_label
+            .setFrameOrigin(NSPoint::new(interval_row.label_x(), interval_y));
+        self.interval_field
+            .setFrameOrigin(NSPoint::new(interval_row.control_x(), interval_y));
+        self.interval_stepper
+            .setFrameOrigin(NSPoint::new(164.0, interval_y));
+        self.seconds_label
+            .setFrameOrigin(NSPoint::new(194.0, interval_y));
+        self.reset_refresh_interval
+            .setFrameOrigin(NSPoint::new(350.0, interval_y));
+        self.interval_help.setFrameOrigin(NSPoint::new(
+            0.0,
+            layout.interval_help().origin_y(content_height),
+        ));
+        self.interval_error.setFrameOrigin(NSPoint::new(
+            100.0,
+            layout.interval_error().origin_y(content_height),
+        ));
+    }
+}
+
 pub(super) struct IndicatorControls {
     view: Retained<NSStackView>,
+    layout_views: IndicatorLayoutViews,
+    content_height: Cell<f64>,
     cpu_mode: Retained<NSSegmentedControl>,
     reset_cpu_and_ram: Retained<NSButton>,
     ram_mode: Retained<NSSegmentedControl>,
@@ -278,13 +447,10 @@ pub(super) struct IndicatorControls {
     font_family: Retained<NSButton>,
     font_size: Retained<NSTextField>,
     font_weight: Retained<NSSegmentedControl>,
-    font_fallback_warning: Retained<NSTextField>,
-    layout_warning: Retained<NSTextField>,
     reset_typography: Retained<NSButton>,
     interval_field: Retained<NSTextField>,
     interval_stepper: Retained<NSStepper>,
     reset_refresh_interval: Retained<NSButton>,
-    interval_error: Retained<NSTextField>,
     cpu_editor: ColorEditor,
     ram_editor: ColorEditor,
     labels_editor: ColorEditor,
@@ -295,23 +461,24 @@ impl IndicatorControls {
     pub(super) fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Self {
         let view = NSStackView::initWithFrame(
             NSStackView::alloc(mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 1160.0)),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 0.0)),
         );
 
-        let cpu_heading = heading(mtm, "CPU", 1130.0);
+        let colors_heading = heading(mtm, "Cores", 0.0);
+        let cpu_label = text_label(mtm, "CPU", 0.0);
         let placeholder_target = None;
         let cpu_mode = segmented(
             mtm,
             &["Dinâmica", "Fixa"],
             "indicator.cpu.mode",
-            NSRect::new(NSPoint::new(100.0, 1096.0), NSSize::new(240.0, 28.0)),
+            NSRect::new(NSPoint::new(100.0, 0.0), NSSize::new(240.0, 28.0)),
             placeholder_target,
             None,
         );
         let reset_cpu_and_ram = reset_button(
             mtm,
             "Restaurar CPU e RAM",
-            NSRect::new(NSPoint::new(390.0, 1096.0), NSSize::new(160.0, 28.0)),
+            NSRect::new(NSPoint::new(390.0, 0.0), NSSize::new(160.0, 28.0)),
         );
         let cpu_editor = ColorEditor::new(
             mtm,
@@ -319,16 +486,16 @@ impl IndicatorControls {
             proxy.clone(),
         );
         cpu_editor.view().setFrame(NSRect::new(
-            NSPoint::new(0.0, 928.0),
+            NSPoint::new(0.0, 0.0),
             NSSize::new(540.0, 160.0),
         ));
 
-        let ram_heading = heading(mtm, "RAM", 898.0);
+        let ram_label = text_label(mtm, "RAM", 0.0);
         let ram_mode = segmented(
             mtm,
             &["Dinâmica", "Fixa"],
             "indicator.ram.mode",
-            NSRect::new(NSPoint::new(100.0, 864.0), NSSize::new(240.0, 28.0)),
+            NSRect::new(NSPoint::new(100.0, 0.0), NSSize::new(240.0, 28.0)),
             placeholder_target,
             None,
         );
@@ -338,11 +505,11 @@ impl IndicatorControls {
             proxy.clone(),
         );
         ram_editor.view().setFrame(NSRect::new(
-            NSPoint::new(0.0, 696.0),
+            NSPoint::new(0.0, 0.0),
             NSSize::new(540.0, 160.0),
         ));
 
-        let labels_heading = heading(mtm, "Rótulos", 666.0);
+        let labels_heading = heading(mtm, "Rótulos", 0.0);
         let labels_visible = unsafe {
             NSButton::checkboxWithTitle_target_action(
                 ns_string!("Mostrar rótulos C/R"),
@@ -352,7 +519,7 @@ impl IndicatorControls {
             )
         };
         labels_visible.setFrame(NSRect::new(
-            NSPoint::new(0.0, 632.0),
+            NSPoint::new(0.0, 0.0),
             NSSize::new(220.0, 24.0),
         ));
         labels_visible.setAccessibilityIdentifier(Some(ns_string!("indicator.labels.visible")));
@@ -360,23 +527,23 @@ impl IndicatorControls {
             mtm,
             &["Neutra", "Igual ao valor", "Personalizada"],
             "indicator.labels.mode",
-            NSRect::new(NSPoint::new(100.0, 594.0), NSSize::new(390.0, 28.0)),
+            NSRect::new(NSPoint::new(100.0, 0.0), NSSize::new(390.0, 28.0)),
             placeholder_target,
             None,
         );
         let reset_labels = reset_button(
             mtm,
             "Restaurar rótulos",
-            NSRect::new(NSPoint::new(390.0, 632.0), NSSize::new(160.0, 28.0)),
+            NSRect::new(NSPoint::new(390.0, 0.0), NSSize::new(160.0, 28.0)),
         );
         let labels_editor = ColorEditor::new(mtm, ColorBinding::LabelShared, proxy.clone());
         labels_editor.view().setFrame(NSRect::new(
-            NSPoint::new(0.0, 426.0),
+            NSPoint::new(0.0, 0.0),
             NSSize::new(540.0, 160.0),
         ));
 
-        let typography_heading = heading(mtm, "Tipografia", 396.0);
-        let family_label = text_label(mtm, "Família", 356.0);
+        let typography_heading = heading(mtm, "Tipografia", 0.0);
+        let family_label = text_label(mtm, "Família", 0.0);
         let font_family = unsafe {
             NSButton::buttonWithTitle_target_action(
                 ns_string!("System Monospaced"),
@@ -386,28 +553,28 @@ impl IndicatorControls {
             )
         };
         font_family.setFrame(NSRect::new(
-            NSPoint::new(100.0, 352.0),
+            NSPoint::new(100.0, 0.0),
             NSSize::new(300.0, 30.0),
         ));
         font_family.setAccessibilityIdentifier(Some(ns_string!("indicator.font.family")));
 
-        let size_label = text_label(mtm, "Tamanho", 316.0);
+        let size_label = text_label(mtm, "Tamanho", 0.0);
         let font_size = NSTextField::initWithFrame(
             NSTextField::alloc(mtm),
-            NSRect::new(NSPoint::new(100.0, 312.0), NSSize::new(58.0, 26.0)),
+            NSRect::new(NSPoint::new(100.0, 0.0), NSSize::new(58.0, 26.0)),
         );
         font_size.setStringValue(ns_string!("12"));
         font_size.setAccessibilityLabel(Some(ns_string!("Tamanho da fonte em pontos")));
         font_size.setAccessibilityIdentifier(Some(ns_string!("indicator.font.size")));
-        let points_label = text_label(mtm, "pt", 316.0);
-        points_label.setFrameOrigin(NSPoint::new(166.0, 316.0));
+        let points_label = text_label(mtm, "pt", 0.0);
+        points_label.setFrameOrigin(NSPoint::new(166.0, 0.0));
 
-        let weight_label = text_label(mtm, "Peso", 276.0);
+        let weight_label = text_label(mtm, "Peso", 0.0);
         let font_weight = segmented(
             mtm,
             &["Regular", "Médio", "Negrito"],
             "indicator.font.weight",
-            NSRect::new(NSPoint::new(100.0, 272.0), NSSize::new(300.0, 28.0)),
+            NSRect::new(NSPoint::new(100.0, 0.0), NSSize::new(300.0, 28.0)),
             placeholder_target,
             None,
         );
@@ -420,24 +587,24 @@ impl IndicatorControls {
             )
         };
         reset_typography.setFrame(NSRect::new(
-            NSPoint::new(400.0, 272.0),
+            NSPoint::new(400.0, 0.0),
             NSSize::new(150.0, 28.0),
         ));
-        let font_fallback_warning = warning_label(mtm, 236.0);
-        let layout_warning = warning_label(mtm, 208.0);
+        let font_fallback_warning = warning_label(mtm, 0.0);
+        let layout_warning = warning_label(mtm, 0.0);
 
-        let update_heading = heading(mtm, "Atualização", 170.0);
-        let interval_label = text_label(mtm, "Intervalo", 130.0);
+        let update_heading = heading(mtm, "Atualização", 0.0);
+        let interval_label = text_label(mtm, "Intervalo", 0.0);
         let interval_field = NSTextField::initWithFrame(
             NSTextField::alloc(mtm),
-            NSRect::new(NSPoint::new(100.0, 126.0), NSSize::new(58.0, 26.0)),
+            NSRect::new(NSPoint::new(100.0, 0.0), NSSize::new(58.0, 26.0)),
         );
         interval_field.setStringValue(ns_string!("2"));
         interval_field.setAccessibilityLabel(Some(ns_string!("Intervalo de atualização")));
         interval_field.setAccessibilityIdentifier(Some(ns_string!("indicator.refresh.interval")));
         let interval_stepper = NSStepper::initWithFrame(
             NSStepper::alloc(mtm),
-            NSRect::new(NSPoint::new(164.0, 124.0), NSSize::new(20.0, 28.0)),
+            NSRect::new(NSPoint::new(164.0, 0.0), NSSize::new(20.0, 28.0)),
         );
         interval_stepper.setMinValue(1.0);
         interval_stepper.setMaxValue(60.0);
@@ -445,20 +612,20 @@ impl IndicatorControls {
         interval_stepper.setValueWraps(false);
         interval_stepper
             .setAccessibilityLabel(Some(ns_string!("Ajustar intervalo de atualização")));
-        let seconds_label = text_label(mtm, "segundos", 130.0);
-        seconds_label.setFrameOrigin(NSPoint::new(194.0, 130.0));
+        let seconds_label = text_label(mtm, "segundos", 0.0);
+        seconds_label.setFrameOrigin(NSPoint::new(194.0, 0.0));
         let interval_help = text_label(
             mtm,
             "Intervalos menores atualizam com mais frequência e usam mais recursos.",
-            90.0,
+            0.0,
         );
         interval_help.setFrameSize(NSSize::new(500.0, 24.0));
         interval_help.setTextColor(Some(&NSColor::secondaryLabelColor()));
-        let interval_error = warning_label(mtm, 60.0);
+        let interval_error = warning_label(mtm, 0.0);
         let reset_refresh_interval = reset_button(
             mtm,
             "Restaurar atualização",
-            NSRect::new(NSPoint::new(350.0, 124.0), NSSize::new(190.0, 28.0)),
+            NSRect::new(NSPoint::new(350.0, 0.0), NSSize::new(190.0, 28.0)),
         );
 
         let defaults = IndicatorPreferences::default();
@@ -495,11 +662,12 @@ impl IndicatorControls {
         );
 
         for child in [
-            &*cpu_heading as &NSView,
+            &*colors_heading as &NSView,
+            &*cpu_label,
             &*cpu_mode,
             &*reset_cpu_and_ram,
             cpu_editor.view(),
-            &*ram_heading,
+            &*ram_label,
             &*ram_mode,
             ram_editor.view(),
             &*labels_heading,
@@ -530,8 +698,44 @@ impl IndicatorControls {
             view.addSubview(child);
         }
 
+        let layout_views = IndicatorLayoutViews {
+            colors_heading: colors_heading.clone(),
+            reset_cpu_and_ram: reset_cpu_and_ram.clone(),
+            cpu_label: cpu_label.clone(),
+            cpu_mode: cpu_mode.clone(),
+            cpu_editor: cpu_editor.view().retain(),
+            ram_label: ram_label.clone(),
+            ram_mode: ram_mode.clone(),
+            ram_editor: ram_editor.view().retain(),
+            labels_heading: labels_heading.clone(),
+            labels_visible: labels_visible.clone(),
+            labels_mode: labels_mode.clone(),
+            reset_labels: reset_labels.clone(),
+            labels_editor: labels_editor.view().retain(),
+            typography_heading: typography_heading.clone(),
+            family_label: family_label.clone(),
+            font_family: font_family.clone(),
+            size_label: size_label.clone(),
+            font_size: font_size.clone(),
+            points_label: points_label.clone(),
+            weight_label: weight_label.clone(),
+            font_weight: font_weight.clone(),
+            reset_typography: reset_typography.clone(),
+            font_fallback_warning: font_fallback_warning.clone(),
+            layout_warning: layout_warning.clone(),
+            update_heading: update_heading.clone(),
+            interval_label: interval_label.clone(),
+            interval_field: interval_field.clone(),
+            interval_stepper: interval_stepper.clone(),
+            seconds_label: seconds_label.clone(),
+            reset_refresh_interval: reset_refresh_interval.clone(),
+            interval_help: interval_help.clone(),
+            interval_error: interval_error.clone(),
+        };
         let controls = Self {
             view,
+            layout_views,
+            content_height: Cell::new(0.0),
             cpu_mode,
             reset_cpu_and_ram,
             ram_mode,
@@ -541,13 +745,10 @@ impl IndicatorControls {
             font_family,
             font_size,
             font_weight,
-            font_fallback_warning,
-            layout_warning,
             reset_typography,
             interval_field,
             interval_stepper,
             reset_refresh_interval,
-            interval_error,
             cpu_editor,
             ram_editor,
             labels_editor,
@@ -600,7 +801,7 @@ impl IndicatorControls {
         self.interval_stepper
             .setIntegerValue(interval.valid_interval().seconds().into());
         set_inline_error(
-            &self.interval_error,
+            &self.layout_views.interval_error,
             interval.error().map(|error| error.message()),
         );
         drop(interval);
@@ -627,6 +828,11 @@ impl IndicatorControls {
         if !labels_fixed {
             self.labels_editor.deactivate();
         }
+        self.apply_layout(IndicatorControlsVisibility {
+            cpu_editor: cpu_fixed,
+            ram_editor: ram_fixed,
+            labels_editor: labels_fixed,
+        });
 
         unsafe {
             if cpu_fixed {
@@ -673,6 +879,18 @@ impl IndicatorControls {
         self.target.ivars().applying.set(false);
     }
 
+    fn apply_layout(&self, visibility: IndicatorControlsVisibility) {
+        let layout = IndicatorControlsLayout::new(visibility);
+        self.layout_views.apply(&layout);
+        self.view
+            .setFrameSize(NSSize::new(560.0, layout.content_height()));
+        self.content_height.set(layout.content_height());
+    }
+
+    pub(super) fn content_height(&self) -> f64 {
+        self.content_height.get()
+    }
+
     pub(super) fn wells(&self) -> Vec<Retained<NSColorWell>> {
         self.cpu_editor
             .wells()
@@ -706,7 +924,10 @@ impl IndicatorControls {
                 fallback.resolved_family
             )
         });
-        set_warning_text(&self.font_fallback_warning, fallback_message.as_deref());
+        set_warning_text(
+            &self.layout_views.font_fallback_warning,
+            fallback_message.as_deref(),
+        );
 
         let diagnostics = [layout.status, Some(layout.light), Some(layout.dark)]
             .into_iter()
@@ -725,7 +946,7 @@ impl IndicatorControls {
             (false, true) => Some("Esta tipografia pode ocupar largura excessiva na menu bar."),
             (false, false) => None,
         };
-        set_warning_text(&self.layout_warning, message);
+        set_warning_text(&self.layout_views.layout_warning, message);
     }
 
     fn apply_typography(&self, typography: &TypographyPreferences) {
