@@ -15,17 +15,22 @@ use objc2_app_kit::{
     NSAppearanceNameAccessibilityHighContrastDarkAqua, NSAppearanceNameAqua,
     NSAppearanceNameDarkAqua,
 };
-use statlet::core::{AppEffect, AppEvent, Preferences, PreferencesSaveResult, StatletCore};
+use statlet::core::{
+    AppEffect, AppEvent, MetricPngAssetMutation, MetricPngImportResult, MetricPngRemovalResult,
+    Preferences, PreferencesSaveResult, StatletCore,
+};
 use statlet::disk::macos::{ContinuousClock, StartupVolumeSampler};
 use statlet::disk::DiskSamplingSchedule;
 use statlet::history::{History, HistoryStore};
+use statlet::icon_assets::{IconAssetStore, PngAssetTransaction, PreparedPngAsset};
 use statlet::indicator::{
-    compose_indicator, has_low_text_contrast, preview_accessibility_summary, PreviewBackground,
+    compose_indicator, has_low_text_contrast, preview_accessibility_summary_with_fallbacks,
+    preview_visible_summary, resolve_identifier_fallbacks, PreviewBackground,
 };
-use statlet::indicator_preferences::{IndicatorAppearance, MetricsRefreshInterval};
+use statlet::indicator_preferences::{IndicatorAppearance, MetricKind, MetricsRefreshInterval};
 use statlet::metrics_schedule::MetricsSamplingSchedule;
 use statlet::mole::{MoleDetection, MoleDetector, MoleInstallation, MoleStatus};
-use statlet::preferences::PreferencesStore;
+use statlet::preferences::{PreferencesCommitState, PreferencesSaveError, PreferencesStore};
 use statlet::runtime_schedule::{RedrawRequest, RuntimeSchedule};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -84,12 +89,15 @@ fn main() {
         .expect("resolve the current user's preferences directory");
     let history_store =
         HistoryStore::for_current_user().expect("resolve the current user's history directory");
+    let icon_asset_store = IconAssetStore::for_current_user()
+        .expect("resolve the current user's indicator icon directory");
     let history = history_store.load();
     let initial_preferences = preferences_store.load();
     let initial_metrics_interval = initial_preferences.indicator.refresh_interval;
     let (mut core, startup_effects) = StatletCore::with_preferences(initial_preferences);
     let mut runtime = RuntimeAdapters::new(
         preferences_store,
+        icon_asset_store,
         history_store,
         history,
         review_space_item,
@@ -138,6 +146,11 @@ fn main() {
         Event::UserEvent(runtime_event) => {
             let effects = match runtime_event {
                 RuntimeEvent::App(app_event) => core.handle(app_event),
+                RuntimeEvent::MetricPngPrepared {
+                    metric,
+                    generation,
+                    result,
+                } => runtime.finish_png_preparation(&mut core, metric, generation, result),
                 RuntimeEvent::VisualEnvironmentChanged => {
                     let marker = MainThreadMarker::new().expect("visual events run on main thread");
                     if let Some(request) = visual_environment_redraw_request(
@@ -270,6 +283,7 @@ fn apply_persistence_intent(
 
 struct RuntimeAdapters {
     preferences_store: PreferencesStore,
+    icon_asset_store: IconAssetStore,
     history_store: HistoryStore,
     history: History,
     windows: Option<WindowManager>,
@@ -280,11 +294,15 @@ struct RuntimeAdapters {
     visual_environment: VisualEnvironmentState<Retained<NSAppearance>>,
     schedule: RuntimeSchedule<Preferences>,
     review_space_item: MenuItem,
+    event_proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
+    png_import_generations: [u64; 2],
+    prepared_png_imports: [Option<PreparedPngAsset>; 2],
 }
 
 impl RuntimeAdapters {
     fn new(
         preferences_store: PreferencesStore,
+        icon_asset_store: IconAssetStore,
         history_store: HistoryStore,
         history: History,
         review_space_item: MenuItem,
@@ -293,16 +311,47 @@ impl RuntimeAdapters {
     ) -> Self {
         Self {
             preferences_store,
+            icon_asset_store,
             history_store,
             history,
             windows: None,
             samplers: RuntimeSamplers::new(metrics_interval),
-            mole: RuntimeMole::new(proxy),
+            mole: RuntimeMole::new(proxy.clone()),
             notifications: None,
             visual_environment_observer: None,
             visual_environment: VisualEnvironmentState::default(),
             schedule: RuntimeSchedule::new(),
             review_space_item,
+            event_proxy: proxy,
+            png_import_generations: [0; 2],
+            prepared_png_imports: [None, None],
+        }
+    }
+
+    fn finish_png_preparation(
+        &mut self,
+        core: &mut StatletCore,
+        metric: MetricKind,
+        generation: u64,
+        result: Result<PreparedPngAsset, String>,
+    ) -> Vec<AppEffect> {
+        let index = metric_index(metric);
+        if !png_import_generation_is_current(&self.png_import_generations, metric, generation) {
+            return Vec::new();
+        }
+        match result {
+            Ok(prepared) => {
+                let metadata = prepared.metadata().clone();
+                self.prepared_png_imports[index] = Some(prepared);
+                core.handle(AppEvent::MetricPngImportFinished {
+                    metric,
+                    result: MetricPngImportResult::Imported(metadata),
+                })
+            }
+            Err(message) => core.handle(AppEvent::MetricPngImportFinished {
+                metric,
+                result: MetricPngImportResult::Failed(message),
+            }),
         }
     }
 
@@ -501,6 +550,86 @@ impl RuntimeAdapters {
                     }
                     Err(error) => eprintln!("Statlet could not clear history: {error}"),
                 },
+                AppEffect::ImportMetricPng { metric, source } => {
+                    let generation =
+                        next_png_import_generation(&mut self.png_import_generations, metric);
+                    if let Err(error) = spawn_png_preparation_with(
+                        self.icon_asset_store.clone(),
+                        metric,
+                        source,
+                        generation,
+                        {
+                            let proxy = self.event_proxy.clone();
+                            move |event| {
+                                let _ = proxy.send_event(event);
+                            }
+                        },
+                    ) {
+                        pending.extend(core.handle(AppEvent::MetricPngImportFinished {
+                            metric,
+                            result: MetricPngImportResult::Failed(format!(
+                                "Não foi possível iniciar o processamento do PNG: {error}"
+                            )),
+                        }));
+                    }
+                }
+                AppEffect::CancelMetricPngImport(metric) => {
+                    invalidate_png_import(
+                        &mut self.png_import_generations,
+                        &mut self.prepared_png_imports,
+                        metric,
+                    );
+                }
+                AppEffect::RemoveMetricPngAsset(metric) => {
+                    pending.extend(core.handle(AppEvent::MetricPngRemovalFinished {
+                        metric,
+                        result: MetricPngRemovalResult::Removed,
+                    }));
+                }
+                AppEffect::PersistMetricPngChange {
+                    metric,
+                    mutation,
+                    previous,
+                    preferences,
+                } => {
+                    let transaction = match mutation {
+                        MetricPngAssetMutation::Replace => self.prepared_png_imports
+                            [metric_index(metric)]
+                        .take()
+                        .ok_or_else(|| {
+                            "O PNG preparado não está mais disponível; a escolha anterior foi restaurada."
+                                .to_owned()
+                        })
+                        .and_then(|prepared| {
+                            self.icon_asset_store
+                                .begin_replace(prepared)
+                                .map_err(|error| error.user_message().to_owned())
+                        }),
+                        MetricPngAssetMutation::Remove => self
+                            .icon_asset_store
+                            .begin_remove(metric)
+                            .map_err(|error| error.user_message().to_owned()),
+                    };
+                    match transaction {
+                        Ok(transaction) => pending.extend(persist_metric_png_change(
+                            &self.preferences_store,
+                            &mut self.schedule,
+                            self.samplers.clock.now(),
+                            core,
+                            metric,
+                            previous,
+                            preferences,
+                            transaction,
+                        )),
+                        Err(message) => {
+                            pending.extend(core.handle(AppEvent::MetricPngPersistenceFailed {
+                                metric,
+                                previous,
+                                message,
+                            }))
+                        }
+                    }
+                }
                 AppEffect::Quit => should_quit = true,
             }
         }
@@ -568,8 +697,12 @@ impl RuntimeAdapters {
             requested_family: light.font.requested_family.clone(),
             resolved_family: light.font.resolved_family.clone(),
         });
-        let light_colors = resolved_scene_srgb_colors(&light_scene, &light_appearance);
-        let dark_colors = resolved_scene_srgb_colors(&dark_scene, &dark_appearance);
+        let (light_resolved_scene, light_fallbacks) =
+            resolve_identifier_fallbacks(&light_scene, light.identifier_resolved);
+        let (dark_resolved_scene, dark_fallbacks) =
+            resolve_identifier_fallbacks(&dark_scene, dark.identifier_resolved);
+        let light_colors = resolved_scene_srgb_colors(&light_resolved_scene, &light_appearance);
+        let dark_colors = resolved_scene_srgb_colors(&dark_resolved_scene, &dark_appearance);
         let contrast_warnings = preview_contrast_warnings(&light_colors, &dark_colors);
         windows.update_indicator_surfaces(IndicatorSurfaceUpdate {
             previews: PreviewImages {
@@ -579,15 +712,27 @@ impl RuntimeAdapters {
             font_fallback,
             contrast_warnings,
             summaries: PreviewSummaries {
-                light: preview_accessibility_summary(
-                    &light_scene,
+                light_visible: preview_visible_summary(
+                    &light_resolved_scene,
+                    IndicatorAppearance::Light,
+                    light_fallbacks,
+                ),
+                dark_visible: preview_visible_summary(
+                    &dark_resolved_scene,
+                    IndicatorAppearance::Dark,
+                    dark_fallbacks,
+                ),
+                light: preview_accessibility_summary_with_fallbacks(
+                    &light_resolved_scene,
                     &light_colors,
                     IndicatorAppearance::Light,
+                    light_fallbacks,
                 ),
-                dark: preview_accessibility_summary(
-                    &dark_scene,
+                dark: preview_accessibility_summary_with_fallbacks(
+                    &dark_resolved_scene,
                     &dark_colors,
                     IndicatorAppearance::Dark,
+                    dark_fallbacks,
                 ),
             },
             layout: IndicatorLayoutDiagnostics {
@@ -626,13 +771,48 @@ fn preview_contrast_warnings(
     }
 }
 
+trait PreferencesPersistence {
+    fn save(&self, preferences: Preferences) -> Result<(), PreferencesPersistenceError>;
+}
+
+#[derive(Debug)]
+struct PreferencesPersistenceError {
+    commit_state: PreferencesCommitState,
+    message: String,
+}
+
+impl From<PreferencesSaveError> for PreferencesPersistenceError {
+    fn from(error: PreferencesSaveError) -> Self {
+        Self {
+            commit_state: error.commit_state(),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for PreferencesPersistenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl PreferencesPersistence for PreferencesStore {
+    fn save(&self, preferences: Preferences) -> Result<(), PreferencesPersistenceError> {
+        PreferencesStore::save(self, preferences).map_err(Into::into)
+    }
+}
+
 fn save_preferences(
-    store: &PreferencesStore,
+    store: &impl PreferencesPersistence,
     preferences: Preferences,
     core: &mut StatletCore,
 ) -> bool {
     let (result, succeeded) = match store.save(preferences) {
         Ok(()) => (PreferencesSaveResult::Saved, true),
+        Err(error) if error.commit_state == PreferencesCommitState::Committed => {
+            eprintln!("Statlet committed preferences with a durability warning: {error}");
+            (PreferencesSaveResult::Failed, false)
+        }
         Err(error) => {
             eprintln!("Statlet could not save preferences: {error}");
             (PreferencesSaveResult::Failed, false)
@@ -641,6 +821,157 @@ fn save_preferences(
     let effects = core.handle(AppEvent::PreferencesSaveFinished(result));
     debug_assert!(effects.is_empty());
     succeeded
+}
+
+fn metric_index(metric: MetricKind) -> usize {
+    match metric {
+        MetricKind::Cpu => 0,
+        MetricKind::Ram => 1,
+    }
+}
+
+fn next_png_import_generation(generations: &mut [u64; 2], metric: MetricKind) -> u64 {
+    let generation = &mut generations[metric_index(metric)];
+    *generation = generation.wrapping_add(1);
+    *generation
+}
+
+fn png_import_generation_is_current(
+    generations: &[u64; 2],
+    metric: MetricKind,
+    generation: u64,
+) -> bool {
+    generations[metric_index(metric)] == generation
+}
+
+fn invalidate_png_import(
+    generations: &mut [u64; 2],
+    prepared_imports: &mut [Option<PreparedPngAsset>; 2],
+    metric: MetricKind,
+) {
+    next_png_import_generation(generations, metric);
+    prepared_imports[metric_index(metric)] = None;
+}
+
+fn spawn_png_preparation_with(
+    store: IconAssetStore,
+    metric: MetricKind,
+    source: std::path::PathBuf,
+    generation: u64,
+    deliver: impl FnOnce(RuntimeEvent) + Send + 'static,
+) -> std::io::Result<()> {
+    thread::Builder::new()
+        .name(format!(
+            "statlet-png-{}",
+            match metric {
+                MetricKind::Cpu => "cpu",
+                MetricKind::Ram => "ram",
+            }
+        ))
+        .spawn(move || {
+            let result = store
+                .prepare_file(metric, &source)
+                .map_err(|error| error.user_message().to_owned());
+            deliver(RuntimeEvent::MetricPngPrepared {
+                metric,
+                generation,
+                result,
+            });
+        })?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_metric_png_change<T: MetricPngTransaction>(
+    store: &impl PreferencesPersistence,
+    schedule: &mut RuntimeSchedule<Preferences>,
+    now: Duration,
+    core: &mut StatletCore,
+    metric: MetricKind,
+    previous: statlet::indicator_preferences::MetricIdentifierPreferences,
+    preferences: Preferences,
+    transaction: T,
+) -> Vec<AppEffect> {
+    schedule.queue_save(now, preferences.clone());
+    schedule.request_save_now(now);
+    debug_assert_eq!(schedule.due_save(now), Some(preferences.clone()));
+    match store.save(preferences.clone()) {
+        Ok(()) => {
+            let cleanup_error = transaction.commit().err();
+            schedule.finish_save(&preferences, true);
+            let mut effects = core.handle(AppEvent::PreferencesSaveFinished(
+                PreferencesSaveResult::Saved,
+            ));
+            if let Some(error) = cleanup_error {
+                effects.extend(core.handle(AppEvent::MetricPngTransactionCleanupFailed {
+                    metric,
+                    message: format!(
+                        "O PNG foi salvo, mas a limpeza segura da transação falhou: {error}"
+                    ),
+                }));
+            }
+            effects
+        }
+        Err(error) if error.commit_state == PreferencesCommitState::Committed => {
+            eprintln!(
+                "Statlet committed preferences for a PNG change with a durability warning: {error}"
+            );
+            let cleanup_error = transaction.commit().err();
+            schedule.finish_save(&preferences, false);
+            let mut effects = core.handle(AppEvent::PreferencesSaveFinished(
+                PreferencesSaveResult::Failed,
+            ));
+            effects.extend(core.handle(AppEvent::MetricPngDurabilityWarning {
+                metric,
+                message: format!(
+                    "As preferências e o PNG foram aplicados, mas a confirmação de durabilidade falhou: {error}"
+                ),
+            }));
+            if let Some(cleanup_error) = cleanup_error {
+                effects.extend(core.handle(AppEvent::MetricPngTransactionCleanupFailed {
+                    metric,
+                    message: format!(
+                        "O PNG foi aplicado, mas a limpeza segura da transação falhou: {cleanup_error}"
+                    ),
+                }));
+            }
+            effects
+        }
+        Err(error) => {
+            eprintln!("Statlet could not save preferences for a PNG change: {error}");
+            schedule.finish_save(&preferences, false);
+            let rollback = transaction.rollback();
+            let message = match rollback {
+                Ok(()) => {
+                    "Não foi possível salvar as preferências; a escolha de PNG anterior foi restaurada."
+                        .to_owned()
+                }
+                Err(rollback_error) => format!(
+                    "Não foi possível salvar as preferências nem restaurar o PNG anterior: {rollback_error}"
+                ),
+            };
+            core.handle(AppEvent::MetricPngPersistenceFailed {
+                metric,
+                previous,
+                message,
+            })
+        }
+    }
+}
+
+trait MetricPngTransaction {
+    fn commit(self) -> Result<(), String>;
+    fn rollback(self) -> Result<(), String>;
+}
+
+impl MetricPngTransaction for PngAssetTransaction {
+    fn commit(self) -> Result<(), String> {
+        PngAssetTransaction::commit(self).map_err(|error| error.user_message().to_owned())
+    }
+
+    fn rollback(self) -> Result<(), String> {
+        PngAssetTransaction::rollback(self).map_err(|error| error.user_message().to_owned())
+    }
 }
 
 struct RuntimeMole {
@@ -787,21 +1118,446 @@ impl RuntimeSamplers {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
+    use std::io::Cursor;
+    use std::sync::mpsc;
     use std::time::Duration;
 
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
     use statlet::core::{AppEvent, IndicatorPreferenceChange, Preferences, PreferencesSaveStatus};
     use statlet::indicator::{IndicatorRun, IndicatorScene, SegmentColor, SemanticColor};
     use statlet::indicator_preferences::{MetricsRefreshInterval, SrgbColor};
+    use statlet::preferences::PreferencesCommitState;
     use tempfile::tempdir;
 
     use super::{
         apply_persistence_intent, preview_contrast_warnings, resolved_scene_srgb_colors,
-        save_preferences, visual_environment_redraw_request, PreferencesStore,
-        PreviewContrastWarnings, RuntimeSamplers, StatletCore, VisualEnvironment,
-        VisualEnvironmentState,
+        save_preferences, spawn_png_preparation_with, visual_environment_redraw_request, AppEffect,
+        IconAssetStore, MetricKind, PreferencesStore, PreviewContrastWarnings, RuntimeEvent,
+        RuntimeSamplers, StatletCore, VisualEnvironment, VisualEnvironmentState,
     };
+
+    #[test]
+    fn png_decode_resize_and_reencode_run_on_a_worker_thread() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("large.png");
+        let image = RgbaImage::from_pixel(128, 64, Rgba([0x22, 0x88, 0xCC, 0xFF]));
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        fs::write(&source, bytes.into_inner()).unwrap();
+        let store = IconAssetStore::new(directory.path().join("icons"));
+        let caller = std::thread::current().id();
+        let (sender, receiver) = mpsc::channel();
+
+        spawn_png_preparation_with(store, MetricKind::Cpu, source, 7, move |event| {
+            sender.send((std::thread::current().id(), event)).unwrap();
+        })
+        .unwrap();
+
+        let (worker, event) = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_ne!(worker, caller);
+        assert!(matches!(
+            event,
+            RuntimeEvent::MetricPngPrepared {
+                metric: MetricKind::Cpu,
+                generation: 7,
+                result: Ok(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn canceling_a_png_import_invalidates_its_runtime_generation() {
+        let mut generations = [0, 0];
+        let mut prepared = [None, None];
+        let stale_generation = super::next_png_import_generation(&mut generations, MetricKind::Cpu);
+
+        super::invalidate_png_import(&mut generations, &mut prepared, MetricKind::Cpu);
+
+        assert!(!super::png_import_generation_is_current(
+            &generations,
+            MetricKind::Cpu,
+            stale_generation,
+        ));
+    }
+
+    #[test]
+    fn png_asset_and_preferences_roll_back_together_when_save_fails() {
+        let directory = tempdir().unwrap();
+        let asset_store = IconAssetStore::new(directory.path().join("icons"));
+        let png = |color| {
+            let image = RgbaImage::from_pixel(12, 12, Rgba(color));
+            let mut bytes = Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(image)
+                .write_to(&mut bytes, ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        };
+        asset_store
+            .import_bytes(
+                MetricKind::Cpu,
+                "original.png",
+                &png([0x11, 0x22, 0x33, 0xFF]),
+            )
+            .unwrap();
+        let original_asset = fs::read(asset_store.path_for(MetricKind::Cpu)).unwrap();
+        let prepared = asset_store
+            .prepare_bytes(
+                MetricKind::Cpu,
+                "replacement.png",
+                &png([0xAA, 0xBB, 0xCC, 0xFF]),
+            )
+            .unwrap();
+        let metadata = prepared.metadata().clone();
+        let transaction = asset_store.begin_replace(prepared).unwrap();
+        let blocker = directory.path().join("not-a-directory");
+        fs::write(&blocker, b"block preference parent").unwrap();
+        let preferences_store = PreferencesStore::new(blocker.join("preferences.json"));
+        let mut core = StatletCore::new();
+        let previous = core.state().preferences.indicator.identifiers.cpu.clone();
+        let effect = core
+            .handle(AppEvent::MetricPngImportFinished {
+                metric: MetricKind::Cpu,
+                result: statlet::core::MetricPngImportResult::Imported(metadata),
+            })
+            .into_iter()
+            .find_map(|effect| match effect {
+                AppEffect::PersistMetricPngChange {
+                    metric,
+                    previous,
+                    preferences,
+                    ..
+                } => Some((metric, previous, preferences)),
+                _ => None,
+            })
+            .unwrap();
+        let mut schedule = statlet::runtime_schedule::RuntimeSchedule::new();
+
+        let effects = super::persist_metric_png_change(
+            &preferences_store,
+            &mut schedule,
+            Duration::ZERO,
+            &mut core,
+            effect.0,
+            effect.1,
+            effect.2,
+            transaction,
+        );
+
+        assert_eq!(
+            fs::read(asset_store.path_for(MetricKind::Cpu)).unwrap(),
+            original_asset
+        );
+        assert_eq!(core.state().preferences.indicator.identifiers.cpu, previous);
+        assert_eq!(effects, vec![AppEffect::RequestIndicatorRedraw]);
+    }
+
+    #[derive(Debug)]
+    struct FaultInjectedTransaction {
+        commit_error: Option<String>,
+        rollback_error: Option<String>,
+    }
+
+    struct PostRenameFaultStore {
+        inner: PreferencesStore,
+    }
+
+    struct PostRenameOnceStore {
+        inner: PreferencesStore,
+        fail_after_next_save: Cell<bool>,
+    }
+
+    impl super::PreferencesPersistence for PostRenameFaultStore {
+        fn save(&self, preferences: Preferences) -> Result<(), super::PreferencesPersistenceError> {
+            self.inner
+                .save(preferences)
+                .map_err(super::PreferencesPersistenceError::from)?;
+            Err(super::PreferencesPersistenceError {
+                commit_state: PreferencesCommitState::Committed,
+                message: "fault injected after preferences rename".into(),
+            })
+        }
+    }
+
+    impl super::PreferencesPersistence for PostRenameOnceStore {
+        fn save(&self, preferences: Preferences) -> Result<(), super::PreferencesPersistenceError> {
+            self.inner
+                .save(preferences)
+                .map_err(super::PreferencesPersistenceError::from)?;
+            if self.fail_after_next_save.replace(false) {
+                Err(super::PreferencesPersistenceError {
+                    commit_state: PreferencesCommitState::Committed,
+                    message: "fault injected after preferences rename".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn post_rename_preferences_failure_keeps_json_asset_and_runtime_state_aligned() {
+        let directory = tempdir().unwrap();
+        let asset_store = IconAssetStore::new(directory.path().join("icons"));
+        let png = |color| {
+            let image = RgbaImage::from_pixel(12, 12, Rgba(color));
+            let mut bytes = Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(image)
+                .write_to(&mut bytes, ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        };
+        asset_store
+            .import_bytes(
+                MetricKind::Cpu,
+                "original.png",
+                &png([0x11, 0x22, 0x33, 0xFF]),
+            )
+            .unwrap();
+        let prepared = asset_store
+            .prepare_bytes(
+                MetricKind::Cpu,
+                "replacement.png",
+                &png([0xAA, 0xBB, 0xCC, 0xFF]),
+            )
+            .unwrap();
+        let metadata = prepared.metadata().clone();
+        let transaction = asset_store.begin_replace(prepared).unwrap();
+        let installed_asset = fs::read(asset_store.path_for(MetricKind::Cpu)).unwrap();
+        let preferences_store = PreferencesStore::new(directory.path().join("preferences.json"));
+        preferences_store.save(Preferences::default()).unwrap();
+        let fault_store = PostRenameFaultStore {
+            inner: preferences_store,
+        };
+        let mut core = StatletCore::new();
+        let (metric, previous, preferences) = core
+            .handle(AppEvent::MetricPngImportFinished {
+                metric: MetricKind::Cpu,
+                result: statlet::core::MetricPngImportResult::Imported(metadata),
+            })
+            .into_iter()
+            .find_map(|effect| match effect {
+                AppEffect::PersistMetricPngChange {
+                    metric,
+                    previous,
+                    preferences,
+                    ..
+                } => Some((metric, previous, preferences)),
+                _ => None,
+            })
+            .unwrap();
+        let mut schedule = statlet::runtime_schedule::RuntimeSchedule::new();
+
+        let effects = super::persist_metric_png_change(
+            &fault_store,
+            &mut schedule,
+            Duration::ZERO,
+            &mut core,
+            metric,
+            previous,
+            preferences.clone(),
+            transaction,
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(fault_store.inner.load(), preferences);
+        assert_eq!(
+            fs::read(asset_store.path_for(MetricKind::Cpu)).unwrap(),
+            installed_asset
+        );
+        assert_eq!(core.state().preferences, fault_store.inner.load());
+        assert_eq!(
+            core.state().preferences_save_status,
+            PreferencesSaveStatus::Failed
+        );
+        assert!(core
+            .state()
+            .indicator_icon_error(MetricKind::Cpu)
+            .unwrap()
+            .contains("fault injected after preferences rename"));
+        assert_eq!(schedule.pending_save(), Some(&preferences));
+    }
+
+    #[test]
+    fn successful_retry_clears_only_the_resolved_png_durability_warning() {
+        let directory = tempdir().unwrap();
+        let store = PostRenameOnceStore {
+            inner: PreferencesStore::new(directory.path().join("preferences.json")),
+            fail_after_next_save: Cell::new(true),
+        };
+        let mut core = StatletCore::new();
+        let previous = core.state().preferences.indicator.identifiers.cpu.clone();
+        let metadata =
+            statlet::indicator_preferences::PngIconMetadata::new("custom-cpu.png", 24, 12, 812)
+                .unwrap();
+        let preferences = core
+            .handle(AppEvent::MetricPngImportFinished {
+                metric: MetricKind::Cpu,
+                result: statlet::core::MetricPngImportResult::Imported(metadata),
+            })
+            .into_iter()
+            .find_map(|effect| match effect {
+                AppEffect::PersistMetricPngChange { preferences, .. } => Some(preferences),
+                _ => None,
+            })
+            .unwrap();
+        let mut schedule = statlet::runtime_schedule::RuntimeSchedule::new();
+
+        super::persist_metric_png_change(
+            &store,
+            &mut schedule,
+            Duration::ZERO,
+            &mut core,
+            MetricKind::Cpu,
+            previous,
+            preferences.clone(),
+            FaultInjectedTransaction {
+                commit_error: None,
+                rollback_error: None,
+            },
+        );
+        assert!(core
+            .state()
+            .indicator_icon_error(MetricKind::Cpu)
+            .unwrap()
+            .contains("confirmação de durabilidade"));
+
+        assert_eq!(
+            core.handle(AppEvent::RetrySavePreferences),
+            vec![AppEffect::FlushPreferences(preferences.clone())]
+        );
+        let succeeded = save_preferences(&store, preferences.clone(), &mut core);
+        schedule.finish_save(&preferences, succeeded);
+
+        assert!(succeeded);
+        assert_eq!(
+            core.state().preferences_save_status,
+            PreferencesSaveStatus::Saved
+        );
+        assert_eq!(schedule.pending_save(), None);
+        assert_eq!(core.state().indicator_icon_error(MetricKind::Cpu), None);
+    }
+
+    #[test]
+    fn successful_retry_preserves_an_independent_png_cleanup_error() {
+        let directory = tempdir().unwrap();
+        let store = PostRenameOnceStore {
+            inner: PreferencesStore::new(directory.path().join("preferences.json")),
+            fail_after_next_save: Cell::new(true),
+        };
+        let mut core = StatletCore::new();
+        let previous = core.state().preferences.indicator.identifiers.ram.clone();
+        let preferences = core.state().preferences.clone();
+        let mut schedule = statlet::runtime_schedule::RuntimeSchedule::new();
+
+        super::persist_metric_png_change(
+            &store,
+            &mut schedule,
+            Duration::ZERO,
+            &mut core,
+            MetricKind::Ram,
+            previous,
+            preferences.clone(),
+            FaultInjectedTransaction {
+                commit_error: Some("fault injected during backup cleanup".into()),
+                rollback_error: None,
+            },
+        );
+        let succeeded = save_preferences(&store, preferences.clone(), &mut core);
+        schedule.finish_save(&preferences, succeeded);
+
+        let error = core.state().indicator_icon_error(MetricKind::Ram).unwrap();
+        assert!(succeeded);
+        assert_eq!(schedule.pending_save(), None);
+        assert!(error.contains("fault injected during backup cleanup"));
+        assert!(!error.contains("confirmação de durabilidade"));
+    }
+
+    impl super::MetricPngTransaction for FaultInjectedTransaction {
+        fn commit(self) -> Result<(), String> {
+            self.commit_error.map_or(Ok(()), Err)
+        }
+
+        fn rollback(self) -> Result<(), String> {
+            self.rollback_error.map_or(Ok(()), Err)
+        }
+    }
+
+    #[test]
+    fn committed_preferences_surface_transaction_cleanup_failure() {
+        let directory = tempdir().unwrap();
+        let preferences_store = PreferencesStore::new(directory.path().join("preferences.json"));
+        let mut core = StatletCore::new();
+        let previous = core.state().preferences.indicator.identifiers.cpu.clone();
+        let preferences = core.state().preferences.clone();
+        let mut schedule = statlet::runtime_schedule::RuntimeSchedule::new();
+
+        let effects = super::persist_metric_png_change(
+            &preferences_store,
+            &mut schedule,
+            Duration::ZERO,
+            &mut core,
+            MetricKind::Cpu,
+            previous,
+            preferences,
+            FaultInjectedTransaction {
+                commit_error: Some("fault injected during backup cleanup".into()),
+                rollback_error: None,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            core.state().preferences_save_status,
+            PreferencesSaveStatus::Saved
+        );
+        assert!(core
+            .state()
+            .indicator_icon_error(MetricKind::Cpu)
+            .unwrap()
+            .contains("fault injected during backup cleanup"));
+    }
+
+    #[test]
+    fn failed_preferences_save_surfaces_rollback_failure() {
+        let directory = tempdir().unwrap();
+        let blocker = directory.path().join("not-a-directory");
+        fs::write(&blocker, b"block preference parent").unwrap();
+        let preferences_store = PreferencesStore::new(blocker.join("preferences.json"));
+        let mut core = StatletCore::new();
+        let previous = core.state().preferences.indicator.identifiers.ram.clone();
+        let preferences = core.state().preferences.clone();
+        let mut schedule = statlet::runtime_schedule::RuntimeSchedule::new();
+
+        let effects = super::persist_metric_png_change(
+            &preferences_store,
+            &mut schedule,
+            Duration::ZERO,
+            &mut core,
+            MetricKind::Ram,
+            previous,
+            preferences,
+            FaultInjectedTransaction {
+                commit_error: None,
+                rollback_error: Some("fault injected while restoring previous.png".into()),
+            },
+        );
+
+        assert_eq!(effects, vec![AppEffect::RequestIndicatorRedraw]);
+        assert_eq!(
+            core.state().preferences_save_status,
+            PreferencesSaveStatus::Failed
+        );
+        assert!(core
+            .state()
+            .indicator_icon_error(MetricKind::Ram)
+            .unwrap()
+            .contains("fault injected while restoring previous.png"));
+    }
 
     #[test]
     fn appearance_identity_change_requests_only_a_semantic_color_redraw() {
@@ -936,6 +1692,8 @@ mod tests {
                 text: "R 68%".into(),
                 color: gray,
             }],
+            top_identifier: None,
+            bottom_identifier: None,
             disk_badge: None,
             accessibility_label: "CPU 42%, RAM 68%".into(),
         };
@@ -958,6 +1716,8 @@ mod tests {
                 text: "R 68%".into(),
                 color: warning,
             }],
+            top_identifier: None,
+            bottom_identifier: None,
             disk_badge: None,
             accessibility_label: "CPU 42%, RAM 68%".into(),
         };

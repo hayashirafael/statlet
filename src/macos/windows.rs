@@ -50,6 +50,8 @@ pub struct IndicatorSurfaceUpdate {
 }
 
 pub struct PreviewSummaries {
+    pub light_visible: String,
+    pub dark_visible: String,
     pub light: String,
     pub dark: String,
 }

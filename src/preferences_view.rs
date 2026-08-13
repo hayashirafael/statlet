@@ -1,6 +1,7 @@
 use crate::core::{AppState, Preferences, PreferencesSaveStatus};
 use crate::indicator_preferences::{
-    AppearanceColors, FixedColorPreferences, MetricsRefreshInterval, SrgbColor,
+    AppearanceColors, FixedColorPreferences, MetricIdentifierMode, MetricIdentifierPreferences,
+    MetricKind, MetricsRefreshInterval, SrgbColor,
 };
 
 mod layout;
@@ -17,6 +18,8 @@ pub struct PreferencesControlsPresentation {
     preferences: Preferences,
     can_undo_indicator_reset: bool,
     preferences_save_status: PreferencesSaveStatus,
+    indicator_icon_errors: [Option<String>; 2],
+    indicator_icon_pending: [bool; 2],
 }
 
 impl PreferencesControlsPresentation {
@@ -25,6 +28,78 @@ impl PreferencesControlsPresentation {
             preferences: state.preferences.clone(),
             can_undo_indicator_reset: state.can_undo_indicator_reset,
             preferences_save_status: state.preferences_save_status,
+            indicator_icon_errors: [
+                state
+                    .indicator_icon_error(MetricKind::Cpu)
+                    .map(str::to_owned),
+                state
+                    .indicator_icon_error(MetricKind::Ram)
+                    .map(str::to_owned),
+            ],
+            indicator_icon_pending: [
+                state.indicator_icon_pending(MetricKind::Cpu),
+                state.indicator_icon_pending(MetricKind::Ram),
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdentifierDetailPresentation {
+    Hidden,
+    SystemSymbol {
+        selected_name: String,
+    },
+    Png {
+        source_name: Option<String>,
+        can_remove: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetricIdentifierControlPresentation {
+    pub detail: IdentifierDetailPresentation,
+    pub error: Option<String>,
+    pub processing: bool,
+}
+
+impl MetricIdentifierControlPresentation {
+    pub fn new(preferences: &MetricIdentifierPreferences, error: Option<&str>) -> Self {
+        Self::with_processing(preferences, error, false)
+    }
+
+    pub fn with_processing(
+        preferences: &MetricIdentifierPreferences,
+        error: Option<&str>,
+        processing: bool,
+    ) -> Self {
+        let detail = if processing {
+            IdentifierDetailPresentation::Png {
+                source_name: preferences
+                    .png
+                    .as_ref()
+                    .map(|metadata| metadata.source_name().to_owned()),
+                can_remove: false,
+            }
+        } else {
+            match preferences.mode {
+                MetricIdentifierMode::Text => IdentifierDetailPresentation::Hidden,
+                MetricIdentifierMode::SystemSymbol => IdentifierDetailPresentation::SystemSymbol {
+                    selected_name: preferences.system_symbol.as_str().to_owned(),
+                },
+                MetricIdentifierMode::Png => IdentifierDetailPresentation::Png {
+                    source_name: preferences
+                        .png
+                        .as_ref()
+                        .map(|metadata| metadata.source_name().to_owned()),
+                    can_remove: preferences.png.is_some(),
+                },
+            }
+        };
+        Self {
+            detail,
+            error: error.map(str::to_owned),
+            processing,
         }
     }
 }

@@ -22,6 +22,8 @@ struct PreviewFallback<'a> {
 struct PreviewText {
     light_description: String,
     dark_description: String,
+    light_accessibility: String,
+    dark_accessibility: String,
     shared_warnings: Vec<String>,
 }
 
@@ -39,8 +41,7 @@ const fn warning_region_contract() -> WarningRegionContract {
 }
 
 fn preview_text(
-    light_summary: &str,
-    dark_summary: &str,
+    summaries: &PreviewSummaries,
     layout: &LayoutDiagnostics,
     fallback: Option<PreviewFallback<'_>>,
     environment: &VisualEnvironment,
@@ -93,8 +94,10 @@ fn preview_text(
     );
 
     PreviewText {
-        light_description: light_summary.to_owned(),
-        dark_description: dark_summary.to_owned(),
+        light_description: summaries.light_visible.clone(),
+        dark_description: summaries.dark_visible.clone(),
+        light_accessibility: summaries.light.clone(),
+        dark_accessibility: summaries.dark.clone(),
         shared_warnings,
     }
 }
@@ -243,16 +246,17 @@ impl PreviewPane {
         );
         self.light_image.setImage(Some(&images.light));
         self.dark_image.setImage(Some(&images.dark));
-        let text = preview_text(
-            &summaries.light,
-            &summaries.dark,
-            layout,
-            fallback,
-            environment,
-            contrast,
+        let text = preview_text(summaries, layout, fallback, environment, contrast);
+        set_preview_text(
+            &self.light_description,
+            &text.light_description,
+            &text.light_accessibility,
         );
-        set_preview_text(&self.light_description, &text.light_description);
-        set_preview_text(&self.dark_description, &text.dark_description);
+        set_preview_text(
+            &self.dark_description,
+            &text.dark_description,
+            &text.dark_accessibility,
+        );
         set_warning_text(&self.warnings, &self.warnings_scroll, &text.shared_warnings);
     }
 }
@@ -311,10 +315,9 @@ fn wrapped_preview_label(
     field
 }
 
-fn set_preview_text(field: &NSTextField, text: &str) {
-    let text = objc2_foundation::NSString::from_str(text);
-    field.setStringValue(&text);
-    field.setAccessibilityLabel(Some(&text));
+fn set_preview_text(field: &NSTextField, visible: &str, accessibility: &str) {
+    field.setStringValue(&objc2_foundation::NSString::from_str(visible));
+    field.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(accessibility)));
 }
 
 fn set_warning_text(field: &NSTextField, scroll: &NSScrollView, warnings: &[String]) {
@@ -323,7 +326,7 @@ fn set_warning_text(field: &NSTextField, scroll: &NSScrollView, warnings: &[Stri
         .map(|warning| format!("• {warning}"))
         .collect::<Vec<_>>()
         .join("\n");
-    set_preview_text(field, &text);
+    set_preview_text(field, &text, &text);
     let viewport = scroll.contentSize();
     let measured = field.sizeThatFits(NSSize::new(viewport.width, f64::MAX));
     field.setFrameSize(NSSize::new(
@@ -341,16 +344,24 @@ fn family_name(family: &FontFamilyPreference) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{preview_text, warning_region_contract, PreviewContrastWarnings, PreviewFallback};
+    use super::{
+        preview_text, warning_region_contract, PreviewContrastWarnings, PreviewFallback,
+        PreviewSummaries,
+    };
     use crate::macos::environment::VisualEnvironment;
     use statlet::indicator::LayoutDiagnostics;
     use statlet::indicator_preferences::IndicatorAppearance;
 
     #[test]
     fn preview_text_keeps_appearance_descriptions_separate_from_shared_warnings() {
+        let summaries = PreviewSummaries {
+            light_visible: "Claro: CPU 42% · RAM 68%.".into(),
+            dark_visible: "Escuro: CPU 42% · RAM 68%.".into(),
+            light: "Prévia clara resumida e completa para acessibilidade.".into(),
+            dark: "Prévia escura resumida e completa para acessibilidade.".into(),
+        };
         let text = preview_text(
-            "Prévia clara resumida.",
-            "Prévia escura resumida.",
+            &summaries,
             &LayoutDiagnostics {
                 exceeds_menu_bar_height: true,
                 exceeds_curated_width: true,
@@ -371,10 +382,12 @@ mod tests {
             },
         );
 
-        assert!(text.light_description.contains("Prévia clara"));
+        assert!(text.light_description.contains("Claro"));
+        assert!(text.light_accessibility.contains("Prévia clara"));
         assert!(!text.light_description.contains("contraste"));
         assert!(!text.light_description.contains("Prévia escura"));
-        assert!(text.dark_description.contains("Prévia escura"));
+        assert!(text.dark_description.contains("Escuro"));
+        assert!(text.dark_accessibility.contains("Prévia escura"));
         assert!(!text.dark_description.contains("contraste"));
         assert!(!text.dark_description.contains("Prévia clara"));
         assert!(text
@@ -413,9 +426,14 @@ mod tests {
 
     #[test]
     fn preview_text_routes_each_appearance_contrast_warning_once_to_scrollable_region() {
+        let summaries = PreviewSummaries {
+            light_visible: "Claro: CPU 42% · RAM 68%.".into(),
+            dark_visible: "Escuro: CPU 42% · RAM 68%.".into(),
+            light: "Prévia clara resumida.".into(),
+            dark: "Prévia escura resumida.".into(),
+        };
         let text = preview_text(
-            "Prévia clara resumida.",
-            "Prévia escura resumida.",
+            &summaries,
             &LayoutDiagnostics {
                 exceeds_menu_bar_height: false,
                 exceeds_curated_width: false,

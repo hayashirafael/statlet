@@ -5,6 +5,7 @@ pub const COLOR_EDITOR_HEIGHT: f64 = 160.0;
 const HEADING_HEIGHT: f64 = 24.0;
 const ROW_HEIGHT: f64 = 28.0;
 const MESSAGE_HEIGHT: f64 = 20.0;
+const IDENTIFIER_DETAIL_HEIGHT: f64 = 32.0;
 const CONTROL_X: f64 = 100.0;
 
 pub fn preserve_scroll_origin_from_top(
@@ -141,6 +142,11 @@ pub struct IndicatorControlsLayout {
     cpu_editor: Option<VerticalSlot>,
     ram_row: RowSlot,
     ram_editor: Option<VerticalSlot>,
+    identifiers_heading: VerticalSlot,
+    cpu_identifier_row: RowSlot,
+    cpu_identifier_detail: VerticalSlot,
+    ram_identifier_row: RowSlot,
+    ram_identifier_detail: VerticalSlot,
     labels_heading: VerticalSlot,
     labels_visibility_row: RowSlot,
     labels_mode_row: RowSlot,
@@ -170,6 +176,17 @@ impl IndicatorControlsLayout {
         cursor += INLINE_GAP;
         let ram_row = row(&mut cursor);
         let ram_editor = optional_editor(&mut cursor, visibility.ram_editor);
+
+        cursor += GROUP_GAP;
+        let identifiers_heading = vertical(&mut cursor, HEADING_HEIGHT);
+        cursor += INLINE_GAP;
+        let cpu_identifier_row = row(&mut cursor);
+        cursor += INLINE_GAP;
+        let cpu_identifier_detail = vertical(&mut cursor, IDENTIFIER_DETAIL_HEIGHT);
+        cursor += INLINE_GAP;
+        let ram_identifier_row = row(&mut cursor);
+        cursor += INLINE_GAP;
+        let ram_identifier_detail = vertical(&mut cursor, IDENTIFIER_DETAIL_HEIGHT);
 
         cursor += GROUP_GAP;
         let labels_heading = vertical(&mut cursor, HEADING_HEIGHT);
@@ -208,6 +225,11 @@ impl IndicatorControlsLayout {
             cpu_editor,
             ram_row,
             ram_editor,
+            identifiers_heading,
+            cpu_identifier_row,
+            cpu_identifier_detail,
+            ram_identifier_row,
+            ram_identifier_detail,
             labels_heading,
             labels_visibility_row,
             labels_mode_row,
@@ -243,6 +265,21 @@ impl IndicatorControlsLayout {
     }
     pub const fn ram_editor(self) -> Option<VerticalSlot> {
         self.ram_editor
+    }
+    pub const fn identifiers_heading(self) -> VerticalSlot {
+        self.identifiers_heading
+    }
+    pub const fn cpu_identifier_row(self) -> RowSlot {
+        self.cpu_identifier_row
+    }
+    pub const fn cpu_identifier_detail(self) -> VerticalSlot {
+        self.cpu_identifier_detail
+    }
+    pub const fn ram_identifier_row(self) -> RowSlot {
+        self.ram_identifier_row
+    }
+    pub const fn ram_identifier_detail(self) -> VerticalSlot {
+        self.ram_identifier_detail
     }
     pub const fn labels_heading(self) -> VerticalSlot {
         self.labels_heading
@@ -443,6 +480,11 @@ mod tests {
                 layout.cpu_editor(),
                 Some(layout.ram_row().vertical()),
                 layout.ram_editor(),
+                Some(layout.identifiers_heading()),
+                Some(layout.cpu_identifier_row().vertical()),
+                Some(layout.cpu_identifier_detail()),
+                Some(layout.ram_identifier_row().vertical()),
+                Some(layout.ram_identifier_detail()),
                 Some(layout.labels_heading()),
                 Some(layout.labels_visibility_row().vertical()),
                 Some(layout.labels_mode_row().vertical()),
@@ -471,11 +513,12 @@ mod tests {
                 );
             }
             for gap in [
-                layout.labels_heading().top()
+                layout.identifiers_heading().top()
                     - layout
                         .ram_editor()
                         .unwrap_or(layout.ram_row().vertical())
                         .bottom(),
+                layout.labels_heading().top() - layout.ram_identifier_detail().bottom(),
                 layout.typography_heading().top()
                     - layout
                         .labels_editor()

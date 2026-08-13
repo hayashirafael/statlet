@@ -1,6 +1,7 @@
 pub mod core;
 pub mod disk;
 pub mod history;
+pub mod icon_assets;
 pub mod indicator;
 pub mod indicator_preferences;
 pub mod metrics;

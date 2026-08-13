@@ -1,7 +1,8 @@
 use crate::core::{DiskBadge, MetricContent, MetricSeverity, StatusContent};
 use crate::indicator_preferences::{
     IndicatorAppearance, IndicatorPreferences, LabelColorMode, MetricColorMode,
-    MetricColorPreferences, SrgbColor,
+    MetricColorPreferences, MetricIdentifierMode, MetricKind, PngIconMetadata, SrgbColor,
+    SystemSymbolName,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,8 +31,54 @@ pub struct IndicatorRun {
 pub struct IndicatorScene {
     pub top: Vec<IndicatorRun>,
     pub bottom: Vec<IndicatorRun>,
+    pub top_identifier: Option<MetricIdentifierVisual>,
+    pub bottom_identifier: Option<MetricIdentifierVisual>,
     pub disk_badge: Option<IndicatorRun>,
     pub accessibility_label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MetricIdentifierVisual {
+    SystemSymbol {
+        name: SystemSymbolName,
+        color: SegmentColor,
+        fallback_text: String,
+    },
+    Png {
+        metric: MetricKind,
+        metadata: PngIconMetadata,
+        fallback_color: SegmentColor,
+        fallback_text: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetricSurfaceSpec {
+    pub identifier: Option<MetricIdentifierVisual>,
+    pub runs: Vec<IndicatorRun>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SurfaceSpec {
+    pub top: MetricSurfaceSpec,
+    pub bottom: MetricSurfaceSpec,
+    pub disk_badge: Option<IndicatorRun>,
+}
+
+impl IndicatorScene {
+    pub fn surface_spec(&self) -> SurfaceSpec {
+        SurfaceSpec {
+            top: MetricSurfaceSpec {
+                identifier: self.top_identifier.clone(),
+                runs: self.top.clone(),
+            },
+            bottom: MetricSurfaceSpec {
+                identifier: self.bottom_identifier.clone(),
+                runs: self.bottom.clone(),
+            },
+            disk_badge: self.disk_badge.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,21 +127,28 @@ pub fn compose_indicator(
     let cpu_color = metric_color(status.cpu.severity, preferences.cpu_color, appearance);
     let ram_color = metric_color(status.ram.severity, preferences.ram_color, appearance);
 
+    let (top_identifier, top) = metric_presentation(
+        &status.cpu,
+        MetricKind::Cpu,
+        cpu_color,
+        preferences,
+        preferences.labels.cpu.as_str(),
+        appearance,
+    );
+    let (bottom_identifier, bottom) = metric_presentation(
+        &status.ram,
+        MetricKind::Ram,
+        ram_color,
+        preferences,
+        preferences.labels.ram.as_str(),
+        appearance,
+    );
+
     IndicatorScene {
-        top: metric_runs(
-            &status.cpu,
-            cpu_color,
-            preferences,
-            preferences.labels.cpu.as_str(),
-            appearance,
-        ),
-        bottom: metric_runs(
-            &status.ram,
-            ram_color,
-            preferences,
-            preferences.labels.ram.as_str(),
-            appearance,
-        ),
+        top,
+        bottom,
+        top_identifier,
+        bottom_identifier,
         disk_badge: status.disk_badge.map(|badge| match badge {
             DiskBadge::Warning => IndicatorRun {
                 text: " !".to_owned(),
@@ -114,12 +168,39 @@ pub fn preview_accessibility_summary(
     resolved_colors: &[[f64; 3]],
     appearance: IndicatorAppearance,
 ) -> String {
+    preview_accessibility_summary_with_fallbacks(scene, resolved_colors, appearance, [false, false])
+}
+
+pub fn preview_accessibility_summary_with_fallbacks(
+    scene: &IndicatorScene,
+    resolved_colors: &[[f64; 3]],
+    appearance: IndicatorAppearance,
+    text_fallbacks: [bool; 2],
+) -> String {
     let mut color_index = 0;
-    let (cpu, cpu_has_label) =
-        preview_metric_summary("CPU", &scene.top, resolved_colors, &mut color_index);
-    let (ram, ram_has_label) =
-        preview_metric_summary("RAM", &scene.bottom, resolved_colors, &mut color_index);
-    let labels = if cpu_has_label && ram_has_label {
+    let (cpu, cpu_has_identifier) = preview_metric_summary(
+        "CPU",
+        &scene.top,
+        scene.top_identifier.as_ref(),
+        resolved_colors,
+        &mut color_index,
+        text_fallbacks[0],
+    );
+    let (ram, ram_has_identifier) = preview_metric_summary(
+        "RAM",
+        &scene.bottom,
+        scene.bottom_identifier.as_ref(),
+        resolved_colors,
+        &mut color_index,
+        text_fallbacks[1],
+    );
+    let uses_visual_identifier =
+        scene.top_identifier.is_some() || scene.bottom_identifier.is_some();
+    let labels = if uses_visual_identifier && cpu_has_identifier && ram_has_identifier {
+        "identificadores visíveis"
+    } else if uses_visual_identifier {
+        "identificadores parcialmente visíveis"
+    } else if cpu_has_identifier && ram_has_identifier {
         "rótulos exibidos"
     } else {
         "rótulos ocultos"
@@ -146,12 +227,139 @@ pub fn preview_accessibility_summary(
     format!("Prévia {appearance}: {cpu}; {ram}; {labels}; {badge}.")
 }
 
+pub fn resolve_identifier_fallbacks(
+    scene: &IndicatorScene,
+    identifier_resolved: [bool; 2],
+) -> (IndicatorScene, [bool; 2]) {
+    let mut resolved = scene.clone();
+    let top_fallback = resolve_metric_identifier_fallback(
+        &mut resolved.top_identifier,
+        &mut resolved.top,
+        identifier_resolved[0],
+    );
+    let bottom_fallback = resolve_metric_identifier_fallback(
+        &mut resolved.bottom_identifier,
+        &mut resolved.bottom,
+        identifier_resolved[1],
+    );
+    (resolved, [top_fallback, bottom_fallback])
+}
+
+fn resolve_metric_identifier_fallback(
+    identifier: &mut Option<MetricIdentifierVisual>,
+    runs: &mut Vec<IndicatorRun>,
+    resolved: bool,
+) -> bool {
+    if resolved {
+        return false;
+    }
+    let Some(identifier) = identifier.take() else {
+        return false;
+    };
+    let (text, color) = match identifier {
+        MetricIdentifierVisual::SystemSymbol {
+            fallback_text,
+            color,
+            ..
+        } => (fallback_text, color),
+        MetricIdentifierVisual::Png {
+            fallback_text,
+            fallback_color,
+            ..
+        } => (fallback_text, fallback_color),
+    };
+    runs.insert(0, IndicatorRun { text, color });
+    true
+}
+
+pub fn preview_visible_summary(
+    scene: &IndicatorScene,
+    appearance: IndicatorAppearance,
+    text_fallbacks: [bool; 2],
+) -> String {
+    let appearance = match appearance {
+        IndicatorAppearance::Light => "Claro",
+        IndicatorAppearance::Dark => "Escuro",
+    };
+    let cpu = visible_metric_summary(
+        "CPU",
+        &scene.top,
+        scene.top_identifier.as_ref(),
+        text_fallbacks[0],
+    );
+    let ram = visible_metric_summary(
+        "RAM",
+        &scene.bottom,
+        scene.bottom_identifier.as_ref(),
+        text_fallbacks[1],
+    );
+    format!("{appearance}: {cpu} · {ram}.")
+}
+
+fn visible_metric_summary(
+    name: &str,
+    runs: &[IndicatorRun],
+    identifier: Option<&MetricIdentifierVisual>,
+    text_fallback: bool,
+) -> String {
+    let value = runs.last().map_or("—", |run| run.text.trim());
+    let presentation = if text_fallback {
+        "texto alternativo"
+    } else {
+        match identifier {
+            Some(MetricIdentifierVisual::SystemSymbol { .. }) => "ícone",
+            Some(MetricIdentifierVisual::Png { .. }) => "PNG",
+            None if runs.len() > 1 => "texto",
+            None => "sem rótulo",
+        }
+    };
+    format!("{name} {value} ({presentation})")
+}
+
 fn preview_metric_summary(
     name: &str,
     runs: &[IndicatorRun],
+    identifier: Option<&MetricIdentifierVisual>,
     resolved_colors: &[[f64; 3]],
     color_index: &mut usize,
+    text_fallback: bool,
 ) -> (String, bool) {
+    if let (Some(identifier), [value]) = (identifier, runs) {
+        return match identifier {
+            MetricIdentifierVisual::SystemSymbol { name: symbol, .. } => {
+                let identifier_color = resolved_colors
+                    .get(*color_index)
+                    .map_or_else(|| "cor indisponível".to_owned(), |color| color_hex(*color));
+                *color_index += 1;
+                let value_color = resolved_colors
+                    .get(*color_index)
+                    .map_or_else(|| "cor indisponível".to_owned(), |color| color_hex(*color));
+                *color_index += 1;
+                (
+                    format!(
+                        "{name} {}, ícone do macOS {} na cor {identifier_color} e valor {value_color}",
+                        value.text.trim(),
+                        symbol.label_pt_br()
+                    ),
+                    true,
+                )
+            }
+            MetricIdentifierVisual::Png { metadata, .. } => {
+                let value_color = resolved_colors
+                    .get(*color_index)
+                    .map_or_else(|| "cor indisponível".to_owned(), |color| color_hex(*color));
+                *color_index += 1;
+                (
+                    format!(
+                        "{name} {}, PNG {} e valor {value_color}",
+                        value.text.trim(),
+                        metadata.source_name()
+                    ),
+                    true,
+                )
+            }
+        };
+    }
     match runs {
         [_, value] => {
             let label_color = resolved_colors
@@ -163,10 +371,17 @@ fn preview_metric_summary(
                 .map_or_else(|| "cor indisponível".to_owned(), |color| color_hex(*color));
             *color_index += 1;
             (
-                format!(
-                    "{name} {}, rótulo {label_color} e valor {value_color}",
-                    value.text.trim()
-                ),
+                if text_fallback {
+                    format!(
+                        "{name} {}, fallback textual na cor {label_color} e valor {value_color}",
+                        value.text.trim()
+                    )
+                } else {
+                    format!(
+                        "{name} {}, rótulo {label_color} e valor {value_color}",
+                        value.text.trim()
+                    )
+                },
                 true,
             )
         }
@@ -216,6 +431,77 @@ fn metric_runs(
         color: metric_color,
     });
     runs
+}
+
+fn metric_presentation(
+    metric: &MetricContent,
+    metric_kind: MetricKind,
+    metric_color: SegmentColor,
+    preferences: &IndicatorPreferences,
+    label: &str,
+    appearance: IndicatorAppearance,
+) -> (Option<MetricIdentifierVisual>, Vec<IndicatorRun>) {
+    let identifier = match metric_kind {
+        MetricKind::Cpu => &preferences.identifiers.cpu,
+        MetricKind::Ram => &preferences.identifiers.ram,
+    };
+    if identifier.mode == MetricIdentifierMode::Text {
+        return (
+            None,
+            metric_runs(metric, metric_color, preferences, label, appearance),
+        );
+    }
+
+    let label_color = resolved_label_color(metric_color, preferences, appearance);
+    let fallback_text = format!("{} ", metric.label);
+    let value_run = IndicatorRun {
+        text: format!("{}%", metric.percent),
+        color: metric_color,
+    };
+    match identifier.mode {
+        MetricIdentifierMode::Text => unreachable!("text mode returned above"),
+        MetricIdentifierMode::SystemSymbol => (
+            Some(MetricIdentifierVisual::SystemSymbol {
+                name: identifier.system_symbol.clone(),
+                color: label_color,
+                fallback_text,
+            }),
+            vec![value_run],
+        ),
+        MetricIdentifierMode::Png => match &identifier.png {
+            Some(metadata) => (
+                Some(MetricIdentifierVisual::Png {
+                    metric: metric_kind,
+                    metadata: metadata.clone(),
+                    fallback_color: label_color,
+                    fallback_text,
+                }),
+                vec![value_run],
+            ),
+            None => (
+                None,
+                vec![
+                    IndicatorRun {
+                        text: fallback_text,
+                        color: label_color,
+                    },
+                    value_run,
+                ],
+            ),
+        },
+    }
+}
+
+fn resolved_label_color(
+    metric_color: SegmentColor,
+    preferences: &IndicatorPreferences,
+    appearance: IndicatorAppearance,
+) -> SegmentColor {
+    match preferences.labels.color_mode {
+        LabelColorMode::Neutral => SegmentColor::Semantic(SemanticColor::Neutral),
+        LabelColorMode::MatchMetric => metric_color,
+        LabelColorMode::Fixed => SegmentColor::Srgb(preferences.labels.fixed.color_for(appearance)),
+    }
 }
 
 fn metric_color(
