@@ -43,6 +43,158 @@ pub enum MetricKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetricIdentifierMode {
+    Text,
+    SystemSymbol,
+    Png,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemSymbolName(String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidSystemSymbolName;
+
+impl SystemSymbolName {
+    const CURATED_NAMES: [&'static str; 6] = [
+        "cpu",
+        "memorychip",
+        "gauge.with.dots.needle.33percent",
+        "waveform.path.ecg",
+        "chart.bar.fill",
+        "bolt.fill",
+    ];
+
+    pub fn new(value: impl AsRef<str>) -> Result<Self, InvalidSystemSymbolName> {
+        let value = value.as_ref().trim();
+        if !Self::CURATED_NAMES.contains(&value) {
+            return Err(InvalidSystemSymbolName);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub const fn curated_names() -> &'static [&'static str] {
+        &Self::CURATED_NAMES
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PngIconMetadata {
+    source_name: String,
+    width: u32,
+    height: u32,
+    byte_length: u64,
+    content_fingerprint: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidPngIconMetadata;
+
+impl PngIconMetadata {
+    pub const MAX_DIMENSION: u32 = 24;
+    pub const MAX_BYTE_LENGTH: u64 = 256 * 1024;
+
+    pub fn new(
+        source_name: impl Into<String>,
+        width: u32,
+        height: u32,
+        byte_length: u64,
+    ) -> Result<Self, InvalidPngIconMetadata> {
+        Self::with_content_fingerprint(source_name, width, height, byte_length, 0)
+    }
+
+    pub fn with_content_fingerprint(
+        source_name: impl Into<String>,
+        width: u32,
+        height: u32,
+        byte_length: u64,
+        content_fingerprint: u64,
+    ) -> Result<Self, InvalidPngIconMetadata> {
+        let source_name = source_name.into();
+        let trimmed = source_name.trim();
+        let has_png_extension = trimmed
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("png"));
+        let is_plain_name = !trimmed.contains(['/', '\\'])
+            && trimmed.chars().count() <= 128
+            && !trimmed.chars().any(char::is_control);
+        if trimmed.is_empty()
+            || !has_png_extension
+            || !is_plain_name
+            || width == 0
+            || height == 0
+            || width > Self::MAX_DIMENSION
+            || height > Self::MAX_DIMENSION
+            || byte_length == 0
+            || byte_length > Self::MAX_BYTE_LENGTH
+        {
+            return Err(InvalidPngIconMetadata);
+        }
+        Ok(Self {
+            source_name: trimmed.to_owned(),
+            width,
+            height,
+            byte_length,
+            content_fingerprint,
+        })
+    }
+
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub const fn byte_length(&self) -> u64 {
+        self.byte_length
+    }
+
+    pub const fn content_fingerprint(&self) -> u64 {
+        self.content_fingerprint
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetricIdentifierPreferences {
+    pub mode: MetricIdentifierMode,
+    pub system_symbol: SystemSymbolName,
+    pub png: Option<PngIconMetadata>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentifierPreferences {
+    pub cpu: MetricIdentifierPreferences,
+    pub ram: MetricIdentifierPreferences,
+}
+
+impl Default for IdentifierPreferences {
+    fn default() -> Self {
+        Self {
+            cpu: MetricIdentifierPreferences {
+                mode: MetricIdentifierMode::Text,
+                system_symbol: SystemSymbolName("cpu".to_owned()),
+                png: None,
+            },
+            ram: MetricIdentifierPreferences {
+                mode: MetricIdentifierMode::Text,
+                system_symbol: SystemSymbolName("memorychip".to_owned()),
+                png: None,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetricColorMode {
     Dynamic,
     Fixed,
@@ -258,6 +410,7 @@ impl Default for MetricsRefreshInterval {
 pub struct IndicatorPreferences {
     pub cpu_color: MetricColorPreferences,
     pub ram_color: MetricColorPreferences,
+    pub identifiers: IdentifierPreferences,
     pub labels: LabelPreferences,
     pub typography: TypographyPreferences,
     pub refresh_interval: MetricsRefreshInterval,
@@ -278,6 +431,7 @@ impl IndicatorPreferences {
             IndicatorPreferenceGroup::CpuAndRam => {
                 self.cpu_color = defaults.cpu_color;
                 self.ram_color = defaults.ram_color;
+                self.identifiers = defaults.identifiers;
             }
             IndicatorPreferenceGroup::Labels => self.labels = defaults.labels,
             IndicatorPreferenceGroup::Typography => self.typography = defaults.typography,
@@ -307,6 +461,7 @@ impl Default for IndicatorPreferences {
                     variants: None,
                 },
             },
+            identifiers: IdentifierPreferences::default(),
             labels: LabelPreferences {
                 visible: true,
                 color_mode: LabelColorMode::Neutral,

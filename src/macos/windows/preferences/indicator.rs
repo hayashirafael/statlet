@@ -1,25 +1,30 @@
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
+use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSAccessibility, NSButton, NSColor, NSColorWell, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSFont, NSSegmentSwitchTracking, NSSegmentedControl, NSSlider,
-    NSStackView, NSStepper, NSTextField, NSTextFieldDelegate, NSView,
+    NSControlTextEditingDelegate, NSFont, NSImage, NSImageView, NSModalResponseOK, NSOpenPanel,
+    NSPopUpButton, NSSegmentSwitchTracking, NSSegmentedControl, NSSlider, NSStackView, NSStepper,
+    NSTextField, NSTextFieldDelegate, NSView,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint,
     NSRect, NSSize,
 };
 use statlet::core::{AppEvent, IndicatorPreferenceChange};
+use statlet::icon_assets::IconAssetStore;
 use statlet::indicator_preferences::{
     FontFamilyPreference, FontSize, FontWeight, IndicatorLabel, IndicatorPreferenceGroup,
-    IndicatorPreferences, LabelColorMode, LabelSpacing, MetricColorMode, MetricKind,
-    TypographyPreferences,
+    IndicatorPreferences, LabelColorMode, LabelSpacing, MetricColorMode, MetricIdentifierMode,
+    MetricKind, SystemSymbolName, TypographyPreferences,
 };
 use statlet::preferences_view::{
-    ColorEditorState, IndicatorControlsLayout, IndicatorControlsVisibility, IntervalDraft,
+    ColorEditorState, IdentifierDetailPresentation, IndicatorControlsLayout,
+    IndicatorControlsVisibility, IntervalDraft, MetricIdentifierControlPresentation,
 };
 use tao::event_loop::EventLoopProxy;
 
@@ -42,6 +47,10 @@ struct IndicatorControlsTargetIvars {
     selected_cpu_label: RefCell<IndicatorLabel>,
     selected_ram_label: RefCell<IndicatorLabel>,
     selected_label_spacing: Cell<LabelSpacing>,
+    selected_cpu_identifier_mode: Cell<MetricIdentifierMode>,
+    selected_ram_identifier_mode: Cell<MetricIdentifierMode>,
+    cpu_png_available: Cell<bool>,
+    ram_png_available: Cell<bool>,
     cpu_label_field: Retained<NSTextField>,
     ram_label_field: Retained<NSTextField>,
     label_spacing: Retained<NSSlider>,
@@ -113,6 +122,46 @@ define_class!(
         #[unsafe(method(changeRamColorMode:))]
         fn change_ram_color_mode(&self, sender: &NSSegmentedControl) {
             self.send_metric_mode(MetricKind::Ram, sender);
+        }
+
+        #[unsafe(method(changeCpuIdentifierMode:))]
+        fn change_cpu_identifier_mode(&self, sender: &NSSegmentedControl) {
+            self.change_identifier_mode(MetricKind::Cpu, sender);
+        }
+
+        #[unsafe(method(changeRamIdentifierMode:))]
+        fn change_ram_identifier_mode(&self, sender: &NSSegmentedControl) {
+            self.change_identifier_mode(MetricKind::Ram, sender);
+        }
+
+        #[unsafe(method(changeCpuSystemSymbol:))]
+        fn change_cpu_system_symbol(&self, sender: &NSPopUpButton) {
+            self.change_system_symbol(MetricKind::Cpu, sender);
+        }
+
+        #[unsafe(method(changeRamSystemSymbol:))]
+        fn change_ram_system_symbol(&self, sender: &NSPopUpButton) {
+            self.change_system_symbol(MetricKind::Ram, sender);
+        }
+
+        #[unsafe(method(chooseCpuPng:))]
+        fn choose_cpu_png(&self, sender: &NSButton) {
+            self.present_png_panel(MetricKind::Cpu, sender.window().as_deref(), None);
+        }
+
+        #[unsafe(method(chooseRamPng:))]
+        fn choose_ram_png(&self, sender: &NSButton) {
+            self.present_png_panel(MetricKind::Ram, sender.window().as_deref(), None);
+        }
+
+        #[unsafe(method(removeCpuPng:))]
+        fn remove_cpu_png(&self, _sender: &NSButton) {
+            self.send_event(AppEvent::RemoveMetricPng(MetricKind::Cpu));
+        }
+
+        #[unsafe(method(removeRamPng:))]
+        fn remove_ram_png(&self, _sender: &NSButton) {
+            self.send_event(AppEvent::RemoveMetricPng(MetricKind::Ram));
         }
 
         #[unsafe(method(toggleLabelsVisible:))]
@@ -276,6 +325,98 @@ impl IndicatorControlsTarget {
         self.send(IndicatorPreferenceChange::SetMetricColorMode { metric, mode });
     }
 
+    fn change_identifier_mode(&self, metric: MetricKind, sender: &NSSegmentedControl) {
+        if self.ivars().applying.get() {
+            return;
+        }
+        let mode = match sender.selectedSegment() {
+            1 => MetricIdentifierMode::SystemSymbol,
+            2 => MetricIdentifierMode::Png,
+            _ => MetricIdentifierMode::Text,
+        };
+        let png_available = match metric {
+            MetricKind::Cpu => self.ivars().cpu_png_available.get(),
+            MetricKind::Ram => self.ivars().ram_png_available.get(),
+        };
+        if mode == MetricIdentifierMode::Png && !png_available {
+            self.present_png_panel(metric, sender.window().as_deref(), Some(sender.retain()));
+            return;
+        }
+        self.send(IndicatorPreferenceChange::SetMetricIdentifierMode { metric, mode });
+    }
+
+    fn change_system_symbol(&self, metric: MetricKind, sender: &NSPopUpButton) {
+        if self.ivars().applying.get() {
+            return;
+        }
+        let Ok(index) = usize::try_from(sender.indexOfSelectedItem()) else {
+            return;
+        };
+        let Some(name) = SystemSymbolName::curated_names().get(index) else {
+            return;
+        };
+        let Ok(symbol) = SystemSymbolName::new(name) else {
+            return;
+        };
+        self.send(IndicatorPreferenceChange::SetMetricSystemSymbol { metric, symbol });
+    }
+
+    fn present_png_panel(
+        &self,
+        metric: MetricKind,
+        parent: Option<&objc2_app_kit::NSWindow>,
+        restore_mode: Option<Retained<NSSegmentedControl>>,
+    ) {
+        let Some(parent) = parent else {
+            if let Some(control) = restore_mode {
+                restore_identifier_segment(&control, self.selected_identifier_mode(metric));
+            }
+            return;
+        };
+        let marker = MainThreadMarker::new().expect("PNG picker actions run on main thread");
+        let panel = NSOpenPanel::openPanel(marker);
+        panel.setCanChooseDirectories(false);
+        panel.setCanChooseFiles(true);
+        panel.setAllowsMultipleSelection(false);
+        panel.setResolvesAliases(true);
+        #[allow(deprecated)]
+        panel.setAllowedFileTypes(Some(&NSArray::from_slice(&[ns_string!("png")])));
+        panel.setPrompt(Some(ns_string!("Escolher PNG")));
+        panel.setMessage(Some(ns_string!(
+            "Escolha um PNG com transparência. O Statlet reduzirá e otimizará uma cópia."
+        )));
+
+        let proxy = self.ivars().proxy.clone();
+        let panel_for_completion = panel.clone();
+        let previous_mode = self.selected_identifier_mode(metric);
+        let completion = RcBlock::new(move |result| {
+            if result == NSModalResponseOK {
+                if let Some(path) = panel_for_completion
+                    .URL()
+                    .and_then(|url| url.path())
+                    .map(|path| PathBuf::from(path.to_string()))
+                {
+                    let _ = proxy.send_event(RuntimeEvent::App(AppEvent::ChooseMetricPng {
+                        metric,
+                        source: path,
+                    }));
+                    return;
+                }
+            }
+            if let Some(control) = &restore_mode {
+                restore_identifier_segment(control, previous_mode);
+            }
+        });
+        panel.beginSheetModalForWindow_completionHandler(parent, &completion);
+    }
+
+    fn selected_identifier_mode(&self, metric: MetricKind) -> MetricIdentifierMode {
+        match metric {
+            MetricKind::Cpu => self.ivars().selected_cpu_identifier_mode.get(),
+            MetricKind::Ram => self.ivars().selected_ram_identifier_mode.get(),
+        }
+    }
+
     fn send(&self, change: IndicatorPreferenceChange) {
         self.send_event(AppEvent::UpdateIndicator(change));
     }
@@ -397,6 +538,14 @@ impl IndicatorControlsTarget {
     }
 }
 
+fn restore_identifier_segment(control: &NSSegmentedControl, mode: MetricIdentifierMode) {
+    control.setSelectedSegment(match mode {
+        MetricIdentifierMode::Text => 0,
+        MetricIdentifierMode::SystemSymbol => 1,
+        MetricIdentifierMode::Png => 2,
+    });
+}
+
 struct IndicatorLayoutViews {
     colors_heading: Retained<NSTextField>,
     reset_cpu_and_ram: Retained<NSButton>,
@@ -406,6 +555,9 @@ struct IndicatorLayoutViews {
     ram_label: Retained<NSTextField>,
     ram_mode: Retained<NSSegmentedControl>,
     ram_editor: Retained<NSStackView>,
+    identifiers_heading: Retained<NSTextField>,
+    cpu_identifier: MetricIdentifierControls,
+    ram_identifier: MetricIdentifierControls,
     labels_heading: Retained<NSTextField>,
     labels_visible: Retained<NSButton>,
     cpu_label_text: Retained<NSTextField>,
@@ -437,6 +589,144 @@ struct IndicatorLayoutViews {
     reset_refresh_interval: Retained<NSButton>,
     interval_help: Retained<NSTextField>,
     interval_error: Retained<NSTextField>,
+}
+
+struct MetricIdentifierControls {
+    metric: MetricKind,
+    label: Retained<NSTextField>,
+    mode: Retained<NSSegmentedControl>,
+    symbol: Retained<NSPopUpButton>,
+    choose_png: Retained<NSButton>,
+    thumbnail: Retained<NSImageView>,
+    status: Retained<NSTextField>,
+    remove: Retained<NSButton>,
+}
+
+impl MetricIdentifierControls {
+    fn retained(&self) -> Self {
+        Self {
+            metric: self.metric,
+            label: self.label.clone(),
+            mode: self.mode.clone(),
+            symbol: self.symbol.clone(),
+            choose_png: self.choose_png.clone(),
+            thumbnail: self.thumbnail.clone(),
+            status: self.status.clone(),
+            remove: self.remove.clone(),
+        }
+    }
+
+    fn set_frames(
+        &self,
+        row: statlet::preferences_view::RowSlot,
+        detail: statlet::preferences_view::VerticalSlot,
+        content_height: f64,
+    ) {
+        set_slot_frame(
+            &self.label,
+            row.label_x(),
+            row.label_origin_y(content_height),
+            row.height(),
+        );
+        set_slot_frame(
+            &self.mode,
+            row.control_x(),
+            row.control_origin_y(content_height),
+            row.height(),
+        );
+        let y = detail.origin_y(content_height);
+        set_slot_frame(&self.symbol, 100.0, y, detail.height());
+        set_slot_frame(&self.choose_png, 100.0, y, detail.height());
+        set_slot_frame(&self.thumbnail, 228.0, y, detail.height());
+        set_slot_frame(&self.status, 266.0, y, detail.height());
+        set_slot_frame(&self.remove, 468.0, y, detail.height());
+    }
+
+    fn views(&self) -> [&NSView; 7] {
+        [
+            &self.label,
+            &self.mode,
+            &self.symbol,
+            &self.choose_png,
+            &self.thumbnail,
+            &self.status,
+            &self.remove,
+        ]
+    }
+
+    fn apply(
+        &self,
+        preferences: &statlet::indicator_preferences::MetricIdentifierPreferences,
+        error: Option<&str>,
+        store: &IconAssetStore,
+    ) {
+        restore_identifier_segment(&self.mode, preferences.mode);
+        if let Some(index) = SystemSymbolName::curated_names()
+            .iter()
+            .position(|name| *name == preferences.system_symbol.as_str())
+        {
+            self.symbol
+                .selectItemAtIndex(isize::try_from(index).expect("curated symbol index fits"));
+        }
+        let presentation = MetricIdentifierControlPresentation::new(preferences, error);
+        self.symbol.setHidden(true);
+        self.choose_png.setHidden(true);
+        self.thumbnail.setHidden(true);
+        self.status.setHidden(true);
+        self.remove.setHidden(true);
+        self.thumbnail.setImage(None);
+
+        match presentation.detail {
+            IdentifierDetailPresentation::Hidden => {}
+            IdentifierDetailPresentation::SystemSymbol { .. } => {
+                self.symbol.setHidden(false);
+            }
+            IdentifierDetailPresentation::Png {
+                source_name,
+                can_remove,
+            } => {
+                self.choose_png.setHidden(false);
+                self.status.setHidden(false);
+                self.remove.setHidden(false);
+                self.remove.setEnabled(can_remove);
+                let status = presentation.error.as_deref().or(source_name.as_deref());
+                self.status
+                    .setStringValue(&objc2_foundation::NSString::from_str(
+                        status.unwrap_or("Nenhum PNG escolhido."),
+                    ));
+                let status_color = if presentation.error.is_some() {
+                    NSColor::systemOrangeColor()
+                } else {
+                    NSColor::secondaryLabelColor()
+                };
+                self.status.setTextColor(Some(&status_color));
+                self.status
+                    .setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(
+                        status.unwrap_or("Nenhum PNG escolhido."),
+                    )));
+                if can_remove {
+                    if let Some(path) = store.path_for(self.metric).to_str() {
+                        if let Some(image) = NSImage::initWithContentsOfFile(
+                            NSImage::alloc(),
+                            &objc2_foundation::NSString::from_str(path),
+                        ) {
+                            self.thumbnail.setImage(Some(&image));
+                            self.thumbnail.setHidden(false);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(error) = presentation.error.as_deref() {
+            self.status.setHidden(false);
+            self.status
+                .setStringValue(&objc2_foundation::NSString::from_str(error));
+            self.status
+                .setTextColor(Some(&NSColor::systemOrangeColor()));
+            self.status
+                .setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(error)));
+        }
+    }
 }
 
 pub(super) struct IndicatorAreaViews {
@@ -543,6 +833,24 @@ impl IndicatorLayoutViews {
                 NSSize::new(540.0, ram_editor.height()),
             ));
         }
+
+        let identifiers_heading = layout.identifiers_heading();
+        set_slot_frame(
+            &self.identifiers_heading,
+            0.0,
+            identifiers_heading.origin_y(content_height),
+            identifiers_heading.height(),
+        );
+        self.cpu_identifier.set_frames(
+            layout.cpu_identifier_row(),
+            layout.cpu_identifier_detail(),
+            content_height,
+        );
+        self.ram_identifier.set_frames(
+            layout.ram_identifier_row(),
+            layout.ram_identifier_detail(),
+            content_height,
+        );
 
         let labels_heading = layout.labels_heading();
         set_slot_frame(
@@ -746,7 +1054,7 @@ impl IndicatorLayoutViews {
             .ram_editor()
             .unwrap_or(layout.ram_row().vertical())
             .bottom();
-        let labels_start = layout.labels_heading().top();
+        let labels_start = layout.identifiers_heading().top();
         let labels_end = layout
             .labels_editor()
             .unwrap_or(layout.labels_mode_row().vertical())
@@ -775,6 +1083,21 @@ impl IndicatorLayoutViews {
         );
         shift_views_y(
             &[
+                &self.identifiers_heading,
+                self.cpu_identifier.views()[0],
+                self.cpu_identifier.views()[1],
+                self.cpu_identifier.views()[2],
+                self.cpu_identifier.views()[3],
+                self.cpu_identifier.views()[4],
+                self.cpu_identifier.views()[5],
+                self.cpu_identifier.views()[6],
+                self.ram_identifier.views()[0],
+                self.ram_identifier.views()[1],
+                self.ram_identifier.views()[2],
+                self.ram_identifier.views()[3],
+                self.ram_identifier.views()[4],
+                self.ram_identifier.views()[5],
+                self.ram_identifier.views()[6],
                 &self.labels_heading,
                 &self.labels_visible,
                 &self.cpu_label_text,
@@ -833,6 +1156,9 @@ pub(super) struct IndicatorControls {
     cpu_mode: Retained<NSSegmentedControl>,
     reset_cpu_and_ram: Retained<NSButton>,
     ram_mode: Retained<NSSegmentedControl>,
+    cpu_identifier: MetricIdentifierControls,
+    ram_identifier: MetricIdentifierControls,
+    icon_asset_store: IconAssetStore,
     labels_visible: Retained<NSButton>,
     label_spacing: Retained<NSSlider>,
     labels_mode: Retained<NSSegmentedControl>,
@@ -902,6 +1228,9 @@ impl IndicatorControls {
             NSSize::new(540.0, 160.0),
         ));
 
+        let identifiers_heading = heading(mtm, "Identificadores", 0.0);
+        let cpu_identifier = metric_identifier_controls(mtm, MetricKind::Cpu);
+        let ram_identifier = metric_identifier_controls(mtm, MetricKind::Ram);
         let labels_heading = heading(mtm, "Rótulos", 0.0);
         let labels_visible = unsafe {
             NSButton::checkboxWithTitle_target_action(
@@ -1065,6 +1394,10 @@ impl IndicatorControls {
                 selected_cpu_label: RefCell::new(defaults.labels.cpu.clone()),
                 selected_ram_label: RefCell::new(defaults.labels.ram.clone()),
                 selected_label_spacing: Cell::new(defaults.labels.spacing),
+                selected_cpu_identifier_mode: Cell::new(defaults.identifiers.cpu.mode),
+                selected_ram_identifier_mode: Cell::new(defaults.identifiers.ram.mode),
+                cpu_png_available: Cell::new(defaults.identifiers.cpu.png.is_some()),
+                ram_png_available: Cell::new(defaults.identifiers.ram.png.is_some()),
                 cpu_label_field: cpu_label_field.clone(),
                 ram_label_field: ram_label_field.clone(),
                 label_spacing: label_spacing.clone(),
@@ -1081,6 +1414,8 @@ impl IndicatorControls {
             &cpu_mode,
             &reset_cpu_and_ram,
             &ram_mode,
+            &cpu_identifier,
+            &ram_identifier,
             &labels_visible,
             &cpu_label_field,
             &ram_label_field,
@@ -1116,6 +1451,14 @@ impl IndicatorControls {
             NSView::alloc(mtm),
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 0.0)),
         );
+        labels_page.addSubview(&identifiers_heading);
+        for child in cpu_identifier
+            .views()
+            .into_iter()
+            .chain(ram_identifier.views())
+        {
+            labels_page.addSubview(child);
+        }
         for child in [
             &*labels_heading as &NSView,
             &*labels_visible,
@@ -1191,6 +1534,9 @@ impl IndicatorControls {
             ram_label: ram_label.clone(),
             ram_mode: ram_mode.clone(),
             ram_editor: ram_editor.view().retain(),
+            identifiers_heading: identifiers_heading.clone(),
+            cpu_identifier: cpu_identifier.retained(),
+            ram_identifier: ram_identifier.retained(),
             labels_heading: labels_heading.clone(),
             labels_visible: labels_visible.clone(),
             cpu_label_text: cpu_label_text.clone(),
@@ -1232,6 +1578,10 @@ impl IndicatorControls {
             cpu_mode,
             reset_cpu_and_ram,
             ram_mode,
+            cpu_identifier,
+            ram_identifier,
+            icon_asset_store: IconAssetStore::for_current_user()
+                .expect("resolve the current user's indicator icon directory"),
             labels_visible,
             label_spacing,
             labels_mode,
@@ -1248,15 +1598,46 @@ impl IndicatorControls {
             labels_editor,
             target,
         };
-        controls.apply(&IndicatorPreferences::default());
+        controls.apply(&IndicatorPreferences::default(), None, None);
         controls
             .area_views()
             .set_visible_area(PreferencesArea::Colors);
         controls
     }
 
-    pub(super) fn apply(&self, preferences: &IndicatorPreferences) {
+    pub(super) fn apply(
+        &self,
+        preferences: &IndicatorPreferences,
+        cpu_icon_error: Option<&str>,
+        ram_icon_error: Option<&str>,
+    ) {
         self.target.ivars().applying.set(true);
+        self.target
+            .ivars()
+            .selected_cpu_identifier_mode
+            .set(preferences.identifiers.cpu.mode);
+        self.target
+            .ivars()
+            .selected_ram_identifier_mode
+            .set(preferences.identifiers.ram.mode);
+        self.target
+            .ivars()
+            .cpu_png_available
+            .set(preferences.identifiers.cpu.png.is_some());
+        self.target
+            .ivars()
+            .ram_png_available
+            .set(preferences.identifiers.ram.png.is_some());
+        self.cpu_identifier.apply(
+            &preferences.identifiers.cpu,
+            cpu_icon_error,
+            &self.icon_asset_store,
+        );
+        self.ram_identifier.apply(
+            &preferences.identifiers.ram,
+            ram_icon_error,
+            &self.icon_asset_store,
+        );
         self.cpu_mode
             .setSelectedSegment(match preferences.cpu_color.mode {
                 MetricColorMode::Dynamic => 0,
@@ -1386,6 +1767,68 @@ impl IndicatorControls {
             } else {
                 self.ram_mode.setNextKeyView(Some(&self.reset_cpu_and_ram));
             }
+            match preferences.identifiers.cpu.mode {
+                MetricIdentifierMode::Text => self
+                    .cpu_identifier
+                    .mode
+                    .setNextKeyView(Some(&self.ram_identifier.mode)),
+                MetricIdentifierMode::SystemSymbol => {
+                    self.cpu_identifier
+                        .mode
+                        .setNextKeyView(Some(&self.cpu_identifier.symbol));
+                    self.cpu_identifier
+                        .symbol
+                        .setNextKeyView(Some(&self.ram_identifier.mode));
+                }
+                MetricIdentifierMode::Png => {
+                    self.cpu_identifier
+                        .mode
+                        .setNextKeyView(Some(&self.cpu_identifier.choose_png));
+                    if preferences.identifiers.cpu.png.is_some() {
+                        self.cpu_identifier
+                            .choose_png
+                            .setNextKeyView(Some(&self.cpu_identifier.remove));
+                        self.cpu_identifier
+                            .remove
+                            .setNextKeyView(Some(&self.ram_identifier.mode));
+                    } else {
+                        self.cpu_identifier
+                            .choose_png
+                            .setNextKeyView(Some(&self.ram_identifier.mode));
+                    }
+                }
+            }
+            match preferences.identifiers.ram.mode {
+                MetricIdentifierMode::Text => self
+                    .ram_identifier
+                    .mode
+                    .setNextKeyView(Some(&self.labels_visible)),
+                MetricIdentifierMode::SystemSymbol => {
+                    self.ram_identifier
+                        .mode
+                        .setNextKeyView(Some(&self.ram_identifier.symbol));
+                    self.ram_identifier
+                        .symbol
+                        .setNextKeyView(Some(&self.labels_visible));
+                }
+                MetricIdentifierMode::Png => {
+                    self.ram_identifier
+                        .mode
+                        .setNextKeyView(Some(&self.ram_identifier.choose_png));
+                    if preferences.identifiers.ram.png.is_some() {
+                        self.ram_identifier
+                            .choose_png
+                            .setNextKeyView(Some(&self.ram_identifier.remove));
+                        self.ram_identifier
+                            .remove
+                            .setNextKeyView(Some(&self.labels_visible));
+                    } else {
+                        self.ram_identifier
+                            .choose_png
+                            .setNextKeyView(Some(&self.labels_visible));
+                    }
+                }
+            }
             self.labels_visible
                 .setNextKeyView(Some(&self.layout_views.cpu_label_field));
             self.layout_views
@@ -1449,7 +1892,7 @@ impl IndicatorControls {
     pub(super) fn first_key_view_for(&self, area: PreferencesArea) -> &NSView {
         match area {
             PreferencesArea::Colors => &self.cpu_mode,
-            PreferencesArea::Labels => &self.labels_visible,
+            PreferencesArea::Labels => &self.cpu_identifier.mode,
             PreferencesArea::Typography => &self.font_family,
             PreferencesArea::Refresh => &self.interval_field,
             PreferencesArea::DiskAndMole => {
@@ -1528,6 +1971,105 @@ impl IndicatorControls {
     }
 }
 
+fn metric_identifier_controls(
+    mtm: MainThreadMarker,
+    metric: MetricKind,
+) -> MetricIdentifierControls {
+    let (metric_name, prefix) = match metric {
+        MetricKind::Cpu => ("CPU", "indicator.cpu.identifier"),
+        MetricKind::Ram => ("RAM", "indicator.ram.identifier"),
+    };
+    let label = text_label(mtm, metric_name, 0.0);
+    let mode = segmented(
+        mtm,
+        &["Texto", "Ícone do macOS", "PNG"],
+        &format!("{prefix}.mode"),
+        NSRect::new(NSPoint::new(100.0, 0.0), NSSize::new(400.0, 28.0)),
+        None,
+        None,
+    );
+    mode.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+        "Tipo de identificador de {metric_name}"
+    ))));
+
+    let symbol = NSPopUpButton::initWithFrame_pullsDown(
+        NSPopUpButton::alloc(mtm),
+        NSRect::new(NSPoint::new(100.0, 0.0), NSSize::new(300.0, 30.0)),
+        false,
+    );
+    let names = SystemSymbolName::curated_names()
+        .iter()
+        .map(|name| objc2_foundation::NSString::from_str(name))
+        .collect::<Vec<_>>();
+    let name_refs = names.iter().map(|name| &**name).collect::<Vec<_>>();
+    symbol.addItemsWithTitles(&NSArray::from_slice(&name_refs));
+    symbol.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(&format!(
+        "{prefix}.symbol"
+    ))));
+    symbol.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+        "Ícone do macOS para {metric_name}"
+    ))));
+
+    let choose_png = unsafe {
+        NSButton::buttonWithTitle_target_action(ns_string!("Escolher PNG…"), None, None, mtm)
+    };
+    choose_png.setFrame(NSRect::new(
+        NSPoint::new(100.0, 0.0),
+        NSSize::new(120.0, 30.0),
+    ));
+    choose_png.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(&format!(
+        "{prefix}.choose-png"
+    ))));
+    choose_png.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+        "Escolher PNG para {metric_name}"
+    ))));
+
+    let thumbnail = NSImageView::initWithFrame(
+        NSImageView::alloc(mtm),
+        NSRect::new(NSPoint::new(228.0, 0.0), NSSize::new(30.0, 30.0)),
+    );
+    thumbnail.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(&format!(
+        "{prefix}.thumbnail"
+    ))));
+    thumbnail.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+        "Miniatura do PNG de {metric_name}"
+    ))));
+
+    let status = NSTextField::labelWithString(ns_string!("Nenhum PNG escolhido."), mtm);
+    status.setFrame(NSRect::new(
+        NSPoint::new(266.0, 0.0),
+        NSSize::new(194.0, 30.0),
+    ));
+    status.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingMiddle);
+    status.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(&format!(
+        "{prefix}.status"
+    ))));
+
+    let remove =
+        unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Remover"), None, None, mtm) };
+    remove.setFrame(NSRect::new(
+        NSPoint::new(468.0, 0.0),
+        NSSize::new(82.0, 30.0),
+    ));
+    remove.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(&format!(
+        "{prefix}.remove"
+    ))));
+    remove.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+        "Remover PNG de {metric_name}"
+    ))));
+
+    MetricIdentifierControls {
+        metric,
+        label,
+        mode,
+        symbol,
+        choose_png,
+        thumbnail,
+        status,
+        remove,
+    }
+}
+
 fn segmented(
     mtm: MainThreadMarker,
     labels: &[&str],
@@ -1599,6 +2141,8 @@ fn configure_actions(
     cpu_mode: &NSSegmentedControl,
     reset_cpu_and_ram: &NSButton,
     ram_mode: &NSSegmentedControl,
+    cpu_identifier: &MetricIdentifierControls,
+    ram_identifier: &MetricIdentifierControls,
     labels_visible: &NSButton,
     cpu_label_field: &NSTextField,
     ram_label_field: &NSTextField,
@@ -1626,6 +2170,38 @@ fn configure_actions(
             (
                 &**ram_mode as &objc2_app_kit::NSControl,
                 sel!(changeRamColorMode:),
+            ),
+            (
+                &*cpu_identifier.mode as &objc2_app_kit::NSControl,
+                sel!(changeCpuIdentifierMode:),
+            ),
+            (
+                &*ram_identifier.mode as &objc2_app_kit::NSControl,
+                sel!(changeRamIdentifierMode:),
+            ),
+            (
+                &*cpu_identifier.symbol as &objc2_app_kit::NSControl,
+                sel!(changeCpuSystemSymbol:),
+            ),
+            (
+                &*ram_identifier.symbol as &objc2_app_kit::NSControl,
+                sel!(changeRamSystemSymbol:),
+            ),
+            (
+                &*cpu_identifier.choose_png as &objc2_app_kit::NSControl,
+                sel!(chooseCpuPng:),
+            ),
+            (
+                &*ram_identifier.choose_png as &objc2_app_kit::NSControl,
+                sel!(chooseRamPng:),
+            ),
+            (
+                &*cpu_identifier.remove as &objc2_app_kit::NSControl,
+                sel!(removeCpuPng:),
+            ),
+            (
+                &*ram_identifier.remove as &objc2_app_kit::NSControl,
+                sel!(removeRamPng:),
             ),
             (
                 &**labels_visible as &objc2_app_kit::NSControl,

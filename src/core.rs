@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::disk::DiskObservation;
@@ -5,7 +6,8 @@ use crate::history::HistoryEventKind;
 use crate::indicator_preferences::{
     AppearanceColors, FontFamilyPreference, FontSize, FontWeight, IndicatorAppearance,
     IndicatorLabel, IndicatorPreferenceGroup, IndicatorPreferences, LabelColorMode, LabelSpacing,
-    MetricColorMode, MetricColorPreferences, MetricKind, MetricsRefreshInterval, SrgbColor,
+    MetricColorMode, MetricColorPreferences, MetricIdentifierMode, MetricIdentifierPreferences,
+    MetricKind, MetricsRefreshInterval, PngIconMetadata, SrgbColor, SystemSymbolName,
 };
 use crate::mole::MoleStatus;
 
@@ -75,12 +77,21 @@ pub struct AppState {
     pub mole_status: MoleStatus,
     pub can_undo_indicator_reset: bool,
     pub preferences_save_status: PreferencesSaveStatus,
+    indicator_icon_errors: [Option<String>; 2],
+}
+
+impl AppState {
+    pub fn indicator_icon_error(&self, metric: MetricKind) -> Option<&str> {
+        self.indicator_icon_errors[metric_index(metric)].as_deref()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppEvent {
     ApplicationLaunched,
-    ApplicationReopened { has_visible_windows: bool },
+    ApplicationReopened {
+        has_visible_windows: bool,
+    },
     MetricsSample(SystemSnapshot),
     OpenPreferences,
     OpenHistory,
@@ -94,6 +105,19 @@ pub enum AppEvent {
     MoleStatusObserved(MoleStatus),
     OpenMoleInTerminal,
     ClearHistoryConfirmed,
+    ChooseMetricPng {
+        metric: MetricKind,
+        source: PathBuf,
+    },
+    MetricPngImportFinished {
+        metric: MetricKind,
+        result: MetricPngImportResult,
+    },
+    RemoveMetricPng(MetricKind),
+    MetricPngRemovalFinished {
+        metric: MetricKind,
+        result: MetricPngRemovalResult,
+    },
     UpdateIndicator(IndicatorPreferenceChange),
     ResetIndicatorGroup(IndicatorPreferenceGroup),
     ResetIndicatorConfirmed,
@@ -116,7 +140,31 @@ pub enum PreferencesSaveResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MetricPngImportResult {
+    Imported(PngIconMetadata),
+    Failed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MetricPngRemovalResult {
+    Removed,
+    Failed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IndicatorPreferenceChange {
+    SetMetricIdentifierMode {
+        metric: MetricKind,
+        mode: MetricIdentifierMode,
+    },
+    SetMetricSystemSymbol {
+        metric: MetricKind,
+        symbol: SystemSymbolName,
+    },
+    SetMetricPngMetadata {
+        metric: MetricKind,
+        png: Option<PngIconMetadata>,
+    },
     SetMetricColorMode {
         metric: MetricKind,
         mode: MetricColorMode,
@@ -173,6 +221,8 @@ pub enum AppEffect {
     LaunchMoleInTerminal,
     RecordHistory(HistoryEventKind),
     ClearHistory,
+    ImportMetricPng { metric: MetricKind, source: PathBuf },
+    RemoveMetricPngAsset(MetricKind),
     Quit,
 }
 
@@ -242,6 +292,7 @@ impl StatletCore {
                 mole_status: MoleStatus::Unknown,
                 can_undo_indicator_reset: false,
                 preferences_save_status: PreferencesSaveStatus::Saved,
+                indicator_icon_errors: [None, None],
             },
             system_snapshot,
             disk_episode: DiskEpisode::default(),
@@ -405,10 +456,78 @@ impl StatletCore {
                 }
             }
             AppEvent::ClearHistoryConfirmed => vec![AppEffect::ClearHistory],
+            AppEvent::ChooseMetricPng { metric, source } => {
+                self.state.indicator_icon_errors[metric_index(metric)] = None;
+                vec![AppEffect::ImportMetricPng { metric, source }]
+            }
+            AppEvent::MetricPngImportFinished { metric, result } => match result {
+                MetricPngImportResult::Imported(metadata) => {
+                    let previous_interval = self.state.preferences.indicator.refresh_interval;
+                    let identifier =
+                        metric_identifier(&mut self.state.preferences.indicator, metric);
+                    let changed = identifier.mode != MetricIdentifierMode::Png
+                        || identifier.png.as_ref() != Some(&metadata);
+                    identifier.mode = MetricIdentifierMode::Png;
+                    identifier.png = Some(metadata);
+                    self.state.indicator_icon_errors[metric_index(metric)] = None;
+                    if changed {
+                        self.indicator_effects(previous_interval)
+                    } else {
+                        Vec::new()
+                    }
+                }
+                MetricPngImportResult::Failed(message) => {
+                    self.state.indicator_icon_errors[metric_index(metric)] = Some(message);
+                    Vec::new()
+                }
+            },
+            AppEvent::RemoveMetricPng(metric) => {
+                if metric_identifier(&mut self.state.preferences.indicator, metric)
+                    .png
+                    .is_none()
+                {
+                    Vec::new()
+                } else {
+                    self.state.indicator_icon_errors[metric_index(metric)] = None;
+                    vec![AppEffect::RemoveMetricPngAsset(metric)]
+                }
+            }
+            AppEvent::MetricPngRemovalFinished { metric, result } => match result {
+                MetricPngRemovalResult::Removed => {
+                    let previous_interval = self.state.preferences.indicator.refresh_interval;
+                    let identifier =
+                        metric_identifier(&mut self.state.preferences.indicator, metric);
+                    let changed =
+                        identifier.mode != MetricIdentifierMode::Text || identifier.png.is_some();
+                    identifier.mode = MetricIdentifierMode::Text;
+                    identifier.png = None;
+                    self.state.indicator_icon_errors[metric_index(metric)] = None;
+                    if changed {
+                        self.indicator_effects(previous_interval)
+                    } else {
+                        Vec::new()
+                    }
+                }
+                MetricPngRemovalResult::Failed(message) => {
+                    self.state.indicator_icon_errors[metric_index(metric)] = Some(message);
+                    Vec::new()
+                }
+            },
             AppEvent::UpdateIndicator(change) => {
                 let previous_interval = self.state.preferences.indicator.refresh_interval;
+                let identifier_metric = match &change {
+                    IndicatorPreferenceChange::SetMetricIdentifierMode { metric, .. }
+                    | IndicatorPreferenceChange::SetMetricSystemSymbol { metric, .. }
+                    | IndicatorPreferenceChange::SetMetricPngMetadata { metric, .. } => {
+                        Some(*metric)
+                    }
+                    _ => None,
+                };
                 if !change.apply(&mut self.state.preferences.indicator) {
                     return Vec::new();
+                }
+                if let Some(metric) = identifier_metric {
+                    self.state.indicator_icon_errors[metric_index(metric)] = None;
                 }
                 self.indicator_effects(previous_interval)
             }
@@ -493,6 +612,16 @@ impl StatletCore {
 impl IndicatorPreferenceChange {
     fn apply(self, indicator: &mut IndicatorPreferences) -> bool {
         match self {
+            Self::SetMetricIdentifierMode { metric, mode } => {
+                replace_if_changed(&mut metric_identifier(indicator, metric).mode, mode)
+            }
+            Self::SetMetricSystemSymbol { metric, symbol } => replace_if_changed(
+                &mut metric_identifier(indicator, metric).system_symbol,
+                symbol,
+            ),
+            Self::SetMetricPngMetadata { metric, png } => {
+                replace_if_changed(&mut metric_identifier(indicator, metric).png, png)
+            }
             Self::SetMetricColorMode { metric, mode } => {
                 replace_if_changed(&mut metric_colors(indicator, metric).mode, mode)
             }
@@ -548,6 +677,23 @@ impl IndicatorPreferenceChange {
             }
             Self::SetFontSize(size) => replace_if_changed(&mut indicator.typography.size, size),
         }
+    }
+}
+
+fn metric_identifier(
+    indicator: &mut IndicatorPreferences,
+    metric: MetricKind,
+) -> &mut MetricIdentifierPreferences {
+    match metric {
+        MetricKind::Cpu => &mut indicator.identifiers.cpu,
+        MetricKind::Ram => &mut indicator.identifiers.ram,
+    }
+}
+
+const fn metric_index(metric: MetricKind) -> usize {
+    match metric {
+        MetricKind::Cpu => 0,
+        MetricKind::Ram => 1,
     }
 }
 

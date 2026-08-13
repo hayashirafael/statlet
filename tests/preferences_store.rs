@@ -241,6 +241,18 @@ fn valid_versioned_preferences_round_trip_with_atomic_replacement() {
                         "variants": null
                     }
                 },
+                "identifiers": {
+                    "cpu": {
+                        "mode": "text",
+                        "systemSymbol": "cpu",
+                        "png": null
+                    },
+                    "ram": {
+                        "mode": "text",
+                        "systemSymbol": "memorychip",
+                        "png": null
+                    }
+                },
                 "labels": {
                     "visible": true,
                     "colorMode": "neutral",

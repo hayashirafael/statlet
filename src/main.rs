@@ -15,10 +15,14 @@ use objc2_app_kit::{
     NSAppearanceNameAccessibilityHighContrastDarkAqua, NSAppearanceNameAqua,
     NSAppearanceNameDarkAqua,
 };
-use statlet::core::{AppEffect, AppEvent, Preferences, PreferencesSaveResult, StatletCore};
+use statlet::core::{
+    AppEffect, AppEvent, MetricPngImportResult, MetricPngRemovalResult, Preferences,
+    PreferencesSaveResult, StatletCore,
+};
 use statlet::disk::macos::{ContinuousClock, StartupVolumeSampler};
 use statlet::disk::DiskSamplingSchedule;
 use statlet::history::{History, HistoryStore};
+use statlet::icon_assets::IconAssetStore;
 use statlet::indicator::{
     compose_indicator, has_low_text_contrast, preview_accessibility_summary, PreviewBackground,
 };
@@ -84,12 +88,15 @@ fn main() {
         .expect("resolve the current user's preferences directory");
     let history_store =
         HistoryStore::for_current_user().expect("resolve the current user's history directory");
+    let icon_asset_store = IconAssetStore::for_current_user()
+        .expect("resolve the current user's indicator icon directory");
     let history = history_store.load();
     let initial_preferences = preferences_store.load();
     let initial_metrics_interval = initial_preferences.indicator.refresh_interval;
     let (mut core, startup_effects) = StatletCore::with_preferences(initial_preferences);
     let mut runtime = RuntimeAdapters::new(
         preferences_store,
+        icon_asset_store,
         history_store,
         history,
         review_space_item,
@@ -270,6 +277,7 @@ fn apply_persistence_intent(
 
 struct RuntimeAdapters {
     preferences_store: PreferencesStore,
+    icon_asset_store: IconAssetStore,
     history_store: HistoryStore,
     history: History,
     windows: Option<WindowManager>,
@@ -285,6 +293,7 @@ struct RuntimeAdapters {
 impl RuntimeAdapters {
     fn new(
         preferences_store: PreferencesStore,
+        icon_asset_store: IconAssetStore,
         history_store: HistoryStore,
         history: History,
         review_space_item: MenuItem,
@@ -293,6 +302,7 @@ impl RuntimeAdapters {
     ) -> Self {
         Self {
             preferences_store,
+            icon_asset_store,
             history_store,
             history,
             windows: None,
@@ -501,6 +511,26 @@ impl RuntimeAdapters {
                     }
                     Err(error) => eprintln!("Statlet could not clear history: {error}"),
                 },
+                AppEffect::ImportMetricPng { metric, source } => {
+                    let result = match self.icon_asset_store.import_file(metric, &source) {
+                        Ok(metadata) => MetricPngImportResult::Imported(metadata),
+                        Err(error) => {
+                            MetricPngImportResult::Failed(error.user_message().to_owned())
+                        }
+                    };
+                    pending
+                        .extend(core.handle(AppEvent::MetricPngImportFinished { metric, result }));
+                }
+                AppEffect::RemoveMetricPngAsset(metric) => {
+                    let result = match self.icon_asset_store.remove(metric) {
+                        Ok(()) => MetricPngRemovalResult::Removed,
+                        Err(error) => {
+                            MetricPngRemovalResult::Failed(error.user_message().to_owned())
+                        }
+                    };
+                    pending
+                        .extend(core.handle(AppEvent::MetricPngRemovalFinished { metric, result }));
+                }
                 AppEffect::Quit => should_quit = true,
             }
         }
@@ -936,6 +966,8 @@ mod tests {
                 text: "R 68%".into(),
                 color: gray,
             }],
+            top_identifier: None,
+            bottom_identifier: None,
             disk_badge: None,
             accessibility_label: "CPU 42%, RAM 68%".into(),
         };
@@ -958,6 +990,8 @@ mod tests {
                 text: "R 68%".into(),
                 color: warning,
             }],
+            top_identifier: None,
+            bottom_identifier: None,
             disk_badge: None,
             accessibility_label: "CPU 42%, RAM 68%".into(),
         };

@@ -161,6 +161,24 @@ impl PreferencesShellContract {
             "indicator.save.retry",
         ]
     }
+
+    #[cfg(test)]
+    pub(super) const fn identifier_accessibility_identifiers(self) -> [&'static str; 12] {
+        [
+            "indicator.cpu.identifier.mode",
+            "indicator.cpu.identifier.symbol",
+            "indicator.cpu.identifier.choose-png",
+            "indicator.cpu.identifier.thumbnail",
+            "indicator.cpu.identifier.status",
+            "indicator.cpu.identifier.remove",
+            "indicator.ram.identifier.mode",
+            "indicator.ram.identifier.symbol",
+            "indicator.ram.identifier.choose-png",
+            "indicator.ram.identifier.thumbnail",
+            "indicator.ram.identifier.status",
+            "indicator.ram.identifier.remove",
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -624,9 +642,15 @@ struct IndicatorPage {
 }
 
 impl IndicatorPage {
-    fn apply_preferences(&self, preferences: &IndicatorPreferences) {
+    fn apply_preferences(
+        &self,
+        preferences: &IndicatorPreferences,
+        cpu_icon_error: Option<&str>,
+        ram_icon_error: Option<&str>,
+    ) {
         let previous_controls_height = self.controls.content_height();
-        self.controls.apply(preferences);
+        self.controls
+            .apply(preferences, cpu_icon_error, ram_icon_error);
         let controls_height = self.controls.content_height();
         if controls_height == previous_controls_height {
             return;
@@ -802,8 +826,11 @@ impl PreferencesWindow {
         self.disk_and_mole
             .warning_threshold
             .setEnabled(state.preferences.mole_integration_enabled);
-        self.indicator
-            .apply_preferences(&state.preferences.indicator);
+        self.indicator.apply_preferences(
+            &state.preferences.indicator,
+            state.indicator_icon_error(statlet::indicator_preferences::MetricKind::Cpu),
+            state.indicator_icon_error(statlet::indicator_preferences::MetricKind::Ram),
+        );
         self._area_target.refresh_selected_area();
         let save_failed = state.preferences_save_status == PreferencesSaveStatus::Failed;
         let footer =
@@ -1401,6 +1428,23 @@ mod tests {
                 "indicator.reset.all",
                 "indicator.reset.undo",
                 "indicator.save.retry",
+            ]
+        );
+        assert_eq!(
+            contract.identifier_accessibility_identifiers(),
+            [
+                "indicator.cpu.identifier.mode",
+                "indicator.cpu.identifier.symbol",
+                "indicator.cpu.identifier.choose-png",
+                "indicator.cpu.identifier.thumbnail",
+                "indicator.cpu.identifier.status",
+                "indicator.cpu.identifier.remove",
+                "indicator.ram.identifier.mode",
+                "indicator.ram.identifier.symbol",
+                "indicator.ram.identifier.choose-png",
+                "indicator.ram.identifier.thumbnail",
+                "indicator.ram.identifier.status",
+                "indicator.ram.identifier.remove",
             ]
         );
     }

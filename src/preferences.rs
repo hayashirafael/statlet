@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::core::{Preferences, WarningThreshold};
 use crate::indicator_preferences::{
     AppearanceColors, FixedColorPreferences, FontFamilyPreference, FontSize, FontWeight,
-    IndicatorLabel, IndicatorPreferences, LabelColorMode, LabelPreferences, LabelSpacing,
-    MetricColorMode, MetricColorPreferences, MetricsRefreshInterval, SrgbColor,
-    TypographyPreferences,
+    IdentifierPreferences, IndicatorLabel, IndicatorPreferences, LabelColorMode, LabelPreferences,
+    LabelSpacing, MetricColorMode, MetricColorPreferences, MetricIdentifierMode,
+    MetricIdentifierPreferences, MetricsRefreshInterval, PngIconMetadata, SrgbColor,
+    SystemSymbolName, TypographyPreferences,
 };
 
 const CURRENT_VERSION: u8 = 2;
@@ -198,6 +199,8 @@ impl StoredPreferencesV2 {
 struct StoredIndicatorPreferences {
     cpu_color: StoredMetricColorPreferences,
     ram_color: StoredMetricColorPreferences,
+    #[serde(default)]
+    identifiers: StoredIdentifierPreferences,
     labels: StoredLabelPreferences,
     typography: StoredTypographyPreferences,
     refresh_interval: u8,
@@ -208,6 +211,7 @@ impl From<IndicatorPreferences> for StoredIndicatorPreferences {
         Self {
             cpu_color: preferences.cpu_color.into(),
             ram_color: preferences.ram_color.into(),
+            identifiers: preferences.identifiers.into(),
             labels: preferences.labels.into(),
             typography: preferences.typography.into(),
             refresh_interval: preferences.refresh_interval.seconds(),
@@ -220,10 +224,138 @@ impl StoredIndicatorPreferences {
         Some(IndicatorPreferences {
             cpu_color: self.cpu_color.into_preferences()?,
             ram_color: self.ram_color.into_preferences()?,
+            identifiers: self.identifiers.into_preferences()?,
             labels: self.labels.into_preferences()?,
             typography: self.typography.into_preferences()?,
             refresh_interval: MetricsRefreshInterval::try_from(self.refresh_interval).ok()?,
         })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct StoredIdentifierPreferences {
+    cpu: StoredMetricIdentifierPreferences,
+    ram: StoredMetricIdentifierPreferences,
+}
+
+impl Default for StoredIdentifierPreferences {
+    fn default() -> Self {
+        IndicatorPreferences::default().identifiers.into()
+    }
+}
+
+impl From<IdentifierPreferences> for StoredIdentifierPreferences {
+    fn from(preferences: IdentifierPreferences) -> Self {
+        Self {
+            cpu: preferences.cpu.into(),
+            ram: preferences.ram.into(),
+        }
+    }
+}
+
+impl StoredIdentifierPreferences {
+    fn into_preferences(self) -> Option<IdentifierPreferences> {
+        Some(IdentifierPreferences {
+            cpu: self.cpu.into_preferences()?,
+            ram: self.ram.into_preferences()?,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredMetricIdentifierPreferences {
+    mode: StoredMetricIdentifierMode,
+    system_symbol: String,
+    png: Option<StoredPngIconMetadata>,
+}
+
+impl From<MetricIdentifierPreferences> for StoredMetricIdentifierPreferences {
+    fn from(preferences: MetricIdentifierPreferences) -> Self {
+        Self {
+            mode: preferences.mode.into(),
+            system_symbol: preferences.system_symbol.as_str().to_owned(),
+            png: preferences.png.map(Into::into),
+        }
+    }
+}
+
+impl StoredMetricIdentifierPreferences {
+    fn into_preferences(self) -> Option<MetricIdentifierPreferences> {
+        Some(MetricIdentifierPreferences {
+            mode: self.mode.into(),
+            system_symbol: SystemSymbolName::new(self.system_symbol).ok()?,
+            png: self
+                .png
+                .map(StoredPngIconMetadata::into_preferences)
+                .transpose()
+                .ok()?,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum StoredMetricIdentifierMode {
+    Text,
+    SystemSymbol,
+    Png,
+}
+
+impl From<MetricIdentifierMode> for StoredMetricIdentifierMode {
+    fn from(mode: MetricIdentifierMode) -> Self {
+        match mode {
+            MetricIdentifierMode::Text => Self::Text,
+            MetricIdentifierMode::SystemSymbol => Self::SystemSymbol,
+            MetricIdentifierMode::Png => Self::Png,
+        }
+    }
+}
+
+impl From<StoredMetricIdentifierMode> for MetricIdentifierMode {
+    fn from(mode: StoredMetricIdentifierMode) -> Self {
+        match mode {
+            StoredMetricIdentifierMode::Text => Self::Text,
+            StoredMetricIdentifierMode::SystemSymbol => Self::SystemSymbol,
+            StoredMetricIdentifierMode::Png => Self::Png,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredPngIconMetadata {
+    source_name: String,
+    width: u32,
+    height: u32,
+    byte_length: u64,
+    #[serde(default)]
+    content_fingerprint: u64,
+}
+
+impl From<PngIconMetadata> for StoredPngIconMetadata {
+    fn from(metadata: PngIconMetadata) -> Self {
+        Self {
+            source_name: metadata.source_name().to_owned(),
+            width: metadata.width(),
+            height: metadata.height(),
+            byte_length: metadata.byte_length(),
+            content_fingerprint: metadata.content_fingerprint(),
+        }
+    }
+}
+
+impl StoredPngIconMetadata {
+    fn into_preferences(
+        self,
+    ) -> Result<PngIconMetadata, crate::indicator_preferences::InvalidPngIconMetadata> {
+        PngIconMetadata::with_content_fingerprint(
+            self.source_name,
+            self.width,
+            self.height,
+            self.byte_length,
+            self.content_fingerprint,
+        )
     }
 }
 

@@ -11,16 +11,23 @@ use objc2::runtime::AnyObject;
 use objc2::{AnyThread, MainThreadMarker, Message};
 use objc2_app_kit::{
     NSAccessibility, NSAppearance, NSApplication, NSAttributedStringNSStringDrawing, NSColor,
-    NSColorSpace, NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSImage,
+    NSColorSpace, NSFont, NSFontAttributeName, NSFontWeightBold, NSFontWeightMedium,
+    NSFontWeightRegular, NSForegroundColorAttributeName, NSImage, NSImageSymbolConfiguration,
     NSStatusBarButton, NSView,
 };
-use objc2_foundation::{NSDictionary, NSMutableAttributedString, NSPoint, NSSize, NSString};
+use objc2_foundation::{
+    NSDictionary, NSMutableAttributedString, NSPoint, NSRect, NSSize, NSString,
+};
 
+use statlet::icon_assets::IconAssetStore;
 use statlet::indicator::{
     measure_stable_layout, measure_stable_layout_with_prefixes, IndicatorRun, IndicatorScene,
-    LayoutDiagnostics, SegmentColor, SemanticColor, StableLayout, TextMeasurer,
+    LayoutDiagnostics, MetricIdentifierVisual, SegmentColor, SemanticColor, StableLayout,
+    TextMeasurer,
 };
-use statlet::indicator_preferences::{FontWeight, TypographyPreferences};
+use statlet::indicator_preferences::{
+    FontWeight, MetricKind, PngIconMetadata, TypographyPreferences,
+};
 
 use super::fonts::{FontCatalog, FontResolution};
 
@@ -144,9 +151,26 @@ fn color_plan(color: SegmentColor) -> ColorPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PaintKey {
     layout: LayoutKey,
+    top_identifier: Option<IdentifierIdentity>,
+    bottom_identifier: Option<IdentifierIdentity>,
     top: Vec<RunIdentity>,
     bottom: Vec<RunIdentity>,
     badge: Option<RunIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum IdentifierIdentity {
+    SystemSymbol {
+        name: String,
+        paint: PaintIdentity,
+        fallback_text: String,
+    },
+    Png {
+        metric: MetricKind,
+        metadata: PngIconMetadata,
+        fallback_paint: PaintIdentity,
+        fallback_text: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,6 +195,14 @@ fn paint_decision(cached: Option<&PaintKey>, requested: &PaintKey) -> PaintDecis
 fn paint_key(scene: &IndicatorScene, layout: LayoutKey, appearance: String) -> PaintKey {
     PaintKey {
         layout,
+        top_identifier: scene
+            .top_identifier
+            .as_ref()
+            .map(|identifier| identifier_identity(identifier, &appearance)),
+        bottom_identifier: scene
+            .bottom_identifier
+            .as_ref()
+            .map(|identifier| identifier_identity(identifier, &appearance)),
         top: run_identities(&scene.top, &appearance),
         bottom: run_identities(&scene.bottom, &appearance),
         badge: scene
@@ -182,11 +214,55 @@ fn paint_key(scene: &IndicatorScene, layout: LayoutKey, appearance: String) -> P
 
 impl PaintKey {
     fn uses_semantic_color(&self) -> bool {
-        self.top
+        self.top_identifier
             .iter()
-            .chain(&self.bottom)
-            .chain(self.badge.iter())
-            .any(|run| matches!(run.paint, PaintIdentity::Semantic { .. }))
+            .chain(self.bottom_identifier.iter())
+            .any(|identifier| {
+                matches!(
+                    identifier,
+                    IdentifierIdentity::SystemSymbol {
+                        paint: PaintIdentity::Semantic { .. },
+                        ..
+                    } | IdentifierIdentity::Png {
+                        fallback_paint: PaintIdentity::Semantic { .. },
+                        ..
+                    }
+                )
+            })
+            || self
+                .top
+                .iter()
+                .chain(&self.bottom)
+                .chain(self.badge.iter())
+                .any(|run| matches!(run.paint, PaintIdentity::Semantic { .. }))
+    }
+}
+
+fn identifier_identity(
+    identifier: &MetricIdentifierVisual,
+    appearance: &str,
+) -> IdentifierIdentity {
+    match identifier {
+        MetricIdentifierVisual::SystemSymbol {
+            name,
+            color,
+            fallback_text,
+        } => IdentifierIdentity::SystemSymbol {
+            name: name.as_str().to_owned(),
+            paint: paint_identity(*color, appearance),
+            fallback_text: fallback_text.clone(),
+        },
+        MetricIdentifierVisual::Png {
+            metric,
+            metadata,
+            fallback_color,
+            fallback_text,
+        } => IdentifierIdentity::Png {
+            metric: *metric,
+            metadata: metadata.clone(),
+            fallback_paint: paint_identity(*fallback_color, appearance),
+            fallback_text: fallback_text.clone(),
+        },
     }
 }
 
@@ -212,6 +288,45 @@ struct SlotCache<I> {
 
 struct SurfaceCache<I> {
     slots: SlotMap<SlotCache<I>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IdentifierImageKey {
+    identity: IdentifierIdentity,
+    size: u8,
+    weight: FontWeight,
+}
+
+struct IdentifierImageEntry {
+    key: IdentifierImageKey,
+    image: Retained<NSImage>,
+}
+
+#[derive(Default)]
+struct IdentifierImageCache {
+    entries: Vec<IdentifierImageEntry>,
+}
+
+impl IdentifierImageCache {
+    fn get(&mut self, key: &IdentifierImageKey) -> Option<Retained<NSImage>> {
+        let index = self.entries.iter().position(|entry| &entry.key == key)?;
+        let entry = self.entries.remove(index);
+        let image = entry.image.clone();
+        self.entries.push(entry);
+        Some(image)
+    }
+
+    fn insert(&mut self, key: IdentifierImageKey, image: Retained<NSImage>) {
+        const CAPACITY: usize = 12;
+        if self.entries.len() == CAPACITY {
+            self.entries.remove(0);
+        }
+        self.entries.push(IdentifierImageEntry { key, image });
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 impl<I> Default for SurfaceCache<I> {
@@ -298,6 +413,18 @@ fn label_prefix(runs: &[IndicatorRun]) -> Option<String> {
             .map(|(label, _)| format!("{label} ")),
         _ => None,
     }
+}
+
+fn metric_prefix(
+    runs: &[IndicatorRun],
+    identifier: Option<&MetricIdentifierVisual>,
+) -> Option<String> {
+    identifier
+        .map(|identifier| match identifier {
+            MetricIdentifierVisual::SystemSymbol { fallback_text, .. }
+            | MetricIdentifierVisual::Png { fallback_text, .. } => fallback_text.clone(),
+        })
+        .or_else(|| label_prefix(runs))
 }
 
 type TextAttributes = Retained<NSDictionary<NSString, AnyObject>>;
@@ -400,6 +527,8 @@ pub struct Renderer {
     typography: ResolvedTypographyCache,
     attributes: AttributeCache,
     cache: SurfaceCache<Retained<NSImage>>,
+    identifier_images: IdentifierImageCache,
+    icon_asset_store: IconAssetStore,
     default_width: f64,
     font_resolutions: usize,
     measurers: usize,
@@ -433,6 +562,9 @@ impl Renderer {
             typography,
             attributes: AttributeCache::default(),
             cache: SurfaceCache::default(),
+            identifier_images: IdentifierImageCache::default(),
+            icon_asset_store: IconAssetStore::for_current_user()
+                .expect("resolve the current user's indicator icon directory"),
             default_width,
             font_resolutions: 1,
             measurers: 1,
@@ -450,8 +582,8 @@ impl Renderer {
         let resolved = self.resolve_typography(typography);
         let font = resolved.font;
         let measurer = resolved.measurer;
-        let cpu_prefix = label_prefix(&scene.top);
-        let ram_prefix = label_prefix(&scene.bottom);
+        let cpu_prefix = metric_prefix(&scene.top, scene.top_identifier.as_ref());
+        let ram_prefix = metric_prefix(&scene.bottom, scene.bottom_identifier.as_ref());
         let layout_key = LayoutKey {
             resolved_family: font.resolved_family.clone(),
             size: typography.size.points(),
@@ -468,7 +600,7 @@ impl Renderer {
             )
         });
         let appearance_name = appearance.name().to_string();
-        let paint_key = paint_key(scene, layout_key.clone(), appearance_name);
+        let paint_key = paint_key(scene, layout_key.clone(), appearance_name.clone());
         if let Some(image) = self.cache.reused_image(slot, &paint_key) {
             return RenderOutput {
                 image,
@@ -476,8 +608,22 @@ impl Renderer {
                 font,
             };
         }
+        let top_identifier_image = self.resolve_identifier_image(
+            scene.top_identifier.as_ref(),
+            typography,
+            &appearance_name,
+        );
+        let bottom_identifier_image = self.resolve_identifier_image(
+            scene.bottom_identifier.as_ref(),
+            typography,
+            &appearance_name,
+        );
         let image = draw_image(
             scene,
+            IdentifierImages {
+                top: top_identifier_image.as_deref(),
+                bottom: bottom_identifier_image.as_deref(),
+            },
             &font.font,
             &measurer,
             layout,
@@ -515,11 +661,13 @@ impl Renderer {
         self.typography.clear();
         self.attributes.clear();
         self.cache.clear();
+        self.identifier_images.clear();
     }
 
     pub fn invalidate_semantic_colors(&mut self) {
         self.attributes.clear_semantic();
         self.cache.clear_semantic_paint();
+        self.identifier_images.clear();
     }
 
     fn resolve_typography(&mut self, preferences: &TypographyPreferences) -> ResolvedTypography {
@@ -538,6 +686,42 @@ impl Renderer {
             self.cache.clear();
         }
         self.typography.get()
+    }
+
+    fn resolve_identifier_image(
+        &mut self,
+        identifier: Option<&MetricIdentifierVisual>,
+        typography: &TypographyPreferences,
+        appearance: &str,
+    ) -> Option<Retained<NSImage>> {
+        let identifier = identifier?;
+        let key = IdentifierImageKey {
+            identity: identifier_identity(identifier, appearance),
+            size: typography.size.points(),
+            weight: typography.weight,
+        };
+        if let Some(image) = self.identifier_images.get(&key) {
+            return Some(image);
+        }
+        let image = match identifier {
+            MetricIdentifierVisual::SystemSymbol { name, color, .. } => create_system_symbol_image(
+                name,
+                &resolve_color(*color),
+                f64::from(typography.size.points()),
+                typography.weight,
+            ),
+            MetricIdentifierVisual::Png { metric, .. } => {
+                let path = self.icon_asset_store.path_for(*metric);
+                let path = path.to_str()?;
+                NSImage::initWithContentsOfFile(NSImage::alloc(), &NSString::from_str(path))
+            }
+        }?;
+        let image_size = image.size();
+        if image_size.width <= 0.0 || image_size.height <= 0.0 {
+            return None;
+        }
+        self.identifier_images.insert(key, image.clone());
+        Some(image)
     }
 
     #[cfg(test)]
@@ -591,8 +775,14 @@ impl TextMeasurer for FontTextMeasurer {
     }
 }
 
+struct IdentifierImages<'a> {
+    top: Option<&'a NSImage>,
+    bottom: Option<&'a NSImage>,
+}
+
 fn draw_image(
     scene: &IndicatorScene,
+    identifier_images: IdentifierImages<'_>,
     font: &NSFont,
     measurer: &FontTextMeasurer,
     layout: StableLayout,
@@ -627,9 +817,18 @@ fn draw_image(
         #[allow(deprecated)]
         {
             image.lockFocus();
-            draw_metric_line(&scene.bottom, margin - descent, layout.ram_width, &mut text);
+            draw_metric_line(
+                &scene.bottom,
+                scene.bottom_identifier.as_ref(),
+                identifier_images.bottom,
+                margin - descent,
+                layout.ram_width,
+                &mut text,
+            );
             draw_metric_line(
                 &scene.top,
+                scene.top_identifier.as_ref(),
+                identifier_images.top,
                 margin + cap_height + LINE_GAP - descent,
                 layout.cpu_width,
                 &mut text,
@@ -666,10 +865,49 @@ struct DrawTextContext<'a> {
 
 fn draw_metric_line(
     runs: &[IndicatorRun],
+    identifier: Option<&MetricIdentifierVisual>,
+    identifier_image: Option<&NSImage>,
     y: f64,
     line_width: f64,
     context: &mut DrawTextContext<'_>,
 ) {
+    if let (Some(identifier), [value]) = (identifier, runs) {
+        let (fallback_text, fallback_color) = match identifier {
+            MetricIdentifierVisual::SystemSymbol {
+                color,
+                fallback_text,
+                ..
+            }
+            | MetricIdentifierVisual::Png {
+                fallback_color: color,
+                fallback_text,
+                ..
+            } => (fallback_text, *color),
+        };
+        let prefix_width = context.measurer.width(fallback_text);
+        if let Some(image) = identifier_image {
+            draw_metric_identifier(image, y, prefix_width, context);
+        } else {
+            attributed_scene_run(
+                context.font,
+                &IndicatorRun {
+                    text: fallback_text.clone(),
+                    color: fallback_color,
+                },
+                context.attributes,
+                context.appearance_name,
+            )
+            .drawAtPoint(NSPoint { x: 0.0, y });
+        }
+        attributed_scene_run(
+            context.font,
+            value,
+            context.attributes,
+            context.appearance_name,
+        )
+        .drawAtPoint(NSPoint { x: prefix_width, y });
+        return;
+    }
     match runs {
         [value] => attributed_scene_run(
             context.font,
@@ -710,6 +948,48 @@ fn draw_metric_line(
         )
         .drawAtPoint(NSPoint { x: 0.0, y }),
     }
+}
+
+fn draw_metric_identifier(
+    image: &NSImage,
+    y: f64,
+    prefix_width: f64,
+    context: &DrawTextContext<'_>,
+) {
+    let spacing = context.measurer.width(" ");
+    let available_width = (prefix_width - spacing).max(1.0);
+    let available_height = context.font.capHeight().max(1.0);
+    let source = image.size();
+    let scale =
+        (available_width / source.width.max(1.0)).min(available_height / source.height.max(1.0));
+    let size = NSSize::new(source.width * scale, source.height * scale);
+    image.drawInRect(NSRect::new(
+        NSPoint::new((available_width - size.width) / 2.0, y),
+        size,
+    ));
+}
+
+fn create_system_symbol_image(
+    name: &statlet::indicator_preferences::SystemSymbolName,
+    color: &NSColor,
+    point_size: f64,
+    weight: FontWeight,
+) -> Option<Retained<NSImage>> {
+    let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(name.as_str()),
+        None,
+    )?;
+    let weight = unsafe {
+        match weight {
+            FontWeight::Regular => NSFontWeightRegular,
+            FontWeight::Medium => NSFontWeightMedium,
+            FontWeight::Bold => NSFontWeightBold,
+        }
+    };
+    let size = NSImageSymbolConfiguration::configurationWithPointSize_weight(point_size, weight);
+    let color = NSImageSymbolConfiguration::configurationWithHierarchicalColor(color);
+    let configuration = size.configurationByApplyingConfiguration(&color);
+    image.imageWithSymbolConfiguration(&configuration)
 }
 
 fn label_value_origin(measurer: &impl TextMeasurer, label: &str) -> f64 {
@@ -781,11 +1061,15 @@ pub fn resolved_scene_srgb_colors(
     let resolved = RefCell::new(None);
     let resolve = StackBlock::new(|| {
         let colors = scene
-            .top
-            .iter()
-            .chain(&scene.bottom)
-            .chain(scene.disk_badge.iter())
-            .map(|run| resolved_srgb_components(&resolve_color(run.color)))
+            .top_identifier
+            .as_ref()
+            .and_then(identifier_color)
+            .into_iter()
+            .chain(scene.top.iter().map(|run| run.color))
+            .chain(scene.bottom_identifier.as_ref().and_then(identifier_color))
+            .chain(scene.bottom.iter().map(|run| run.color))
+            .chain(scene.disk_badge.iter().map(|run| run.color))
+            .map(|color| resolved_srgb_components(&resolve_color(color)))
             .collect();
         resolved.replace(Some(colors));
     });
@@ -798,6 +1082,13 @@ pub fn resolved_scene_srgb_colors(
     resolved
         .into_inner()
         .expect("drawing appearance resolves colors synchronously")
+}
+
+fn identifier_color(identifier: &MetricIdentifierVisual) -> Option<SegmentColor> {
+    match identifier {
+        MetricIdentifierVisual::SystemSymbol { color, .. } => Some(*color),
+        MetricIdentifierVisual::Png { .. } => None,
+    }
 }
 
 fn resolved_srgb_components(color: &NSColor) -> [f64; 3] {
@@ -854,9 +1145,11 @@ mod tests {
 
     use statlet::indicator::{
         has_low_text_contrast, measure_stable_layout, IndicatorRun, IndicatorScene,
-        PreviewBackground, SegmentColor, SemanticColor, TextMeasurer,
+        MetricIdentifierVisual, PreviewBackground, SegmentColor, SemanticColor, TextMeasurer,
     };
-    use statlet::indicator_preferences::{FontWeight, SrgbColor};
+    use statlet::indicator_preferences::{
+        FontWeight, MetricKind, PngIconMetadata, SrgbColor, SystemSymbolName,
+    };
 
     use super::*;
 
@@ -1012,6 +1305,8 @@ mod tests {
                 text: "R 68%".to_owned(),
                 color: SegmentColor::Semantic(SemanticColor::Warning),
             }],
+            top_identifier: None,
+            bottom_identifier: None,
             disk_badge: None,
             accessibility_label: "CPU 42%, RAM 68%".to_owned(),
         }
@@ -1040,6 +1335,26 @@ mod tests {
     }
 
     #[test]
+    fn symbol_color_precedes_its_value_in_resolved_preview_colors() {
+        let mut scene = scene_with_lines(&["42%"], &["68%"]);
+        scene.top_identifier = Some(MetricIdentifierVisual::SystemSymbol {
+            name: SystemSymbolName::new("cpu").unwrap(),
+            color: SegmentColor::Srgb(SrgbColor::parse_hex("#112233").unwrap()),
+            fallback_text: "C ".into(),
+        });
+        let appearance =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameAqua }).unwrap();
+
+        let colors = resolved_scene_srgb_colors(&scene, &appearance);
+
+        assert_eq!(colors.len(), 3);
+        assert_eq!(
+            colors[0],
+            [0x11, 0x22, 0x33].map(|value| f64::from(value) / 255.0)
+        );
+    }
+
+    #[test]
     fn accessible_status_metadata_is_applied_to_the_target() {
         let scene = IndicatorScene {
             top: vec![IndicatorRun {
@@ -1050,6 +1365,8 @@ mod tests {
                 text: "68%".to_owned(),
                 color: SegmentColor::Semantic(SemanticColor::Good),
             }],
+            top_identifier: None,
+            bottom_identifier: None,
             disk_badge: None,
             accessibility_label: "CPU 42%, RAM 68%, pressão de memória normal".to_owned(),
         };
@@ -1130,6 +1447,8 @@ mod tests {
                 text: "R 68%".to_owned(),
                 color: SegmentColor::Semantic(SemanticColor::Good),
             }],
+            top_identifier: None,
+            bottom_identifier: None,
             disk_badge: None,
             accessibility_label: "CPU 42%, RAM 68%, pressão de memória normal".to_owned(),
         };
@@ -1157,6 +1476,23 @@ mod tests {
             button.toolTip().unwrap().to_string(),
             scene.accessibility_label
         );
+    }
+
+    #[test]
+    fn every_curated_identifier_symbol_resolves_on_the_minimum_macos_runtime() {
+        let Some(_marker) = MainThreadMarker::new() else {
+            eprintln!("SKIP: AppKit symbol validation requires a main-thread test marker");
+            return;
+        };
+        let color = NSColor::labelColor();
+        for name in SystemSymbolName::curated_names() {
+            let name = SystemSymbolName::new(name).unwrap();
+            assert!(
+                create_system_symbol_image(&name, &color, 12.0, FontWeight::Medium).is_some(),
+                "curated SF Symbol {} must resolve on macOS 14+",
+                name.as_str()
+            );
+        }
     }
 
     #[test]
@@ -1348,6 +1684,51 @@ mod tests {
     }
 
     #[test]
+    fn identifier_visual_change_invalidates_the_painted_image() {
+        let mut before = scene_with_lines(&["42%"], &["R ", "68%"]);
+        before.top_identifier = Some(MetricIdentifierVisual::SystemSymbol {
+            name: SystemSymbolName::new("cpu").unwrap(),
+            color: SegmentColor::Semantic(SemanticColor::Neutral),
+            fallback_text: "C ".to_owned(),
+        });
+        let mut after = before.clone();
+        after.top_identifier = Some(MetricIdentifierVisual::SystemSymbol {
+            name: SystemSymbolName::new("waveform.path.ecg").unwrap(),
+            color: SegmentColor::Semantic(SemanticColor::Neutral),
+            fallback_text: "C ".to_owned(),
+        });
+        let layout = layout_key("Menlo", true);
+
+        let cached = paint_key(&before, layout.clone(), "NSAppearanceNameAqua".to_owned());
+        let requested = paint_key(&after, layout, "NSAppearanceNameAqua".to_owned());
+
+        assert_ne!(cached, requested);
+    }
+
+    #[test]
+    fn png_fallback_color_change_invalidates_the_painted_image() {
+        let mut before = scene_with_lines(&["42%"], &["R ", "68%"]);
+        before.top_identifier = Some(MetricIdentifierVisual::Png {
+            metric: MetricKind::Cpu,
+            metadata: PngIconMetadata::new("cpu.png", 24, 24, 100).unwrap(),
+            fallback_color: SegmentColor::Semantic(SemanticColor::Neutral),
+            fallback_text: "C ".to_owned(),
+        });
+        let mut after = before.clone();
+        if let Some(MetricIdentifierVisual::Png { fallback_color, .. }) =
+            after.top_identifier.as_mut()
+        {
+            *fallback_color = SegmentColor::Semantic(SemanticColor::Warning);
+        }
+        let layout = layout_key("Menlo", true);
+
+        let cached = paint_key(&before, layout.clone(), "NSAppearanceNameAqua".to_owned());
+        let requested = paint_key(&after, layout, "NSAppearanceNameAqua".to_owned());
+
+        assert_ne!(cached, requested);
+    }
+
+    #[test]
     fn badge_text_change_invalidates_even_when_its_color_is_unchanged() {
         let mut warning = scene_with_lines(&["C 42%"], &["R 68%"]);
         warning.disk_badge = Some(IndicatorRun {
@@ -1391,6 +1772,8 @@ mod tests {
         IndicatorScene {
             top: runs(top),
             bottom: runs(bottom),
+            top_identifier: None,
+            bottom_identifier: None,
             disk_badge: None,
             accessibility_label: "CPU 42%, RAM 68%".to_owned(),
         }
@@ -1406,6 +1789,8 @@ mod tests {
                 text: "R 68%".to_owned(),
                 color,
             }],
+            top_identifier: None,
+            bottom_identifier: None,
             disk_badge: None,
             accessibility_label: "CPU 42%, RAM 68%".to_owned(),
         }
