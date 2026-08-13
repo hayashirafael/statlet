@@ -1071,17 +1071,10 @@ impl SystemUsageSession {
         if !self.visible {
             return None;
         }
-        [
-            self.sample_deadline,
-            self.in_flight_process
-                .is_none()
-                .then_some(self.process_deadline)
-                .flatten(),
-            self.model.deferred_process_deadline(),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
+        [self.sample_deadline, self.model.deferred_process_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     fn reconcile_surface(&mut self, observation: SurfaceObservation, now: Duration) -> bool {

@@ -492,10 +492,62 @@ mod session_contract {
             &mut sampling,
             &mut surface,
         );
-        assert_eq!(session.next_deadline(), Some(Duration::from_secs(16)));
+        assert_eq!(session.next_deadline(), Some(Duration::from_secs(102)));
         session.advance(
             SystemUsageCause::Wake(SamplingCycle::new(4)),
-            Duration::from_secs(101),
+            Duration::from_secs(102),
+            &mut sampling,
+            &mut surface,
+        );
+        assert_eq!(sampling.process_requests.len(), 2);
+    }
+
+    #[test]
+    fn process_eligibility_coalesces_with_the_system_usage_sampling_wakeup() {
+        let mut session = SystemUsageSession::new();
+        let mut sampling = RecordingSystemUsageSampling::default();
+        let mut surface = RecordingSystemUsageSurface::default();
+        open(
+            &mut session,
+            &mut sampling,
+            &mut surface,
+            Duration::from_secs(10),
+            1,
+        );
+
+        session.advance(
+            SystemUsageCause::Wake(SamplingCycle::new(1)),
+            Duration::from_secs(10),
+            &mut sampling,
+            &mut surface,
+        );
+        let first = sampling.process_requests[0].clone();
+        session.advance(
+            SystemUsageCause::ProcessesFinished(first.finish(ProcessSampleOutcome::Cancelled)),
+            Duration::from_millis(10_100),
+            &mut sampling,
+            &mut surface,
+        );
+
+        session.advance(
+            SystemUsageCause::Wake(SamplingCycle::new(2)),
+            Duration::from_millis(12_100),
+            &mut sampling,
+            &mut surface,
+        );
+        session.advance(
+            SystemUsageCause::Wake(SamplingCycle::new(3)),
+            Duration::from_millis(14_200),
+            &mut sampling,
+            &mut surface,
+        );
+
+        assert_eq!(session.next_deadline(), Some(Duration::from_millis(16_200)));
+        assert_eq!(sampling.process_requests.len(), 1);
+
+        session.advance(
+            SystemUsageCause::Wake(SamplingCycle::new(4)),
+            Duration::from_millis(16_200),
             &mut sampling,
             &mut surface,
         );
