@@ -5,8 +5,9 @@ use statlet::metrics::{detailed_memory_from_counters, VmCounters};
 use statlet::stats::{
     GpuReading, GpuSampleOutcome, GraphNavigation, GraphNavigationCommand, ProcessListStatus,
     ProcessMemory, ProcessSampleCancellation, ProcessSampleCompletion, ProcessSampleOutcome,
-    ProcessSamplingSchedule, SystemUsageModel, SystemUsageRenderCoalescer,
-    SystemUsageSamplingCoordinator, SystemUsageSamplingPorts, SystemUsageSection, UsageHistory,
+    ProcessSamplingSchedule, SystemUsageAccessibilityCoordinator, SystemUsageAccessibilityState,
+    SystemUsageModel, SystemUsageRenderCoalescer, SystemUsageSamplingCoordinator,
+    SystemUsageSamplingPorts, SystemUsageSection, UsageHistory,
 };
 
 #[test]
@@ -174,6 +175,10 @@ fn ram_view_model_remains_complete_when_gpu_is_unavailable() {
     assert_eq!(ram.secondary_value, "3,2 GB de 16 GB");
     assert_eq!(ram.status, "△ Pressão em atenção");
     assert_eq!(
+        ram.accessibility_state,
+        SystemUsageAccessibilityState::MemoryPressure(MemoryPressure::Warning)
+    );
+    assert_eq!(
         ram.memory_composition
             .iter()
             .map(|segment| segment.label)
@@ -208,6 +213,10 @@ fn ram_view_model_remains_complete_when_gpu_is_unavailable() {
     let gpu = model.view_model(SystemUsageSection::Gpu);
     assert_eq!(gpu.primary_value, "—");
     assert_eq!(gpu.status, "O uso da GPU não está disponível neste Mac.");
+    assert_eq!(
+        gpu.accessibility_state,
+        SystemUsageAccessibilityState::Unavailable
+    );
 }
 
 #[test]
@@ -370,6 +379,94 @@ fn system_usage_rendering_suppresses_duplicate_models_and_accepts_each_change_on
 }
 
 #[test]
+fn accessibility_transitions_are_coalesced_and_human_section_focus_is_consumed_once() {
+    let mut coordinator = SystemUsageAccessibilityCoordinator::new();
+
+    let initial = coordinator.observe(
+        SystemUsageSection::Ram,
+        SystemUsageAccessibilityState::MemoryPressure(MemoryPressure::Normal),
+    );
+    assert_eq!(initial.announcement, None);
+    assert!(!initial.focus_summary);
+    assert_eq!(
+        coordinator
+            .observe(
+                SystemUsageSection::Ram,
+                SystemUsageAccessibilityState::MemoryPressure(MemoryPressure::Normal),
+            )
+            .announcement,
+        None
+    );
+
+    let mut pressure_update = coordinator.observe(
+        SystemUsageSection::Ram,
+        SystemUsageAccessibilityState::MemoryPressure(MemoryPressure::Warning),
+    );
+    pressure_update
+        .include_announcement("O processo selecionado terminou; seleção movida para Orca.");
+    assert_eq!(
+        pressure_update.announcement,
+        Some(
+            "Pressão da memória em atenção. O processo selecionado terminou; seleção movida para Orca."
+                .to_owned()
+        )
+    );
+    assert_eq!(
+        coordinator
+            .observe(
+                SystemUsageSection::Ram,
+                SystemUsageAccessibilityState::Stale,
+            )
+            .announcement,
+        Some("Atualização da RAM interrompida.".to_owned())
+    );
+    assert_eq!(
+        coordinator
+            .observe(
+                SystemUsageSection::Ram,
+                SystemUsageAccessibilityState::Stale,
+            )
+            .announcement,
+        None
+    );
+    assert_eq!(
+        coordinator
+            .observe(
+                SystemUsageSection::Ram,
+                SystemUsageAccessibilityState::MemoryPressure(MemoryPressure::Warning),
+            )
+            .announcement,
+        Some("Leitura de RAM restabelecida.".to_owned())
+    );
+
+    coordinator.request_summary_focus_after_user_switch(SystemUsageSection::Gpu);
+    assert!(
+        !coordinator
+            .observe(
+                SystemUsageSection::Ram,
+                SystemUsageAccessibilityState::MemoryPressure(MemoryPressure::Warning),
+            )
+            .focus_summary
+    );
+    assert!(
+        coordinator
+            .observe(
+                SystemUsageSection::Gpu,
+                SystemUsageAccessibilityState::Unavailable,
+            )
+            .focus_summary
+    );
+    assert!(
+        !coordinator
+            .observe(
+                SystemUsageSection::Gpu,
+                SystemUsageAccessibilityState::Unavailable,
+            )
+            .focus_summary
+    );
+}
+
+#[test]
 fn graph_keyboard_navigation_skips_gaps_and_exposes_selected_value_and_time() {
     let points = vec![
         statlet::stats::UsagePoint {
@@ -394,18 +491,26 @@ fn graph_keyboard_navigation_skips_gaps_and_exposes_selected_value_and_time() {
     let latest = navigation.update_points(&points).unwrap();
     assert_eq!(latest.index, 3);
     assert_eq!(latest.accessibility_value, "40%, agora");
+    assert!(!latest.should_notify_accessibility);
 
     let previous = navigation
         .move_selection(&points, GraphNavigationCommand::Previous)
         .unwrap();
     assert_eq!(previous.index, 2);
     assert_eq!(previous.accessibility_value, "30%, há 2 segundos");
+    assert!(previous.should_notify_accessibility);
 
     let first = navigation
         .move_selection(&points, GraphNavigationCommand::First)
         .unwrap();
     assert_eq!(first.index, 0);
     assert_eq!(first.accessibility_value, "10%, há 6 segundos");
+    assert!(first.should_notify_accessibility);
+
+    let unchanged_first = navigation
+        .move_selection(&points, GraphNavigationCommand::First)
+        .unwrap();
+    assert!(!unchanged_first.should_notify_accessibility);
 
     let next = navigation
         .move_selection(&points, GraphNavigationCommand::Next)
@@ -416,6 +521,41 @@ fn graph_keyboard_navigation_skips_gaps_and_exposes_selected_value_and_time() {
         .move_selection(&points, GraphNavigationCommand::Last)
         .unwrap();
     assert_eq!(last.index, 3);
+}
+
+#[test]
+fn graph_pointer_inspection_uses_elapsed_position_without_crossing_gaps() {
+    let points = vec![
+        statlet::stats::UsagePoint {
+            observed_at: Duration::from_secs(10),
+            value: Some(10.0),
+        },
+        statlet::stats::UsagePoint {
+            observed_at: Duration::from_secs(12),
+            value: None,
+        },
+        statlet::stats::UsagePoint {
+            observed_at: Duration::from_secs(14),
+            value: Some(30.0),
+        },
+    ];
+    let window_end = Duration::from_secs(14);
+
+    let valid = statlet::stats::graph_pointer_selection(
+        &points,
+        statlet::stats::history_x_position(Duration::from_secs(10), window_end),
+    )
+    .unwrap();
+    assert_eq!(valid.index, 0);
+    assert_eq!(valid.accessibility_value, "10%, há 4 segundos");
+    assert!(!valid.should_notify_accessibility);
+    assert_eq!(
+        statlet::stats::graph_pointer_selection(
+            &points,
+            statlet::stats::history_x_position(Duration::from_secs(12), window_end),
+        ),
+        None
+    );
 }
 
 #[test]
@@ -652,9 +792,13 @@ fn ram_failure_keeps_the_last_value_marked_as_stale_and_adds_a_gap() {
     assert_eq!(view.primary_value, "50% em uso");
     assert_eq!(
         view.status,
-        "✓ Pressão normal — atualização interrompida; última leitura preservada"
+        "✓ Pressão normal — atualização interrompida; última leitura há 2 s"
     );
     assert_eq!(view.history.last().unwrap().value, None);
+    assert_eq!(
+        view.accessibility_state,
+        SystemUsageAccessibilityState::Stale
+    );
 }
 
 #[test]
@@ -746,9 +890,15 @@ fn gpu_failure_keeps_the_last_value_marked_as_stale() {
     assert_eq!(view.primary_value, "30% de uso");
     assert_eq!(
         view.status,
-        "Atualização interrompida; última leitura preservada"
+        "Atualização interrompida; última leitura há 2 s"
     );
     assert_eq!(view.history.last().unwrap().value, None);
+
+    model.record_gpu(Duration::from_secs(10), GpuSampleOutcome::Failed);
+    assert_eq!(
+        model.view_model(SystemUsageSection::Gpu).status,
+        "Atualização interrompida; última leitura há 10 s"
+    );
 }
 
 #[test]

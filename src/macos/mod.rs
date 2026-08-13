@@ -1,6 +1,6 @@
 use statlet::core::AppEvent;
 use statlet::mole::MoleDetection;
-use statlet::stats::ProcessSampleOutcome;
+use statlet::stats::{ProcessSampleOutcome, SystemUsageSection};
 
 pub mod gpu;
 pub mod notifications;
@@ -21,4 +21,5 @@ pub enum RuntimeEvent {
         outcome: ProcessSampleOutcome,
     },
     SystemUsageVisibilityChanged(bool),
+    SystemUsageSectionSelectedByUser(SystemUsageSection),
 }

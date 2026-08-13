@@ -160,6 +160,10 @@ fn main() {
                     runtime.samplers.set_system_usage_visible(visible);
                     Vec::new()
                 }
+                RuntimeEvent::SystemUsageSectionSelectedByUser(section) => {
+                    runtime.request_system_usage_summary_focus(section);
+                    core.handle(AppEvent::SelectSystemUsageSection(section))
+                }
             };
             if runtime.apply_effects(&effects, &mut core) {
                 *control_flow = ControlFlow::Exit;
@@ -271,6 +275,12 @@ impl RuntimeAdapters {
         self.windows
             .as_ref()
             .map_or(0, WindowManager::system_usage_visibility_generation)
+    }
+
+    fn request_system_usage_summary_focus(&self, section: SystemUsageSection) {
+        if let Some(windows) = &self.windows {
+            windows.request_system_usage_summary_focus(section);
+        }
     }
 
     fn apply_effects(&mut self, effects: &[AppEffect], core: &mut StatletCore) -> bool {

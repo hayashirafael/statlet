@@ -33,6 +33,7 @@ pub enum GraphNavigationCommand {
 pub struct GraphSampleSelection {
     pub index: usize,
     pub accessibility_value: String,
+    pub should_notify_accessibility: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,7 +71,7 @@ impl GraphNavigation {
                 .or_else(|| valid_indices.first().copied())
         }?;
         self.selected_observed_at = Some(points[index].observed_at);
-        Some(graph_selection(points, index))
+        Some(graph_selection(points, index, false))
     }
 
     pub fn move_selection(
@@ -96,9 +97,11 @@ impl GraphNavigation {
             GraphNavigationCommand::Last => valid_indices.len().saturating_sub(1),
         };
         let index = *valid_indices.get(position)?;
+        let should_notify_accessibility =
+            self.selected_observed_at != Some(points[index].observed_at);
         self.follows_latest = index == *valid_indices.last()?;
         self.selected_observed_at = Some(points[index].observed_at);
-        Some(graph_selection(points, index))
+        Some(graph_selection(points, index, should_notify_accessibility))
     }
 }
 
@@ -110,7 +113,11 @@ fn valid_graph_indices(points: &[UsagePoint]) -> Vec<usize> {
         .collect()
 }
 
-fn graph_selection(points: &[UsagePoint], index: usize) -> GraphSampleSelection {
+fn graph_selection(
+    points: &[UsagePoint],
+    index: usize,
+    should_notify_accessibility: bool,
+) -> GraphSampleSelection {
     let point = points[index];
     let window_end = points
         .last()
@@ -123,6 +130,7 @@ fn graph_selection(points: &[UsagePoint], index: usize) -> GraphSampleSelection 
     };
     GraphSampleSelection {
         index,
+        should_notify_accessibility,
         accessibility_value: format!(
             "{}%, {time}",
             point
@@ -160,6 +168,121 @@ pub enum SystemUsageSection {
     #[default]
     Ram,
     Gpu,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemUsageAccessibilityState {
+    Collecting,
+    Available,
+    MemoryPressure(MemoryPressure),
+    Unavailable,
+    Failed,
+    Stale,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SystemUsageAccessibilityUpdate {
+    pub announcement: Option<String>,
+    pub focus_summary: bool,
+}
+
+impl SystemUsageAccessibilityUpdate {
+    pub fn include_announcement(&mut self, announcement: impl Into<String>) {
+        let announcement = announcement.into();
+        self.announcement = Some(match self.announcement.take() {
+            Some(existing) => format!("{existing} {announcement}"),
+            None => announcement,
+        });
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SystemUsageAccessibilityCoordinator {
+    ram_state: Option<SystemUsageAccessibilityState>,
+    gpu_state: Option<SystemUsageAccessibilityState>,
+    pending_summary_focus: Option<SystemUsageSection>,
+}
+
+impl SystemUsageAccessibilityCoordinator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn request_summary_focus_after_user_switch(&mut self, section: SystemUsageSection) {
+        self.pending_summary_focus = Some(section);
+    }
+
+    pub fn observe(
+        &mut self,
+        section: SystemUsageSection,
+        state: SystemUsageAccessibilityState,
+    ) -> SystemUsageAccessibilityUpdate {
+        let previous = match section {
+            SystemUsageSection::Ram => self.ram_state.replace(state),
+            SystemUsageSection::Gpu => self.gpu_state.replace(state),
+        };
+        let focus_summary = self.pending_summary_focus == Some(section);
+        if focus_summary {
+            self.pending_summary_focus = None;
+        }
+        SystemUsageAccessibilityUpdate {
+            announcement: previous.and_then(|previous| {
+                accessibility_transition_announcement(section, previous, state)
+            }),
+            focus_summary,
+        }
+    }
+}
+
+fn accessibility_transition_announcement(
+    section: SystemUsageSection,
+    previous: SystemUsageAccessibilityState,
+    current: SystemUsageAccessibilityState,
+) -> Option<String> {
+    if previous == current {
+        return None;
+    }
+    let was_interrupted = accessibility_state_is_interrupted(previous);
+    let is_interrupted = accessibility_state_is_interrupted(current);
+    if is_interrupted && !was_interrupted {
+        return Some(match section {
+            SystemUsageSection::Ram => "Atualização da RAM interrompida.".to_owned(),
+            SystemUsageSection::Gpu => "Atualização da GPU interrompida.".to_owned(),
+        });
+    }
+    if was_interrupted && !is_interrupted && accessibility_state_is_available(current) {
+        return Some(match section {
+            SystemUsageSection::Ram => "Leitura de RAM restabelecida.".to_owned(),
+            SystemUsageSection::Gpu => "Leitura de GPU restabelecida.".to_owned(),
+        });
+    }
+    match (section, current) {
+        (SystemUsageSection::Ram, SystemUsageAccessibilityState::MemoryPressure(pressure)) => Some(
+            match pressure {
+                MemoryPressure::Normal => "Pressão da memória normal.",
+                MemoryPressure::Warning => "Pressão da memória em atenção.",
+                MemoryPressure::Critical => "Pressão da memória crítica.",
+            }
+            .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
+fn accessibility_state_is_interrupted(state: SystemUsageAccessibilityState) -> bool {
+    matches!(
+        state,
+        SystemUsageAccessibilityState::Unavailable
+            | SystemUsageAccessibilityState::Failed
+            | SystemUsageAccessibilityState::Stale
+    )
+}
+
+fn accessibility_state_is_available(state: SystemUsageAccessibilityState) -> bool {
+    matches!(
+        state,
+        SystemUsageAccessibilityState::Available | SystemUsageAccessibilityState::MemoryPressure(_)
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -232,6 +355,7 @@ pub struct ProcessRowViewModel {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SystemUsageViewModel {
     pub section: SystemUsageSection,
+    pub accessibility_state: SystemUsageAccessibilityState,
     pub primary_value: String,
     pub secondary_value: String,
     pub status: String,
@@ -270,8 +394,8 @@ impl SystemUsageRenderCoalescer {
 #[derive(Clone, Debug, PartialEq)]
 enum GpuReadingState {
     Collecting,
-    Available(GpuReading),
-    Stale(GpuReading),
+    Available(GpuReading, Duration),
+    Stale(GpuReading, Duration),
     Unavailable,
     Failed,
 }
@@ -279,8 +403,8 @@ enum GpuReadingState {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum MemoryReadingState {
     Collecting,
-    Available(MemoryReading),
-    Stale(MemoryReading),
+    Available(MemoryReading, Duration),
+    Stale(MemoryReading, Duration),
     Failed,
 }
 
@@ -326,6 +450,26 @@ pub fn history_x_position(observed_at: Duration, window_end: Duration) -> f64 {
     (1.0 - age.as_secs_f64() / USAGE_HISTORY_WINDOW.as_secs_f64()).clamp(0.0, 1.0)
 }
 
+pub fn graph_pointer_selection(
+    points: &[UsagePoint],
+    normalized_x: f64,
+) -> Option<GraphSampleSelection> {
+    let window_end = points.last()?.observed_at;
+    let index = points
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| {
+            let left_distance =
+                (history_x_position(left.observed_at, window_end) - normalized_x).abs();
+            let right_distance =
+                (history_x_position(right.observed_at, window_end) - normalized_x).abs();
+            left_distance.total_cmp(&right_distance)
+        })?
+        .0;
+    points[index].value.filter(|value| value.is_finite())?;
+    Some(graph_selection(points, index, false))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SystemUsageModel {
     visible: bool,
@@ -336,6 +480,7 @@ pub struct SystemUsageModel {
     processes: Vec<ProcessMemory>,
     process_status: ProcessListStatus,
     deferred_processes: Option<DeferredProcessRows>,
+    latest_observed_at: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -458,16 +603,18 @@ impl SystemUsageModel {
     }
 
     pub fn record_memory(&mut self, observed_at: Duration, outcome: Result<MemoryReading, ()>) {
+        self.latest_observed_at = self.latest_observed_at.max(observed_at);
         match outcome {
             Ok(reading) => {
                 self.ram_history.push(observed_at, Some(reading.percent));
-                self.memory_state = MemoryReadingState::Available(reading);
+                self.memory_state = MemoryReadingState::Available(reading, observed_at);
             }
             Err(()) => {
                 self.ram_history.push(observed_at, None);
                 self.memory_state = match self.memory_state {
-                    MemoryReadingState::Available(reading) | MemoryReadingState::Stale(reading) => {
-                        MemoryReadingState::Stale(reading)
+                    MemoryReadingState::Available(reading, valid_at)
+                    | MemoryReadingState::Stale(reading, valid_at) => {
+                        MemoryReadingState::Stale(reading, valid_at)
                     }
                     MemoryReadingState::Collecting | MemoryReadingState::Failed => {
                         MemoryReadingState::Failed
@@ -481,10 +628,11 @@ impl SystemUsageModel {
         if !self.visible {
             return;
         }
+        self.latest_observed_at = self.latest_observed_at.max(observed_at);
         let value = match outcome {
             GpuSampleOutcome::Available(reading) => {
                 let value = Some(reading.utilization_percent);
-                self.gpu_state = GpuReadingState::Available(reading);
+                self.gpu_state = GpuReadingState::Available(reading, observed_at);
                 value
             }
             GpuSampleOutcome::Unavailable => {
@@ -493,8 +641,9 @@ impl SystemUsageModel {
             }
             GpuSampleOutcome::Failed => {
                 self.gpu_state = match &self.gpu_state {
-                    GpuReadingState::Available(reading) | GpuReadingState::Stale(reading) => {
-                        GpuReadingState::Stale(reading.clone())
+                    GpuReadingState::Available(reading, valid_at)
+                    | GpuReadingState::Stale(reading, valid_at) => {
+                        GpuReadingState::Stale(reading.clone(), *valid_at)
                     }
                     GpuReadingState::Collecting
                     | GpuReadingState::Unavailable
@@ -578,10 +727,11 @@ impl SystemUsageModel {
     }
 
     fn ram_view_model(&self) -> SystemUsageViewModel {
-        let (memory, memory_stale) = match self.memory_state {
+        let (memory, valid_at) = match self.memory_state {
             MemoryReadingState::Collecting => {
                 let mut view_model = empty_view_model(
                     SystemUsageSection::Ram,
+                    SystemUsageAccessibilityState::Collecting,
                     "Coletando a primeira leitura…",
                     &self.ram_history,
                 );
@@ -592,6 +742,7 @@ impl SystemUsageModel {
             MemoryReadingState::Failed => {
                 let mut view_model = empty_view_model(
                     SystemUsageSection::Ram,
+                    SystemUsageAccessibilityState::Failed,
                     "Não foi possível ler a RAM.",
                     &self.ram_history,
                 );
@@ -599,9 +750,10 @@ impl SystemUsageModel {
                 view_model.process_status = self.process_status;
                 return view_model;
             }
-            MemoryReadingState::Available(reading) => (reading, false),
-            MemoryReadingState::Stale(reading) => (reading, true),
+            MemoryReadingState::Available(reading, _) => (reading, None),
+            MemoryReadingState::Stale(reading, valid_at) => (reading, Some(valid_at)),
         };
+        let memory_stale = valid_at.is_some();
         let (symbol, pressure) = match memory.pressure {
             MemoryPressure::Normal => ("✓", "Pressão normal"),
             MemoryPressure::Warning => ("△", "Pressão em atenção"),
@@ -618,6 +770,11 @@ impl SystemUsageModel {
         );
         SystemUsageViewModel {
             section: SystemUsageSection::Ram,
+            accessibility_state: if memory_stale {
+                SystemUsageAccessibilityState::Stale
+            } else {
+                SystemUsageAccessibilityState::MemoryPressure(memory.pressure)
+            },
             primary_value: format!("{}% em uso", memory.percent.round() as u8),
             secondary_value: format!(
                 "{} de {}",
@@ -625,7 +782,13 @@ impl SystemUsageModel {
                 format_bytes(memory.total_bytes)
             ),
             status: if memory_stale {
-                format!("{symbol} {pressure} — atualização interrompida; última leitura preservada")
+                format!(
+                    "{symbol} {pressure} — atualização interrompida; última leitura {}",
+                    elapsed_age(
+                        self.latest_observed_at,
+                        valid_at.expect("stale reading has time")
+                    )
+                )
             } else {
                 format!("{symbol} {pressure}")
             },
@@ -664,30 +827,44 @@ impl SystemUsageModel {
         match &self.gpu_state {
             GpuReadingState::Collecting => empty_view_model(
                 SystemUsageSection::Gpu,
+                SystemUsageAccessibilityState::Collecting,
                 "Coletando a primeira leitura…",
                 &self.gpu_history,
             ),
             GpuReadingState::Unavailable => empty_view_model(
                 SystemUsageSection::Gpu,
+                SystemUsageAccessibilityState::Unavailable,
                 "O uso da GPU não está disponível neste Mac.",
                 &self.gpu_history,
             ),
             GpuReadingState::Failed => empty_view_model(
                 SystemUsageSection::Gpu,
+                SystemUsageAccessibilityState::Failed,
                 "Não foi possível ler esta métrica.",
                 &self.gpu_history,
             ),
-            GpuReadingState::Available(reading) => {
-                self.available_gpu_view_model(reading, "Atualizado agora")
-            }
-            GpuReadingState::Stale(reading) => self.available_gpu_view_model(
+            GpuReadingState::Available(reading, _) => self.available_gpu_view_model(
                 reading,
-                "Atualização interrompida; última leitura preservada",
+                "Atualizado agora",
+                SystemUsageAccessibilityState::Available,
+            ),
+            GpuReadingState::Stale(reading, valid_at) => self.available_gpu_view_model(
+                reading,
+                &format!(
+                    "Atualização interrompida; última leitura {}",
+                    elapsed_age(self.latest_observed_at, *valid_at)
+                ),
+                SystemUsageAccessibilityState::Stale,
             ),
         }
     }
 
-    fn available_gpu_view_model(&self, reading: &GpuReading, status: &str) -> SystemUsageViewModel {
+    fn available_gpu_view_model(
+        &self,
+        reading: &GpuReading,
+        status: &str,
+        accessibility_state: SystemUsageAccessibilityState,
+    ) -> SystemUsageViewModel {
         let mut details = vec![StatsDetailRow {
             label: "Uso atual",
             value: format!("{}%", reading.utilization_percent.round() as u8),
@@ -710,6 +887,7 @@ impl SystemUsageModel {
         let history = self.gpu_history.points.iter().copied().collect::<Vec<_>>();
         SystemUsageViewModel {
             section: SystemUsageSection::Gpu,
+            accessibility_state,
             primary_value: format!("{}% de uso", reading.utilization_percent.round() as u8),
             secondary_value: reading.human_device_name().unwrap_or_default().to_owned(),
             status: status.to_owned(),
@@ -829,18 +1007,21 @@ impl Default for SystemUsageModel {
             processes: Vec::new(),
             process_status: ProcessListStatus::Collecting,
             deferred_processes: None,
+            latest_observed_at: Duration::ZERO,
         }
     }
 }
 
 fn empty_view_model(
     section: SystemUsageSection,
+    accessibility_state: SystemUsageAccessibilityState,
     status: &str,
     history: &UsageHistory,
 ) -> SystemUsageViewModel {
     let points = history.points.iter().copied().collect::<Vec<_>>();
     SystemUsageViewModel {
         section,
+        accessibility_state,
         primary_value: "—".to_owned(),
         secondary_value: String::new(),
         status: status.to_owned(),
@@ -949,4 +1130,12 @@ fn format_bytes(bytes: u64) -> String {
         format!("{value:.1}").replace('.', ",")
     };
     format!("{formatted} {unit}")
+}
+
+fn elapsed_age(now: Duration, observed_at: Duration) -> String {
+    let seconds = now.saturating_sub(observed_at).as_secs();
+    match seconds {
+        1 => "há 1 s".to_owned(),
+        seconds => format!("há {seconds} s"),
+    }
 }
