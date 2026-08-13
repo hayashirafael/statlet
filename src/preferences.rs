@@ -15,6 +15,58 @@ use crate::indicator_preferences::{
 
 const CURRENT_VERSION: u8 = 2;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreferencesCommitState {
+    NotCommitted,
+    Committed,
+}
+
+#[derive(Debug)]
+pub struct PreferencesSaveError {
+    commit_state: PreferencesCommitState,
+    source: io::Error,
+}
+
+impl PreferencesSaveError {
+    fn new(commit_state: PreferencesCommitState, source: io::Error) -> Self {
+        Self {
+            commit_state,
+            source,
+        }
+    }
+
+    fn not_committed(source: io::Error) -> Self {
+        Self::new(PreferencesCommitState::NotCommitted, source)
+    }
+
+    fn committed(source: io::Error) -> Self {
+        Self::new(PreferencesCommitState::Committed, source)
+    }
+
+    pub const fn commit_state(&self) -> PreferencesCommitState {
+        self.commit_state
+    }
+}
+
+impl std::fmt::Display for PreferencesSaveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.commit_state {
+            PreferencesCommitState::NotCommitted => write!(formatter, "{}", self.source),
+            PreferencesCommitState::Committed => write!(
+                formatter,
+                "as preferências foram substituídas, mas a sincronização do diretório falhou: {}",
+                self.source
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PreferencesSaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PreferencesStore {
     path: PathBuf,
@@ -52,18 +104,30 @@ impl PreferencesStore {
             .unwrap_or_default()
     }
 
-    pub fn save(&self, preferences: Preferences) -> io::Result<()> {
+    pub fn save(&self, preferences: Preferences) -> Result<(), PreferencesSaveError> {
+        self.save_with_directory_sync(preferences, |parent| File::open(parent)?.sync_all())
+    }
+
+    fn save_with_directory_sync(
+        &self,
+        preferences: Preferences,
+        sync_directory: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Result<(), PreferencesSaveError> {
         let parent = self.path.parent().ok_or_else(|| {
-            io::Error::new(
+            PreferencesSaveError::not_committed(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "preferences path has no parent",
-            )
+            ))
         })?;
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(PreferencesSaveError::not_committed)?;
 
         let temporary_path = temporary_path(&self.path);
-        let result = self.write_and_replace(parent, &temporary_path, preferences);
-        if result.is_err() {
+        let result =
+            self.write_and_replace(&temporary_path, preferences, || sync_directory(parent));
+        if result
+            .as_ref()
+            .is_err_and(|error| error.commit_state() == PreferencesCommitState::NotCommitted)
+        {
             let _ = fs::remove_file(&temporary_path);
         }
         result
@@ -71,27 +135,35 @@ impl PreferencesStore {
 
     fn write_and_replace(
         &self,
-        parent: &Path,
         temporary_path: &Path,
         preferences: Preferences,
-    ) -> io::Result<()> {
+        sync_directory: impl FnOnce() -> io::Result<()>,
+    ) -> Result<(), PreferencesSaveError> {
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(temporary_path)?;
+            .open(temporary_path)
+            .map_err(PreferencesSaveError::not_committed)?;
         let stored = StoredPreferencesV2::from(preferences);
-        serde_json::to_writer_pretty(&mut file, &stored).map_err(io::Error::other)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::rename(temporary_path, &self.path)?;
-        File::open(parent)?.sync_all()
+        serde_json::to_writer_pretty(&mut file, &stored)
+            .map_err(io::Error::other)
+            .map_err(PreferencesSaveError::not_committed)?;
+        file.write_all(b"\n")
+            .map_err(PreferencesSaveError::not_committed)?;
+        file.sync_all()
+            .map_err(PreferencesSaveError::not_committed)?;
+        fs::rename(temporary_path, &self.path).map_err(PreferencesSaveError::not_committed)?;
+        sync_directory().map_err(PreferencesSaveError::committed)
     }
 }
 
 #[cfg(test)]
 mod location_tests {
-    use super::PreferencesStore;
+    use super::{PreferencesCommitState, PreferencesStore};
+    use crate::core::{Preferences, WarningThreshold};
+    use std::io;
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[test]
     fn explicit_preferences_path_does_not_depend_on_home() {
@@ -110,6 +182,44 @@ mod location_tests {
             store.path,
             PathBuf::from("/Users/example/Library/Application Support/Statlet/preferences.json")
         );
+    }
+
+    #[test]
+    fn parent_sync_failure_after_rename_reports_the_new_document_as_committed() {
+        let directory = tempdir().unwrap();
+        let store = PreferencesStore::new(directory.path().join("preferences.json"));
+        let previous = Preferences::default();
+        let committed = Preferences {
+            warning_threshold: WarningThreshold::try_from(85).unwrap(),
+            ..Preferences::default()
+        };
+        store.save(previous).unwrap();
+
+        let error = store
+            .save_with_directory_sync(committed.clone(), |_| {
+                Err(io::Error::other("fault injected after preferences rename"))
+            })
+            .unwrap_err();
+
+        assert_eq!(error.commit_state(), PreferencesCommitState::Committed);
+        assert_eq!(store.load(), committed);
+        assert!(error
+            .to_string()
+            .contains("fault injected after preferences rename"));
+    }
+
+    #[test]
+    fn rename_failure_reports_not_committed_and_removes_the_temporary_document() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
+        std::fs::create_dir(&path).unwrap();
+        let store = PreferencesStore::new(path.clone());
+
+        let error = store.save(Preferences::default()).unwrap_err();
+
+        assert_eq!(error.commit_state(), PreferencesCommitState::NotCommitted);
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }
 

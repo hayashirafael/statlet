@@ -174,6 +174,28 @@ fn changing_identifier_mode_cancels_an_in_flight_png_import() {
 }
 
 #[test]
+fn explicitly_reselecting_the_active_mode_cancels_an_in_flight_png_import() {
+    let mut app = StatletCore::new();
+    app.handle(AppEvent::ChooseMetricPng {
+        metric: MetricKind::Cpu,
+        source: PathBuf::from("/tmp/slow.png"),
+    });
+
+    let effects = app.handle(AppEvent::UpdateIndicator(
+        statlet::core::IndicatorPreferenceChange::SetMetricIdentifierMode {
+            metric: MetricKind::Cpu,
+            mode: MetricIdentifierMode::Text,
+        },
+    ));
+
+    assert_eq!(
+        effects,
+        vec![AppEffect::CancelMetricPngImport(MetricKind::Cpu)]
+    );
+    assert!(!app.state().indicator_icon_pending(MetricKind::Cpu));
+}
+
+#[test]
 fn choosing_another_png_invalidates_the_in_flight_import_before_starting_the_reselection() {
     let mut app = StatletCore::new();
     app.handle(AppEvent::ChooseMetricPng {

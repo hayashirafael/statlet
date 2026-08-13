@@ -104,3 +104,35 @@ Os dois P2 do review final foram reproduzidos no checkpoint `6c5781e` e fechados
 - `rtk git diff --check` — aprovado.
 - `rtk bash -n scripts/*.sh tests/package_contract.sh` — aprovado.
 - `rtk bash tests/package_contract.sh` — contrato completo do bundle aprovado para arm64/macOS 14+, com assinatura ad hoc hardened runtime, privacy manifest, notices, ZIP e checksum.
+
+## Atomicidade final — Task `task_4a28c6dbc579`
+
+Os dois P2 identificados sobre o checkpoint `7443bf6` foram reproduzidos e corrigidos sem alterações visuais:
+
+- a ação AppKit de modo continua emitindo `SetMetricIdentifierMode` em toda seleção explícita. O reducer agora trata a reseleção do modo já ativo como no-op apenas para preferências, mas ainda emite `CancelMetricPngImport` quando há processamento pendente. O runtime avança a geração e rejeita o completion anterior;
+- `PreferencesStore::save` distingue `NotCommitted` de `Committed`. Falhas anteriores ou no próprio rename continuam acionando rollback do asset; falha no `fsync` do diretório após o rename informa que o JSON novo já foi confirmado logicamente;
+- no caso pós-rename, o runtime confirma a transação do PNG em vez de restaurar somente o asset, mantém o documento pendente para retry, marca o save como falha de durabilidade e expõe o alerta no erro da métrica. Assim, JSON, estado em memória e PNG permanecem apontando para a mesma versão sem declarar durabilidade inexistente.
+
+### Ciclos RED → GREEN
+
+- RED: `explicitly_reselecting_the_active_mode_cancels_an_in_flight_png_import` recebeu `[]` em vez de `CancelMetricPngImport(Cpu)`; GREEN: a reseleção cancela sem redesenhar nem salvar preferências inalteradas.
+- RED: o teste pós-rename não compilava porque o store não classificava commit nem oferecia o ponto de fault injection; GREEN: o fault injection falha exatamente na sincronização do diretório posterior ao rename, retorna `Committed` e `load()` lê o documento novo.
+- RED: o runtime não aceitava um resultado de persistência pós-commit distinto; GREEN: `post_rename_preferences_failure_keeps_json_asset_and_runtime_state_aligned` prova JSON novo, PNG novo, estado novo, save `Failed` com documento pendente para retry, transação finalizada e alerta útil.
+- Cobertura adicional comprova que falha de rename é `NotCommitted`, remove o temporário e preserva o destino, e que cancelar uma importação invalida a geração usada para filtrar completion obsoleto.
+
+### Evidências frescas
+
+- `rtk cargo test --test indicator_png_flow --test preferences_store --bin statlet` — 92 testes aprovados em 3 suítes.
+- `rtk cargo test --lib preferences::location_tests` — 4 testes de classificação/fault injection aprovados.
+- `rtk cargo test` — 261 testes aprovados em 27 suítes.
+- `rtk cargo clippy --all-targets -- -D warnings` — sem achados.
+- `rtk cargo fmt --check` — aprovado.
+- `rtk git diff --check` — aprovado.
+- `rtk bash -n scripts/*.sh tests/package_contract.sh` — aprovado.
+- `rtk bash tests/package_contract.sh` — contrato completo do bundle aprovado para arm64/macOS 14+, com assinatura ad hoc hardened runtime, privacy manifest, notices, ZIP e checksum.
+
+### Limites e preservação
+
+- Não houve alteração de layout, assets ou artefatos do QA visual. A avaliação visual vigente de 9,3/10 continua aplicável ao mesmo layout.
+- `.superpowers/sdd/2026-08-13-icon-option/visual-qa.md` e `.superpowers/sdd/2026-08-13-icon-option/visual-qa/` permaneceram não rastreados e intocados.
+- Nenhum app foi aberto ou ativado; produção, dados reais, push e PR ficaram fora do escopo.

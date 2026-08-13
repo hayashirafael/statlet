@@ -590,6 +590,12 @@ impl StatletCore {
             }
             AppEvent::UpdateIndicator(change) => {
                 let previous_interval = self.state.preferences.indicator.refresh_interval;
+                let explicit_identifier_mode_metric = match &change {
+                    IndicatorPreferenceChange::SetMetricIdentifierMode { metric, .. } => {
+                        Some(*metric)
+                    }
+                    _ => None,
+                };
                 let identifier_metric = match &change {
                     IndicatorPreferenceChange::SetMetricIdentifierMode { metric, .. }
                     | IndicatorPreferenceChange::SetMetricSystemSymbol { metric, .. }
@@ -599,7 +605,9 @@ impl StatletCore {
                     _ => None,
                 };
                 if !change.apply(&mut self.state.preferences.indicator) {
-                    return Vec::new();
+                    return explicit_identifier_mode_metric
+                        .map(|metric| self.cancel_pending_png_imports([metric]))
+                        .unwrap_or_default();
                 }
                 if let Some(metric) = identifier_metric {
                     self.state.indicator_icon_errors[metric_index(metric)] = None;
