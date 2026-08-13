@@ -2,15 +2,16 @@ use std::cell::RefCell;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAccessibility, NSButton, NSColorWell, NSControlStateValueOn, NSLayoutConstraint,
-    NSPopUpButton, NSScrollView, NSSegmentSwitchTracking, NSSegmentedControl, NSStackView,
-    NSTextField, NSView, NSWindow, NSWindowDelegate,
+    NSAccessibility, NSButton, NSColorWell, NSControlStateValueOn, NSControlTextEditingDelegate,
+    NSPopUpButton, NSScrollView, NSSegmentedControl, NSStackView, NSTableColumn, NSTableView,
+    NSTableViewDataSource, NSTableViewDelegate, NSTableViewStyle, NSTextField,
+    NSUserInterfaceItemIdentifier, NSView, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint,
-    NSRect, NSSize,
+    ns_string, MainThreadMarker, NSIndexSet, NSInteger, NSNotification, NSObject, NSObjectProtocol,
+    NSPoint, NSRect, NSSize,
 };
 use statlet::core::{AppEvent, AppState, PreferencesSaveStatus, WarningThreshold};
 use statlet::indicator_preferences::IndicatorPreferences;
@@ -33,6 +34,23 @@ pub(super) enum PreferencesArea {
     #[default]
     Indicator,
     DiskAndMole,
+}
+
+impl PreferencesArea {
+    const fn from_sidebar_row(row: NSInteger) -> Option<Self> {
+        match row {
+            0 => Some(Self::Indicator),
+            1 => Some(Self::DiskAndMole),
+            _ => None,
+        }
+    }
+
+    const fn sidebar_label(self) -> &'static str {
+        match self {
+            Self::Indicator => "Indicador",
+            Self::DiskAndMole => "Disco e Mole",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -80,11 +98,15 @@ impl PreferencesShellContract {
     }
 
     pub(super) const fn content_size(self) -> (f64, f64) {
-        (680.0, 700.0)
+        (860.0, 700.0)
     }
 
-    pub(super) const fn selector_labels(self) -> [&'static str; 2] {
-        ["Indicador", "Disco e Mole"]
+    pub(super) const fn sidebar_width(self) -> f64 {
+        180.0
+    }
+
+    pub(super) const fn sidebar_accessibility_identifier(self) -> &'static str {
+        "preferences.sidebar"
     }
 
     pub(super) const fn placement(self, region: PreferencesRegion) -> RegionPlacement {
@@ -135,6 +157,9 @@ struct PreferencesControlTargetIvars {
     state: RefCell<PreferencesAreaState>,
     indicator: Retained<NSView>,
     disk_and_mole: Retained<NSView>,
+    indicator_first_key: Retained<NSSegmentedControl>,
+    disk_and_mole_first_key: Retained<NSButton>,
+    sidebar: RefCell<Option<Retained<NSTableView>>>,
     color_wells: Vec<Retained<NSColorWell>>,
 }
 
@@ -145,31 +170,6 @@ define_class!(
     struct PreferencesControlTarget;
 
     unsafe impl NSObjectProtocol for PreferencesControlTarget {}
-
-    impl PreferencesControlTarget {
-        #[unsafe(method(changePreferencesArea:))]
-        fn change_preferences_area(&self, sender: &NSSegmentedControl) {
-            let area = if sender.selectedSegment() == 1 {
-                PreferencesArea::DiskAndMole
-            } else {
-                PreferencesArea::Indicator
-            };
-            let state = self.ivars().state.borrow().select(area);
-            self.ivars().state.replace(state);
-            let visible = state.visible();
-            if visible == PreferencesArea::DiskAndMole {
-                for well in &self.ivars().color_wells {
-                    well.deactivate();
-                }
-            }
-            self.ivars()
-                .indicator
-                .setHidden(!state.is_visible(PreferencesArea::Indicator));
-            self.ivars()
-                .disk_and_mole
-                .setHidden(visible != PreferencesArea::DiskAndMole);
-        }
-    }
 );
 
 impl PreferencesControlTarget {
@@ -177,15 +177,154 @@ impl PreferencesControlTarget {
         mtm: MainThreadMarker,
         indicator: Retained<NSView>,
         disk_and_mole: Retained<NSView>,
+        indicator_first_key: Retained<NSSegmentedControl>,
+        disk_and_mole_first_key: Retained<NSButton>,
         color_wells: Vec<Retained<NSColorWell>>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(PreferencesControlTargetIvars {
             state: RefCell::new(PreferencesAreaState::new()),
             indicator,
             disk_and_mole,
+            indicator_first_key,
+            disk_and_mole_first_key,
+            sidebar: RefCell::new(None),
             color_wells,
         });
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn set_sidebar(&self, sidebar: Retained<NSTableView>) {
+        self.ivars().sidebar.replace(Some(sidebar));
+        self.select_area(self.ivars().state.borrow().visible());
+    }
+
+    fn select_area(&self, area: PreferencesArea) {
+        let state = self.ivars().state.borrow().select(area);
+        self.ivars().state.replace(state);
+        let visible = state.visible();
+        if visible == PreferencesArea::DiskAndMole {
+            for well in &self.ivars().color_wells {
+                well.deactivate();
+            }
+        }
+        self.ivars()
+            .indicator
+            .setHidden(!state.is_visible(PreferencesArea::Indicator));
+        self.ivars()
+            .disk_and_mole
+            .setHidden(visible != PreferencesArea::DiskAndMole);
+        if let Some(sidebar) = self.ivars().sidebar.borrow().as_deref() {
+            unsafe {
+                match visible {
+                    PreferencesArea::Indicator => {
+                        sidebar.setNextKeyView(Some(&self.ivars().indicator_first_key))
+                    }
+                    PreferencesArea::DiskAndMole => {
+                        sidebar.setNextKeyView(Some(&self.ivars().disk_and_mole_first_key))
+                    }
+                }
+            }
+        }
+    }
+}
+
+define_class!(
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = ()]
+    struct PreferencesSidebarDataSource;
+
+    unsafe impl NSObjectProtocol for PreferencesSidebarDataSource {}
+
+    unsafe impl NSTableViewDataSource for PreferencesSidebarDataSource {
+        #[unsafe(method(numberOfRowsInTableView:))]
+        fn number_of_rows_in_table_view(&self, _table: &NSTableView) -> NSInteger {
+            2
+        }
+    }
+);
+
+impl PreferencesSidebarDataSource {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+struct PreferencesSidebarDelegateIvars {
+    target: Retained<PreferencesControlTarget>,
+    table: Retained<NSTableView>,
+}
+
+define_class!(
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = PreferencesSidebarDelegateIvars]
+    struct PreferencesSidebarDelegate;
+
+    unsafe impl NSObjectProtocol for PreferencesSidebarDelegate {}
+    unsafe impl NSControlTextEditingDelegate for PreferencesSidebarDelegate {}
+
+    unsafe impl NSTableViewDelegate for PreferencesSidebarDelegate {
+        #[unsafe(method_id(tableView:viewForTableColumn:row:))]
+        fn table_view_view_for_table_column_row(
+            &self,
+            _table: &NSTableView,
+            _column: Option<&NSTableColumn>,
+            row: NSInteger,
+        ) -> Option<Retained<NSView>> {
+            let area = PreferencesArea::from_sidebar_row(row)
+                .expect("preferences sidebar requested a known destination row");
+            let label = NSTextField::labelWithString(
+                &objc2_foundation::NSString::from_str(area.sidebar_label()),
+                MainThreadMarker::new().expect("preferences sidebar runs on the main thread"),
+            );
+            label.setFrame(NSRect::new(
+                NSPoint::new(10.0, 4.0),
+                NSSize::new(152.0, 24.0),
+            ));
+            label.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(
+                area.sidebar_label(),
+            )));
+            Some(label.into_super().into_super())
+        }
+
+        #[unsafe(method(tableViewSelectionDidChange:))]
+        fn table_view_selection_did_change(&self, _notification: &NSNotification) {
+            let Some(area) = PreferencesArea::from_sidebar_row(self.ivars().table.selectedRow())
+            else {
+                return;
+            };
+            self.ivars().target.select_area(area);
+        }
+    }
+);
+
+impl PreferencesSidebarDelegate {
+    fn new(
+        mtm: MainThreadMarker,
+        target: Retained<PreferencesControlTarget>,
+        table: Retained<NSTableView>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(PreferencesSidebarDelegateIvars { target, table });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+struct PreferencesSidebar {
+    _scroll: Retained<NSScrollView>,
+    table: Retained<NSTableView>,
+    _data_source: Retained<PreferencesSidebarDataSource>,
+    _delegate: Retained<PreferencesSidebarDelegate>,
+}
+
+impl PreferencesSidebar {
+    fn table(&self) -> &NSTableView {
+        &self.table
+    }
+
+    fn view(&self) -> &NSScrollView {
+        &self._scroll
     }
 }
 
@@ -311,7 +450,7 @@ impl PreferencesFooter {
 pub(super) struct PreferencesWindow {
     pub(super) window: Retained<NSWindow>,
     _host: Retained<PreferencesWindowHost>,
-    _area_selector: Retained<NSSegmentedControl>,
+    _sidebar: PreferencesSidebar,
     indicator: IndicatorPage,
     disk_and_mole: DiskAndMolePage,
     _footer: PreferencesFooter,
@@ -336,7 +475,7 @@ impl PreferencesWindow {
             .expect("preferences window content view");
 
         let indicator = create_indicator_page(mtm, contract, target.event_proxy());
-        let disk_and_mole = create_disk_and_mole_page(mtm, target);
+        let disk_and_mole = create_disk_and_mole_page(mtm, contract, target);
         disk_and_mole.root.setHidden(true);
         content.addSubview(&indicator.root);
         content.addSubview(&disk_and_mole.root);
@@ -345,46 +484,21 @@ impl PreferencesWindow {
             mtm,
             indicator.root.clone(),
             disk_and_mole.root.clone(),
+            indicator.controls.first_key_view().retain(),
+            disk_and_mole.mole_checkbox.clone(),
             indicator.controls.wells(),
         );
-        let labels = contract.selector_labels();
-        let label_strings = [
-            objc2_foundation::NSString::from_str(labels[0]),
-            objc2_foundation::NSString::from_str(labels[1]),
-        ];
-        let label_refs = [&*label_strings[0], &*label_strings[1]];
-        let area_selector = unsafe {
-            NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
-                &NSArray::from_slice(&label_refs),
-                NSSegmentSwitchTracking::SelectOne,
-                Some(&*area_target as &AnyObject),
-                Some(sel!(changePreferencesArea:)),
-                mtm,
-            )
-        };
-        area_selector.setSelectedSegment(0);
-        area_selector.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(
-            contract.accessibility_identifiers()[0],
-        )));
-        area_selector.setTranslatesAutoresizingMaskIntoConstraints(false);
-        content.addSubview(&area_selector);
-        let constraints = NSArray::from_retained_slice(&[
-            area_selector
-                .centerXAnchor()
-                .constraintEqualToAnchor(&content.centerXAnchor()),
-            area_selector
-                .topAnchor()
-                .constraintEqualToAnchor_constant(&content.topAnchor(), -20.0),
-            area_selector.widthAnchor().constraintEqualToConstant(260.0),
-            area_selector.heightAnchor().constraintEqualToConstant(28.0),
-        ]);
-        NSLayoutConstraint::activateConstraints(&constraints);
+        let sidebar = create_preferences_sidebar(mtm, contract, area_target.clone());
+        area_target.set_sidebar(sidebar.table.clone());
+        content.addSubview(sidebar.view());
 
         let footer = create_footer(mtm, contract, &indicator.root, target);
         unsafe {
-            area_selector.setNextKeyView(Some(indicator.controls.first_key_view()));
+            sidebar
+                .table()
+                .setNextKeyView(Some(indicator.controls.first_key_view()));
         }
-        window.setInitialFirstResponder(Some(&area_selector));
+        window.setInitialFirstResponder(Some(sidebar.table()));
         let delegate =
             PreferencesWindowDelegate::new(mtm, indicator.controls.wells(), target.event_proxy());
         window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -392,7 +506,7 @@ impl PreferencesWindow {
         Self {
             window,
             _host: host,
-            _area_selector: area_selector,
+            _sidebar: sidebar,
             indicator,
             disk_and_mole,
             _footer: footer,
@@ -444,18 +558,20 @@ impl PreferencesWindow {
             } else {
                 self._footer
                     .reset_all
-                    .setNextKeyView(Some(&self._area_selector));
+                    .setNextKeyView(Some(self._sidebar.table()));
             }
             if footer.retry_visible {
                 self._footer
                     .undo
                     .setNextKeyView(Some(&self._footer.retry_save));
             } else {
-                self._footer.undo.setNextKeyView(Some(&self._area_selector));
+                self._footer
+                    .undo
+                    .setNextKeyView(Some(self._sidebar.table()));
             }
             self._footer
                 .retry_save
-                .setNextKeyView(Some(&self._area_selector));
+                .setNextKeyView(Some(self._sidebar.table()));
         }
     }
 
@@ -493,7 +609,10 @@ fn create_indicator_page(
 ) -> IndicatorPage {
     let root = NSView::initWithFrame(
         NSView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(680.0, 640.0)),
+        NSRect::new(
+            NSPoint::new(contract.sidebar_width(), 0.0),
+            NSSize::new(680.0, 640.0),
+        ),
     );
 
     let identifiers = contract.accessibility_identifiers();
@@ -645,10 +764,75 @@ fn footer_button(
     button
 }
 
-fn create_disk_and_mole_page(mtm: MainThreadMarker, target: &ControlTarget) -> DiskAndMolePage {
+fn create_preferences_sidebar(
+    mtm: MainThreadMarker,
+    contract: PreferencesShellContract,
+    target: Retained<PreferencesControlTarget>,
+) -> PreferencesSidebar {
+    let (_, height) = contract.content_size();
+    let scroll = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
+        NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(contract.sidebar_width(), height),
+        ),
+    );
+    scroll.setHasVerticalScroller(false);
+    scroll.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(
+        contract.accessibility_identifiers()[0],
+    )));
+    scroll.setAccessibilityLabel(Some(ns_string!("Áreas de preferências")));
+
+    let table = NSTableView::initWithFrame(
+        NSTableView::alloc(mtm),
+        NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(contract.sidebar_width(), height),
+        ),
+    );
+    table.setStyle(NSTableViewStyle::SourceList);
+    table.setAllowsMultipleSelection(false);
+    table.setAllowsEmptySelection(false);
+    table.setRowHeight(32.0);
+    table.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(
+        contract.sidebar_accessibility_identifier(),
+    )));
+    table.setAccessibilityLabel(Some(ns_string!("Áreas de preferências")));
+    let column = NSTableColumn::initWithIdentifier(
+        NSTableColumn::alloc(mtm),
+        &NSUserInterfaceItemIdentifier::from_str("preferences.sidebar.destination"),
+    );
+    column.setWidth(contract.sidebar_width());
+    table.addTableColumn(&column);
+
+    let data_source = PreferencesSidebarDataSource::new(mtm);
+    let delegate = PreferencesSidebarDelegate::new(mtm, target, table.clone());
+    unsafe {
+        table.setDataSource(Some(ProtocolObject::from_ref(&*data_source)));
+        table.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    }
+    table.selectRowIndexes_byExtendingSelection(&NSIndexSet::indexSetWithIndex(0), false);
+    scroll.setDocumentView(Some(&table));
+
+    PreferencesSidebar {
+        _scroll: scroll,
+        table,
+        _data_source: data_source,
+        _delegate: delegate,
+    }
+}
+
+fn create_disk_and_mole_page(
+    mtm: MainThreadMarker,
+    contract: PreferencesShellContract,
+    target: &ControlTarget,
+) -> DiskAndMolePage {
     let root = NSView::initWithFrame(
         NSView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(680.0, 640.0)),
+        NSRect::new(
+            NSPoint::new(contract.sidebar_width(), 0.0),
+            NSSize::new(680.0, 640.0),
+        ),
     );
     let content = NSView::initWithFrame(
         NSView::alloc(mtm),
@@ -765,11 +949,35 @@ mod tests {
     }
 
     #[test]
-    fn preferences_shell_contract_has_exact_size_and_selector_labels() {
+    fn preferences_shell_contract_has_exact_size_and_sidebar_labels() {
         let contract = PreferencesShellContract::new();
 
-        assert_eq!(contract.content_size(), (680.0, 700.0));
-        assert_eq!(contract.selector_labels(), ["Indicador", "Disco e Mole"]);
+        assert_eq!(contract.content_size(), (860.0, 700.0));
+        assert_eq!(PreferencesArea::Indicator.sidebar_label(), "Indicador");
+        assert_eq!(PreferencesArea::DiskAndMole.sidebar_label(), "Disco e Mole");
+    }
+
+    #[test]
+    fn preferences_shell_contract_exposes_a_stable_keyboard_navigable_sidebar() {
+        let contract = PreferencesShellContract::new();
+
+        assert_eq!(contract.content_size(), (860.0, 700.0));
+        assert_eq!(contract.sidebar_width(), 180.0);
+        assert_eq!(PreferencesArea::Indicator.sidebar_label(), "Indicador");
+        assert_eq!(PreferencesArea::DiskAndMole.sidebar_label(), "Disco e Mole");
+        assert_eq!(
+            contract.sidebar_accessibility_identifier(),
+            "preferences.sidebar"
+        );
+        assert_eq!(
+            PreferencesArea::from_sidebar_row(0),
+            Some(PreferencesArea::Indicator)
+        );
+        assert_eq!(
+            PreferencesArea::from_sidebar_row(1),
+            Some(PreferencesArea::DiskAndMole)
+        );
+        assert_eq!(PreferencesArea::from_sidebar_row(2), None);
     }
 
     #[test]
