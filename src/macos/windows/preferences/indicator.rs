@@ -5,8 +5,8 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSAccessibility, NSButton, NSColor, NSColorWell, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSFont, NSSegmentSwitchTracking, NSSegmentedControl, NSStackView,
-    NSStepper, NSTextField, NSTextFieldDelegate, NSView,
+    NSControlTextEditingDelegate, NSFont, NSSegmentSwitchTracking, NSSegmentedControl, NSSlider,
+    NSStackView, NSStepper, NSTextField, NSTextFieldDelegate, NSView,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint,
@@ -25,7 +25,10 @@ use tao::event_loop::EventLoopProxy;
 
 use super::color_editor::{ColorBinding, ColorEditor};
 use super::font_picker::FontPicker;
-use super::{IndicatorFontFallback, IndicatorLayoutDiagnostics};
+use super::{
+    configure_discrete_slider, font_size_slider_contract, label_spacing_slider_contract,
+    IndicatorFontFallback, IndicatorLayoutDiagnostics, PreferencesArea,
+};
 use crate::macos::fonts::FontCatalog;
 use crate::macos::RuntimeEvent;
 
@@ -41,8 +44,10 @@ struct IndicatorControlsTargetIvars {
     selected_label_spacing: Cell<LabelSpacing>,
     cpu_label_field: Retained<NSTextField>,
     ram_label_field: Retained<NSTextField>,
-    label_spacing_field: Retained<NSTextField>,
-    font_size: Retained<NSTextField>,
+    label_spacing: Retained<NSSlider>,
+    label_spacing_value: Retained<NSTextField>,
+    font_size: Retained<NSSlider>,
+    font_size_value: Retained<NSTextField>,
     interval_field: Retained<NSTextField>,
     interval_stepper: Retained<NSStepper>,
     interval_error: Retained<NSTextField>,
@@ -55,6 +60,35 @@ struct FontResources {
 
 fn get_or_create_font_resources<T>(slot: &mut Option<T>, create: impl FnOnce() -> T) -> &mut T {
     slot.get_or_insert_with(create)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct IndicatorAreaVisibility {
+    colors: bool,
+    labels: bool,
+    typography: bool,
+    refresh: bool,
+}
+
+impl IndicatorAreaVisibility {
+    const fn new(colors: bool, labels: bool, typography: bool, refresh: bool) -> Self {
+        Self {
+            colors,
+            labels,
+            typography,
+            refresh,
+        }
+    }
+
+    pub(super) const fn for_area(area: PreferencesArea) -> Self {
+        match area {
+            PreferencesArea::Colors => Self::new(true, false, false, false),
+            PreferencesArea::Labels => Self::new(false, true, false, false),
+            PreferencesArea::Typography => Self::new(false, false, true, false),
+            PreferencesArea::Refresh => Self::new(false, false, false, true),
+            PreferencesArea::DiskAndMole => Self::new(false, false, false, false),
+        }
+    }
 }
 
 define_class!(
@@ -119,9 +153,9 @@ define_class!(
             self.commit_label(sender, MetricKind::Ram, true);
         }
 
-        #[unsafe(method(commitLabelSpacing:))]
-        fn commit_label_spacing_action(&self, sender: &NSTextField) {
-            self.commit_label_spacing(sender, true);
+        #[unsafe(method(changeLabelSpacing:))]
+        fn change_label_spacing(&self, sender: &NSSlider) {
+            self.apply_label_spacing(sender.integerValue());
         }
 
         #[unsafe(method(openFontPicker:))]
@@ -144,9 +178,9 @@ define_class!(
                 .present(&parent, &resources.catalog, &selected);
         }
 
-        #[unsafe(method(commitFontSize:))]
-        fn commit_font_size_action(&self, sender: &NSTextField) {
-            self.commit_font_size(sender);
+        #[unsafe(method(changeFontSize:))]
+        fn change_font_size(&self, sender: &NSSlider) {
+            self.apply_font_size(sender.integerValue());
         }
 
         #[unsafe(method(changeFontWeight:))]
@@ -196,16 +230,12 @@ define_class!(
             let Some(field) = notification_text_field(notification) else {
                 return;
             };
-            if std::ptr::eq(&*field, &*self.ivars().font_size) {
-                self.commit_font_size(&field);
-            } else if std::ptr::eq(&*field, &*self.ivars().interval_field) {
+            if std::ptr::eq(&*field, &*self.ivars().interval_field) {
                 self.commit_refresh_interval(&field);
             } else if std::ptr::eq(&*field, &*self.ivars().cpu_label_field) {
                 self.commit_label(&field, MetricKind::Cpu, true);
             } else if std::ptr::eq(&*field, &*self.ivars().ram_label_field) {
                 self.commit_label(&field, MetricKind::Ram, true);
-            } else if std::ptr::eq(&*field, &*self.ivars().label_spacing_field) {
-                self.commit_label_spacing(&field, true);
             }
         }
 
@@ -221,8 +251,6 @@ define_class!(
                 self.commit_label(&field, MetricKind::Cpu, false);
             } else if std::ptr::eq(&*field, &*self.ivars().ram_label_field) {
                 self.commit_label(&field, MetricKind::Ram, false);
-            } else if std::ptr::eq(&*field, &*self.ivars().label_spacing_field) {
-                self.commit_label_spacing(&field, false);
             }
         }
     }
@@ -262,26 +290,24 @@ impl IndicatorControlsTarget {
         }
     }
 
-    fn commit_font_size(&self, field: &NSTextField) {
+    fn apply_font_size(&self, value: isize) {
         if self.ivars().applying.get() {
             return;
         }
-        let size = field
-            .stringValue()
-            .to_string()
-            .trim()
-            .parse::<u8>()
+        let size = u8::try_from(value)
             .ok()
             .and_then(|points| FontSize::try_from(points).ok());
         let Some(size) = size else {
-            field.setStringValue(&objc2_foundation::NSString::from_str(
-                &self.ivars().selected_font_size.get().points().to_string(),
-            ));
+            self.ivars()
+                .font_size
+                .setIntegerValue(self.ivars().selected_font_size.get().points().into());
             return;
         };
-        field.setStringValue(&objc2_foundation::NSString::from_str(
-            &size.points().to_string(),
-        ));
+        set_slider_value_text(
+            &self.ivars().font_size,
+            &self.ivars().font_size_value,
+            &format!("{} pt", size.points()),
+        );
         if size != self.ivars().selected_font_size.replace(size) {
             self.send(IndicatorPreferenceChange::SetFontSize(size));
         }
@@ -342,35 +368,29 @@ impl IndicatorControlsTarget {
         }
     }
 
-    fn commit_label_spacing(&self, field: &NSTextField, restore_invalid: bool) {
+    fn apply_label_spacing(&self, value: isize) {
         if self.ivars().applying.get() {
             return;
         }
-        let spacing = field
-            .stringValue()
-            .to_string()
-            .trim()
-            .parse::<u8>()
+        let spacing = u8::try_from(value)
             .ok()
             .and_then(|value| LabelSpacing::try_from(value).ok());
         let Some(spacing) = spacing else {
-            if restore_invalid {
-                field.setStringValue(&objc2_foundation::NSString::from_str(
-                    &self
-                        .ivars()
-                        .selected_label_spacing
-                        .get()
-                        .spaces()
-                        .to_string(),
-                ));
-            }
+            self.ivars().label_spacing.setIntegerValue(
+                isize::try_from(self.ivars().selected_label_spacing.get().spaces())
+                    .expect("label spacing fits NSInteger"),
+            );
             return;
         };
-        if restore_invalid {
-            field.setStringValue(&objc2_foundation::NSString::from_str(
-                &spacing.spaces().to_string(),
-            ));
-        }
+        let value = match spacing.spaces() {
+            1 => "1 espaço".to_owned(),
+            spaces => format!("{spaces} espaços"),
+        };
+        set_slider_value_text(
+            &self.ivars().label_spacing,
+            &self.ivars().label_spacing_value,
+            &value,
+        );
         if spacing != self.ivars().selected_label_spacing.replace(spacing) {
             self.send(IndicatorPreferenceChange::SetLabelSpacing(spacing));
         }
@@ -393,7 +413,8 @@ struct IndicatorLayoutViews {
     ram_label_text: Retained<NSTextField>,
     ram_label_field: Retained<NSTextField>,
     label_spacing_text: Retained<NSTextField>,
-    label_spacing_field: Retained<NSTextField>,
+    label_spacing: Retained<NSSlider>,
+    label_spacing_value: Retained<NSTextField>,
     labels_mode: Retained<NSSegmentedControl>,
     reset_labels: Retained<NSButton>,
     labels_editor: Retained<NSStackView>,
@@ -401,8 +422,8 @@ struct IndicatorLayoutViews {
     family_label: Retained<NSTextField>,
     font_family: Retained<NSButton>,
     size_label: Retained<NSTextField>,
-    font_size: Retained<NSTextField>,
-    points_label: Retained<NSTextField>,
+    font_size: Retained<NSSlider>,
+    font_size_value: Retained<NSTextField>,
     weight_label: Retained<NSTextField>,
     font_weight: Retained<NSSegmentedControl>,
     reset_typography: Retained<NSButton>,
@@ -418,6 +439,39 @@ struct IndicatorLayoutViews {
     interval_error: Retained<NSTextField>,
 }
 
+pub(super) struct IndicatorAreaViews {
+    colors: Retained<NSView>,
+    labels: Retained<NSView>,
+    typography: Retained<NSView>,
+    refresh: Retained<NSView>,
+}
+
+impl IndicatorAreaViews {
+    pub(super) fn set_visible_area(&self, area: PreferencesArea) {
+        let visibility = IndicatorAreaVisibility::for_area(area);
+        self.colors.setHidden(!visibility.colors);
+        self.labels.setHidden(!visibility.labels);
+        self.typography.setHidden(!visibility.typography);
+        self.refresh.setHidden(!visibility.refresh);
+    }
+
+    fn set_frame_size(&self, size: NSSize) {
+        self.colors.setFrameSize(size);
+        self.labels.setFrameSize(size);
+        self.typography.setFrameSize(size);
+        self.refresh.setFrameSize(size);
+    }
+
+    fn retained(&self) -> Self {
+        Self {
+            colors: self.colors.clone(),
+            labels: self.labels.clone(),
+            typography: self.typography.clone(),
+            refresh: self.refresh.clone(),
+        }
+    }
+}
+
 fn set_slot_frame(view: &NSView, x: f64, y: f64, height: f64) {
     view.setFrame(NSRect::new(
         NSPoint::new(x, y),
@@ -425,8 +479,16 @@ fn set_slot_frame(view: &NSView, x: f64, y: f64, height: f64) {
     ));
 }
 
+fn shift_views_y(views: &[&NSView], delta: f64) {
+    for view in views {
+        let mut origin = view.frame().origin;
+        origin.y += delta;
+        view.setFrameOrigin(origin);
+    }
+}
+
 impl IndicatorLayoutViews {
-    fn apply(&self, layout: &IndicatorControlsLayout) {
+    fn apply(&self, layout: &IndicatorControlsLayout) -> f64 {
         let content_height = layout.content_height();
 
         let colors_heading = layout.colors_heading();
@@ -534,8 +596,14 @@ impl IndicatorLayoutViews {
             labels_visibility.height(),
         );
         set_slot_frame(
-            &self.label_spacing_field,
+            &self.label_spacing,
             346.0,
+            labels_visibility_y,
+            labels_visibility.height(),
+        );
+        set_slot_frame(
+            &self.label_spacing_value,
+            502.0,
             labels_visibility_y,
             labels_visibility.height(),
         );
@@ -588,7 +656,7 @@ impl IndicatorLayoutViews {
             size_y,
             size_row.height(),
         );
-        set_slot_frame(&self.points_label, 166.0, size_y, size_row.height());
+        set_slot_frame(&self.font_size_value, 348.0, size_y, size_row.height());
         let weight_row = layout.weight_row();
         let weight_y = weight_row.origin_y(content_height);
         set_slot_frame(
@@ -672,11 +740,93 @@ impl IndicatorLayoutViews {
             interval_error.origin_y(content_height),
             interval_error.height(),
         );
+
+        let colors_start = layout.colors_heading().top();
+        let colors_end = layout
+            .ram_editor()
+            .unwrap_or(layout.ram_row().vertical())
+            .bottom();
+        let labels_start = layout.labels_heading().top();
+        let labels_end = layout
+            .labels_editor()
+            .unwrap_or(layout.labels_mode_row().vertical())
+            .bottom();
+        let typography_start = layout.typography_heading().top();
+        let typography_end = layout.layout_warning().bottom();
+        let refresh_start = layout.update_heading().top();
+        let refresh_end = layout.interval_error().bottom();
+        let page_height = (colors_end - colors_start)
+            .max(labels_end - labels_start)
+            .max(typography_end - typography_start)
+            .max(refresh_end - refresh_start);
+
+        shift_views_y(
+            &[
+                &self.colors_heading,
+                &self.reset_cpu_and_ram,
+                &self.cpu_label,
+                &self.cpu_mode,
+                &self.cpu_editor,
+                &self.ram_label,
+                &self.ram_mode,
+                &self.ram_editor,
+            ],
+            page_height - content_height + colors_start,
+        );
+        shift_views_y(
+            &[
+                &self.labels_heading,
+                &self.labels_visible,
+                &self.cpu_label_text,
+                &self.cpu_label_field,
+                &self.ram_label_text,
+                &self.ram_label_field,
+                &self.label_spacing_text,
+                &self.label_spacing,
+                &self.label_spacing_value,
+                &self.labels_mode,
+                &self.reset_labels,
+                &self.labels_editor,
+            ],
+            page_height - content_height + labels_start,
+        );
+        shift_views_y(
+            &[
+                &self.typography_heading,
+                &self.family_label,
+                &self.font_family,
+                &self.size_label,
+                &self.font_size,
+                &self.font_size_value,
+                &self.weight_label,
+                &self.font_weight,
+                &self.reset_typography,
+                &self.font_fallback_warning,
+                &self.layout_warning,
+            ],
+            page_height - content_height + typography_start,
+        );
+        shift_views_y(
+            &[
+                &self.update_heading,
+                &self.interval_label,
+                &self.interval_field,
+                &self.interval_stepper,
+                &self.seconds_label,
+                &self.reset_refresh_interval,
+                &self.interval_help,
+                &self.interval_error,
+            ],
+            page_height - content_height + refresh_start,
+        );
+
+        page_height
     }
 }
 
 pub(super) struct IndicatorControls {
     view: Retained<NSStackView>,
+    area_views: IndicatorAreaViews,
     layout_views: IndicatorLayoutViews,
     layout_visibility: Cell<Option<IndicatorControlsVisibility>>,
     content_height: Cell<f64>,
@@ -684,10 +834,11 @@ pub(super) struct IndicatorControls {
     reset_cpu_and_ram: Retained<NSButton>,
     ram_mode: Retained<NSSegmentedControl>,
     labels_visible: Retained<NSButton>,
+    label_spacing: Retained<NSSlider>,
     labels_mode: Retained<NSSegmentedControl>,
     reset_labels: Retained<NSButton>,
     font_family: Retained<NSButton>,
-    font_size: Retained<NSTextField>,
+    font_size: Retained<NSSlider>,
     font_weight: Retained<NSSegmentedControl>,
     reset_typography: Retained<NSButton>,
     interval_field: Retained<NSTextField>,
@@ -782,15 +933,18 @@ impl IndicatorControls {
         ram_label_field.setAccessibilityIdentifier(Some(ns_string!("indicator.labels.ram")));
         let label_spacing_text = text_label(mtm, "Esp.", 0.0);
         label_spacing_text.setFrameSize(NSSize::new(42.0, 28.0));
-        let label_spacing_field = NSTextField::initWithFrame(
-            NSTextField::alloc(mtm),
-            NSRect::new(NSPoint::new(346.0, 0.0), NSSize::new(38.0, 28.0)),
+        let label_spacing = NSSlider::initWithFrame(
+            NSSlider::alloc(mtm),
+            NSRect::new(NSPoint::new(346.0, 0.0), NSSize::new(148.0, 28.0)),
         );
-        label_spacing_field.setAccessibilityLabel(Some(ns_string!(
-            "Espaços entre rótulo e percentual, de 0 a 4"
-        )));
-        label_spacing_field
-            .setAccessibilityIdentifier(Some(ns_string!("indicator.labels.spacing")));
+        configure_discrete_slider(&label_spacing, label_spacing_slider_contract());
+        let label_spacing_value = NSTextField::labelWithString(ns_string!("1 espaço"), mtm);
+        label_spacing_value.setFrame(NSRect::new(
+            NSPoint::new(502.0, 0.0),
+            NSSize::new(58.0, 28.0),
+        ));
+        label_spacing_value
+            .setAccessibilityIdentifier(Some(ns_string!("indicator.labels.spacing.value")));
         let labels_mode = segmented(
             mtm,
             &["Neutra", "Igual ao valor", "Personalizada"],
@@ -827,15 +981,17 @@ impl IndicatorControls {
         font_family.setAccessibilityIdentifier(Some(ns_string!("indicator.font.family")));
 
         let size_label = text_label(mtm, "Tamanho", 0.0);
-        let font_size = NSTextField::initWithFrame(
-            NSTextField::alloc(mtm),
-            NSRect::new(NSPoint::new(100.0, 0.0), NSSize::new(58.0, 26.0)),
+        let font_size = NSSlider::initWithFrame(
+            NSSlider::alloc(mtm),
+            NSRect::new(NSPoint::new(100.0, 0.0), NSSize::new(240.0, 28.0)),
         );
-        font_size.setStringValue(ns_string!("12"));
-        font_size.setAccessibilityLabel(Some(ns_string!("Tamanho da fonte em pontos")));
-        font_size.setAccessibilityIdentifier(Some(ns_string!("indicator.font.size")));
-        let points_label = text_label(mtm, "pt", 0.0);
-        points_label.setFrameOrigin(NSPoint::new(166.0, 0.0));
+        configure_discrete_slider(&font_size, font_size_slider_contract());
+        let font_size_value = NSTextField::labelWithString(ns_string!("12 pt"), mtm);
+        font_size_value.setFrame(NSRect::new(
+            NSPoint::new(348.0, 0.0),
+            NSSize::new(58.0, 28.0),
+        ));
+        font_size_value.setAccessibilityIdentifier(Some(ns_string!("indicator.font.size.value")));
 
         let weight_label = text_label(mtm, "Peso", 0.0);
         let font_weight = segmented(
@@ -911,8 +1067,10 @@ impl IndicatorControls {
                 selected_label_spacing: Cell::new(defaults.labels.spacing),
                 cpu_label_field: cpu_label_field.clone(),
                 ram_label_field: ram_label_field.clone(),
-                label_spacing_field: label_spacing_field.clone(),
+                label_spacing: label_spacing.clone(),
+                label_spacing_value: label_spacing_value.clone(),
                 font_size: font_size.clone(),
+                font_size_value: font_size_value.clone(),
                 interval_field: interval_field.clone(),
                 interval_stepper: interval_stepper.clone(),
                 interval_error: interval_error.clone(),
@@ -926,7 +1084,7 @@ impl IndicatorControls {
             &labels_visible,
             &cpu_label_field,
             &ram_label_field,
-            &label_spacing_field,
+            &label_spacing,
             &labels_mode,
             &reset_labels,
             &font_family,
@@ -938,6 +1096,10 @@ impl IndicatorControls {
             &reset_refresh_interval,
         );
 
+        let colors_page = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 0.0)),
+        );
         for child in [
             &*colors_heading as &NSView,
             &*cpu_label,
@@ -947,29 +1109,54 @@ impl IndicatorControls {
             &*ram_label,
             &*ram_mode,
             ram_editor.view(),
-            &*labels_heading,
+        ] {
+            colors_page.addSubview(child);
+        }
+        let labels_page = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 0.0)),
+        );
+        for child in [
+            &*labels_heading as &NSView,
             &*labels_visible,
             &*cpu_label_text,
             &*cpu_label_field,
             &*ram_label_text,
             &*ram_label_field,
             &*label_spacing_text,
-            &*label_spacing_field,
+            &*label_spacing,
+            &*label_spacing_value,
             &*labels_mode,
             &*reset_labels,
             labels_editor.view(),
-            &*typography_heading,
+        ] {
+            labels_page.addSubview(child);
+        }
+        let typography_page = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 0.0)),
+        );
+        for child in [
+            &*typography_heading as &NSView,
             &*family_label,
             &*font_family,
             &*size_label,
             &*font_size,
-            &*points_label,
+            &*font_size_value,
             &*weight_label,
             &*font_weight,
             &*reset_typography,
             &*font_fallback_warning,
             &*layout_warning,
-            &*update_heading,
+        ] {
+            typography_page.addSubview(child);
+        }
+        let refresh_page = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 0.0)),
+        );
+        for child in [
+            &*update_heading as &NSView,
             &*interval_label,
             &*interval_field,
             &*interval_stepper,
@@ -978,7 +1165,21 @@ impl IndicatorControls {
             &*interval_help,
             &*interval_error,
         ] {
-            view.addSubview(child);
+            refresh_page.addSubview(child);
+        }
+        let area_views = IndicatorAreaViews {
+            colors: colors_page,
+            labels: labels_page,
+            typography: typography_page,
+            refresh: refresh_page,
+        };
+        for page in [
+            &*area_views.colors,
+            &*area_views.labels,
+            &*area_views.typography,
+            &*area_views.refresh,
+        ] {
+            view.addSubview(page);
         }
 
         let layout_views = IndicatorLayoutViews {
@@ -997,7 +1198,8 @@ impl IndicatorControls {
             ram_label_text: ram_label_text.clone(),
             ram_label_field: ram_label_field.clone(),
             label_spacing_text: label_spacing_text.clone(),
-            label_spacing_field: label_spacing_field.clone(),
+            label_spacing: label_spacing.clone(),
+            label_spacing_value: label_spacing_value.clone(),
             labels_mode: labels_mode.clone(),
             reset_labels: reset_labels.clone(),
             labels_editor: labels_editor.view().retain(),
@@ -1006,7 +1208,7 @@ impl IndicatorControls {
             font_family: font_family.clone(),
             size_label: size_label.clone(),
             font_size: font_size.clone(),
-            points_label: points_label.clone(),
+            font_size_value: font_size_value.clone(),
             weight_label: weight_label.clone(),
             font_weight: font_weight.clone(),
             reset_typography: reset_typography.clone(),
@@ -1023,6 +1225,7 @@ impl IndicatorControls {
         };
         let controls = Self {
             view,
+            area_views,
             layout_views,
             layout_visibility: Cell::new(None),
             content_height: Cell::new(0.0),
@@ -1030,6 +1233,7 @@ impl IndicatorControls {
             reset_cpu_and_ram,
             ram_mode,
             labels_visible,
+            label_spacing,
             labels_mode,
             reset_labels,
             font_family,
@@ -1045,6 +1249,9 @@ impl IndicatorControls {
             target,
         };
         controls.apply(&IndicatorPreferences::default());
+        controls
+            .area_views()
+            .set_visible_area(PreferencesArea::Colors);
         controls
     }
 
@@ -1093,8 +1300,18 @@ impl IndicatorControls {
             .setStringValue(&objc2_foundation::NSString::from_str(
                 preferences.labels.ram.as_str(),
             ));
-        self.layout_views.label_spacing_field.setStringValue(
-            &objc2_foundation::NSString::from_str(&preferences.labels.spacing.spaces().to_string()),
+        self.label_spacing.setIntegerValue(
+            isize::try_from(preferences.labels.spacing.spaces())
+                .expect("label spacing fits NSInteger"),
+        );
+        let spacing_value = match preferences.labels.spacing.spaces() {
+            1 => "1 espaço".to_owned(),
+            spaces => format!("{spaces} espaços"),
+        };
+        set_slider_value_text(
+            &self.label_spacing,
+            &self.layout_views.label_spacing_value,
+            &spacing_value,
         );
         self.target
             .ivars()
@@ -1169,8 +1386,6 @@ impl IndicatorControls {
             } else {
                 self.ram_mode.setNextKeyView(Some(&self.reset_cpu_and_ram));
             }
-            self.reset_cpu_and_ram
-                .setNextKeyView(Some(&self.labels_visible));
             self.labels_visible
                 .setNextKeyView(Some(&self.layout_views.cpu_label_field));
             self.layout_views
@@ -1178,10 +1393,8 @@ impl IndicatorControls {
                 .setNextKeyView(Some(&self.layout_views.ram_label_field));
             self.layout_views
                 .ram_label_field
-                .setNextKeyView(Some(&self.layout_views.label_spacing_field));
-            self.layout_views
-                .label_spacing_field
-                .setNextKeyView(Some(&self.labels_mode));
+                .setNextKeyView(Some(&self.label_spacing));
+            self.label_spacing.setNextKeyView(Some(&self.labels_mode));
             if labels_fixed {
                 self.labels_editor.configure_key_order(
                     &self.labels_mode,
@@ -1191,29 +1404,25 @@ impl IndicatorControls {
             } else {
                 self.labels_mode.setNextKeyView(Some(&self.reset_labels));
             }
-            self.reset_labels.setNextKeyView(Some(&self.font_family));
             self.font_family.setNextKeyView(Some(&self.font_size));
             self.font_size.setNextKeyView(Some(&self.font_weight));
             self.font_weight
                 .setNextKeyView(Some(&self.reset_typography));
-            self.reset_typography
-                .setNextKeyView(Some(&self.interval_field));
             self.interval_field
                 .setNextKeyView(Some(&self.interval_stepper));
             self.interval_stepper
                 .setNextKeyView(Some(&self.reset_refresh_interval));
-            self.reset_refresh_interval
-                .setNextKeyView(Some(&self.cpu_mode));
         }
         self.target.ivars().applying.set(false);
     }
 
     fn apply_layout(&self, visibility: IndicatorControlsVisibility) {
         let layout = IndicatorControlsLayout::new(visibility);
-        self.layout_views.apply(&layout);
-        self.view
-            .setFrameSize(NSSize::new(560.0, layout.content_height()));
-        self.content_height.set(layout.content_height());
+        let page_height = self.layout_views.apply(&layout);
+        let size = NSSize::new(560.0, page_height);
+        self.view.setFrameSize(size);
+        self.area_views.set_frame_size(size);
+        self.content_height.set(page_height);
     }
 
     pub(super) fn content_height(&self) -> f64 {
@@ -1233,12 +1442,29 @@ impl IndicatorControls {
         &self.view
     }
 
-    pub(super) fn first_key_view(&self) -> &NSSegmentedControl {
-        &self.cpu_mode
+    pub(super) fn area_views(&self) -> IndicatorAreaViews {
+        self.area_views.retained()
     }
 
-    pub(super) fn last_key_view(&self) -> &NSButton {
-        &self.reset_refresh_interval
+    pub(super) fn first_key_view_for(&self, area: PreferencesArea) -> &NSView {
+        match area {
+            PreferencesArea::Colors => &self.cpu_mode,
+            PreferencesArea::Labels => &self.labels_visible,
+            PreferencesArea::Typography => &self.font_family,
+            PreferencesArea::Refresh => &self.interval_field,
+            PreferencesArea::DiskAndMole => {
+                unreachable!("disk preferences use their own first key view")
+            }
+        }
+    }
+
+    pub(super) fn last_key_views(&self) -> [&NSView; 4] {
+        [
+            &self.reset_cpu_and_ram,
+            &self.reset_labels,
+            &self.reset_typography,
+            &self.reset_refresh_interval,
+        ]
     }
 
     pub(super) fn apply_diagnostics(
@@ -1287,9 +1513,12 @@ impl IndicatorControls {
                 "Família da fonte, {family}"
             ))));
         self.font_size
-            .setStringValue(&objc2_foundation::NSString::from_str(
-                &typography.size.points().to_string(),
-            ));
+            .setIntegerValue(typography.size.points().into());
+        set_slider_value_text(
+            &self.font_size,
+            &self.layout_views.font_size_value,
+            &format!("{} pt", typography.size.points()),
+        );
         self.font_weight
             .setSelectedSegment(match typography.weight {
                 FontWeight::Regular => 0,
@@ -1373,11 +1602,11 @@ fn configure_actions(
     labels_visible: &NSButton,
     cpu_label_field: &NSTextField,
     ram_label_field: &NSTextField,
-    label_spacing_field: &NSTextField,
+    label_spacing: &NSSlider,
     labels_mode: &NSSegmentedControl,
     reset_labels: &NSButton,
     font_family: &NSButton,
-    font_size: &NSTextField,
+    font_size: &NSSlider,
     font_weight: &NSSegmentedControl,
     reset_typography: &NSButton,
     interval_field: &NSTextField,
@@ -1411,8 +1640,8 @@ fn configure_actions(
                 sel!(commitRamLabel:),
             ),
             (
-                &**label_spacing_field as &objc2_app_kit::NSControl,
-                sel!(commitLabelSpacing:),
+                &**label_spacing as &objc2_app_kit::NSControl,
+                sel!(changeLabelSpacing:),
             ),
             (
                 &**labels_mode as &objc2_app_kit::NSControl,
@@ -1428,7 +1657,7 @@ fn configure_actions(
             ),
             (
                 &**font_size as &objc2_app_kit::NSControl,
-                sel!(commitFontSize:),
+                sel!(changeFontSize:),
             ),
             (
                 &**font_weight as &objc2_app_kit::NSControl,
@@ -1454,11 +1683,9 @@ fn configure_actions(
             control.setTarget(Some(target as &AnyObject));
             control.setAction(Some(action));
         }
-        font_size.setDelegate(Some(ProtocolObject::from_ref(target)));
         interval_field.setDelegate(Some(ProtocolObject::from_ref(target)));
         cpu_label_field.setDelegate(Some(ProtocolObject::from_ref(target)));
         ram_label_field.setDelegate(Some(ProtocolObject::from_ref(target)));
-        label_spacing_field.setDelegate(Some(ProtocolObject::from_ref(target)));
     }
 }
 
@@ -1471,6 +1698,12 @@ fn family_name(family: &FontFamilyPreference) -> String {
 
 fn notification_text_field(notification: &NSNotification) -> Option<Retained<NSTextField>> {
     notification.object()?.downcast::<NSTextField>().ok()
+}
+
+fn set_slider_value_text(slider: &NSSlider, value_label: &NSTextField, value: &str) {
+    let value = objc2_foundation::NSString::from_str(value);
+    value_label.setStringValue(&value);
+    slider.setAccessibilityValueDescription(Some(&value));
 }
 
 fn set_inline_error(field: &NSTextField, message: Option<&str>) {
@@ -1487,7 +1720,46 @@ fn set_warning_text(field: &NSTextField, message: Option<&str>) {
 mod tests {
     use std::cell::Cell;
 
-    use super::get_or_create_font_resources;
+    use super::{get_or_create_font_resources, IndicatorAreaVisibility};
+    use crate::macos::windows::preferences::PreferencesArea;
+
+    #[test]
+    fn each_indicator_sidebar_destination_exposes_only_its_retained_controls() {
+        let cases = [
+            (
+                PreferencesArea::Colors,
+                IndicatorAreaVisibility::new(true, false, false, false),
+            ),
+            (
+                PreferencesArea::Labels,
+                IndicatorAreaVisibility::new(false, true, false, false),
+            ),
+            (
+                PreferencesArea::Typography,
+                IndicatorAreaVisibility::new(false, false, true, false),
+            ),
+            (
+                PreferencesArea::Refresh,
+                IndicatorAreaVisibility::new(false, false, false, true),
+            ),
+        ];
+
+        for (area, expected) in cases {
+            assert_eq!(IndicatorAreaVisibility::for_area(area), expected);
+            assert_eq!(
+                [
+                    expected.colors,
+                    expected.labels,
+                    expected.typography,
+                    expected.refresh,
+                ]
+                .into_iter()
+                .filter(|visible| *visible)
+                .count(),
+                1
+            );
+        }
+    }
 
     #[test]
     fn font_picker_resources_are_created_only_on_first_request() {

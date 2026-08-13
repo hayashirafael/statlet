@@ -1,13 +1,13 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSAccessibility, NSButton, NSColorWell, NSControlStateValueOn, NSControlTextEditingDelegate,
-    NSPopUpButton, NSScrollView, NSSegmentedControl, NSStackView, NSTableColumn, NSTableView,
-    NSTableViewDataSource, NSTableViewDelegate, NSTableViewStyle, NSTextField,
-    NSUserInterfaceItemIdentifier, NSView, NSWindow, NSWindowDelegate,
+    NSScrollView, NSSlider, NSStackView, NSTableColumn, NSTableView, NSTableViewDataSource,
+    NSTableViewDelegate, NSTableViewStyle, NSTextField, NSUserInterfaceItemIdentifier, NSView,
+    NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSIndexSet, NSInteger, NSNotification, NSObject, NSObjectProtocol,
@@ -26,29 +26,48 @@ mod font_picker;
 mod indicator;
 pub(super) mod preview;
 
-use indicator::IndicatorControls;
+use indicator::{IndicatorAreaViews, IndicatorControls};
 use preview::PreviewPane;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum PreferencesArea {
     #[default]
-    Indicator,
+    Colors,
+    Labels,
+    Typography,
+    Refresh,
     DiskAndMole,
 }
 
 impl PreferencesArea {
     const fn from_sidebar_row(row: NSInteger) -> Option<Self> {
         match row {
-            0 => Some(Self::Indicator),
-            1 => Some(Self::DiskAndMole),
+            0 => Some(Self::Colors),
+            1 => Some(Self::Labels),
+            2 => Some(Self::Typography),
+            3 => Some(Self::Refresh),
+            4 => Some(Self::DiskAndMole),
             _ => None,
         }
     }
 
     const fn sidebar_label(self) -> &'static str {
         match self {
-            Self::Indicator => "Indicador",
+            Self::Colors => "Cores",
+            Self::Labels => "Rótulos",
+            Self::Typography => "Tipografia",
+            Self::Refresh => "Atualização",
             Self::DiskAndMole => "Disco e Mole",
+        }
+    }
+
+    const fn indicator_index(self) -> Option<usize> {
+        match self {
+            Self::Colors => Some(0),
+            Self::Labels => Some(1),
+            Self::Typography => Some(2),
+            Self::Refresh => Some(3),
+            Self::DiskAndMole => None,
         }
     }
 }
@@ -69,10 +88,6 @@ impl PreferencesAreaState {
 
     pub(super) fn select(self, visible: PreferencesArea) -> Self {
         Self { visible }
-    }
-
-    pub(super) fn is_visible(self, area: PreferencesArea) -> bool {
-        self.visible == area
     }
 }
 
@@ -137,6 +152,212 @@ impl PreferencesShellContract {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DiscreteSliderContract {
+    min: u8,
+    max: u8,
+    step: u8,
+    ticks: NSInteger,
+    identifier: &'static str,
+    accessibility_label: &'static str,
+    accessibility_help: &'static str,
+}
+
+impl DiscreteSliderContract {
+    const fn new(
+        min: u8,
+        max: u8,
+        step: u8,
+        ticks: NSInteger,
+        identifier: &'static str,
+        accessibility_label: &'static str,
+        accessibility_help: &'static str,
+    ) -> Self {
+        Self {
+            min,
+            max,
+            step,
+            ticks,
+            identifier,
+            accessibility_label,
+            accessibility_help,
+        }
+    }
+
+    pub(super) const fn min(self) -> u8 {
+        self.min
+    }
+
+    pub(super) const fn max(self) -> u8 {
+        self.max
+    }
+
+    pub(super) const fn step(self) -> u8 {
+        self.step
+    }
+
+    pub(super) const fn ticks(self) -> NSInteger {
+        self.ticks
+    }
+
+    pub(super) const fn identifier(self) -> &'static str {
+        self.identifier
+    }
+
+    pub(super) const fn accessibility_label(self) -> &'static str {
+        self.accessibility_label
+    }
+
+    pub(super) const fn accessibility_help(self) -> &'static str {
+        self.accessibility_help
+    }
+
+    pub(super) const fn continuous(self) -> bool {
+        true
+    }
+
+    pub(super) const fn tick_values_only(self) -> bool {
+        true
+    }
+}
+
+pub(super) const fn label_spacing_slider_contract() -> DiscreteSliderContract {
+    DiscreteSliderContract::new(
+        0,
+        4,
+        1,
+        5,
+        "indicator.labels.spacing",
+        "Espaçamento entre rótulo e percentual",
+        "Escolha de zero a quatro espaços.",
+    )
+}
+
+pub(super) const fn font_size_slider_contract() -> DiscreteSliderContract {
+    DiscreteSliderContract::new(
+        9,
+        14,
+        1,
+        6,
+        "indicator.font.size",
+        "Tamanho da fonte",
+        "Escolha de nove a quatorze pontos.",
+    )
+}
+
+pub(super) const fn disk_threshold_slider_contract() -> DiscreteSliderContract {
+    DiscreteSliderContract::new(
+        70,
+        95,
+        5,
+        6,
+        "disk.warning.threshold",
+        "Limite de aviso do disco",
+        "Escolha o percentual de ocupação que inicia a observação de pouco espaço.",
+    )
+}
+
+pub(super) fn configure_discrete_slider(slider: &NSSlider, contract: DiscreteSliderContract) {
+    slider.setMinValue(f64::from(contract.min()));
+    slider.setMaxValue(f64::from(contract.max()));
+    slider.setAltIncrementValue(f64::from(contract.step()));
+    slider.setNumberOfTickMarks(contract.ticks());
+    slider.setAllowsTickMarkValuesOnly(contract.tick_values_only());
+    slider.setContinuous(contract.continuous());
+    slider.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(
+        contract.identifier(),
+    )));
+    slider.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(
+        contract.accessibility_label(),
+    )));
+    slider.setAccessibilityHelp(Some(&objc2_foundation::NSString::from_str(
+        contract.accessibility_help(),
+    )));
+}
+
+pub(super) fn warning_threshold_from_slider_value(value: NSInteger) -> Option<WarningThreshold> {
+    u8::try_from(value)
+        .ok()
+        .and_then(|value| WarningThreshold::try_from(value).ok())
+}
+
+fn set_disk_threshold_value(
+    slider: &NSSlider,
+    value_label: &NSTextField,
+    threshold: WarningThreshold,
+) {
+    let value = threshold_title(threshold);
+    value_label.setStringValue(&value);
+    slider.setAccessibilityValueDescription(Some(&value));
+}
+
+struct DiskThresholdTargetIvars {
+    proxy: tao::event_loop::EventLoopProxy<crate::macos::RuntimeEvent>,
+    applying: Cell<bool>,
+    selected: Cell<WarningThreshold>,
+    slider: Retained<NSSlider>,
+    value_label: Retained<NSTextField>,
+}
+
+define_class!(
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = DiskThresholdTargetIvars]
+    struct DiskThresholdTarget;
+
+    unsafe impl NSObjectProtocol for DiskThresholdTarget {}
+
+    impl DiskThresholdTarget {
+        #[unsafe(method(changeWarningThreshold:))]
+        fn change_warning_threshold(&self, sender: &NSSlider) {
+            if self.ivars().applying.get() {
+                return;
+            }
+            let Some(threshold) = warning_threshold_from_slider_value(sender.integerValue()) else {
+                sender.setIntegerValue(self.ivars().selected.get().get().into());
+                return;
+            };
+            set_disk_threshold_value(sender, &self.ivars().value_label, threshold);
+            if threshold == self.ivars().selected.replace(threshold) {
+                return;
+            }
+            let _ = self
+                .ivars()
+                .proxy
+                .send_event(crate::macos::RuntimeEvent::App(
+                    AppEvent::SetWarningThreshold(threshold),
+                ));
+        }
+    }
+);
+
+impl DiskThresholdTarget {
+    fn new(
+        mtm: MainThreadMarker,
+        proxy: tao::event_loop::EventLoopProxy<crate::macos::RuntimeEvent>,
+        slider: Retained<NSSlider>,
+        value_label: Retained<NSTextField>,
+    ) -> Retained<Self> {
+        let selected = WarningThreshold::default();
+        let this = Self::alloc(mtm).set_ivars(DiskThresholdTargetIvars {
+            proxy,
+            applying: Cell::new(false),
+            selected: Cell::new(selected),
+            slider,
+            value_label,
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+
+    fn apply(&self, threshold: WarningThreshold) {
+        self.ivars().applying.set(true);
+        self.ivars().selected.set(threshold);
+        self.ivars().slider.setIntegerValue(threshold.get().into());
+        set_disk_threshold_value(&self.ivars().slider, &self.ivars().value_label, threshold);
+        self.ivars().applying.set(false);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PreferencesFooterPresentation {
     undo_visible: bool,
     retry_visible: bool,
@@ -165,7 +386,8 @@ struct PreferencesControlTargetIvars {
     state: RefCell<PreferencesAreaState>,
     indicator: Retained<NSView>,
     disk_and_mole: Retained<NSView>,
-    indicator_first_key: Retained<NSSegmentedControl>,
+    indicator_area_views: IndicatorAreaViews,
+    indicator_first_keys: [Retained<NSView>; 4],
     disk_and_mole_first_key: Retained<NSButton>,
     sidebar: RefCell<Option<Retained<NSTableView>>>,
     color_wells: Vec<Retained<NSColorWell>>,
@@ -185,7 +407,8 @@ impl PreferencesControlTarget {
         mtm: MainThreadMarker,
         indicator: Retained<NSView>,
         disk_and_mole: Retained<NSView>,
-        indicator_first_key: Retained<NSSegmentedControl>,
+        indicator_area_views: IndicatorAreaViews,
+        indicator_first_keys: [Retained<NSView>; 4],
         disk_and_mole_first_key: Retained<NSButton>,
         color_wells: Vec<Retained<NSColorWell>>,
     ) -> Retained<Self> {
@@ -193,7 +416,8 @@ impl PreferencesControlTarget {
             state: RefCell::new(PreferencesAreaState::new()),
             indicator,
             disk_and_mole,
-            indicator_first_key,
+            indicator_area_views,
+            indicator_first_keys,
             disk_and_mole_first_key,
             sidebar: RefCell::new(None),
             color_wells,
@@ -210,29 +434,31 @@ impl PreferencesControlTarget {
         let state = self.ivars().state.borrow().select(area);
         self.ivars().state.replace(state);
         let visible = state.visible();
-        if visible == PreferencesArea::DiskAndMole {
+        if visible != PreferencesArea::Colors {
             for well in &self.ivars().color_wells {
                 well.deactivate();
             }
         }
+        self.ivars().indicator_area_views.set_visible_area(visible);
         self.ivars()
             .indicator
-            .setHidden(!state.is_visible(PreferencesArea::Indicator));
+            .setHidden(visible == PreferencesArea::DiskAndMole);
         self.ivars()
             .disk_and_mole
             .setHidden(visible != PreferencesArea::DiskAndMole);
         if let Some(sidebar) = self.ivars().sidebar.borrow().as_deref() {
             unsafe {
-                match visible {
-                    PreferencesArea::Indicator => {
-                        sidebar.setNextKeyView(Some(&self.ivars().indicator_first_key))
-                    }
-                    PreferencesArea::DiskAndMole => {
-                        sidebar.setNextKeyView(Some(&self.ivars().disk_and_mole_first_key))
-                    }
+                if let Some(index) = visible.indicator_index() {
+                    sidebar.setNextKeyView(Some(&self.ivars().indicator_first_keys[index]));
+                } else {
+                    sidebar.setNextKeyView(Some(&self.ivars().disk_and_mole_first_key));
                 }
             }
         }
+    }
+
+    fn refresh_selected_area(&self) {
+        select_visible_area(&self.ivars().state, |area| self.select_area(area));
     }
 }
 
@@ -247,7 +473,7 @@ define_class!(
     unsafe impl NSTableViewDataSource for PreferencesSidebarDataSource {
         #[unsafe(method(numberOfRowsInTableView:))]
         fn number_of_rows_in_table_view(&self, _table: &NSTableView) -> NSInteger {
-            2
+            5
         }
     }
 );
@@ -422,7 +648,9 @@ impl IndicatorPage {
 struct DiskAndMolePage {
     root: Retained<NSView>,
     mole_checkbox: Retained<NSButton>,
-    warning_threshold: Retained<NSPopUpButton>,
+    warning_threshold: Retained<NSSlider>,
+    _warning_threshold_value: Retained<NSTextField>,
+    warning_threshold_target: Retained<DiskThresholdTarget>,
 }
 
 struct PreferencesFooter {
@@ -492,7 +720,25 @@ impl PreferencesWindow {
             mtm,
             indicator.root.clone(),
             disk_and_mole.root.clone(),
-            indicator.controls.first_key_view().retain(),
+            indicator.controls.area_views(),
+            [
+                indicator
+                    .controls
+                    .first_key_view_for(PreferencesArea::Colors)
+                    .retain(),
+                indicator
+                    .controls
+                    .first_key_view_for(PreferencesArea::Labels)
+                    .retain(),
+                indicator
+                    .controls
+                    .first_key_view_for(PreferencesArea::Typography)
+                    .retain(),
+                indicator
+                    .controls
+                    .first_key_view_for(PreferencesArea::Refresh)
+                    .retain(),
+            ],
             disk_and_mole.mole_checkbox.clone(),
             indicator.controls.wells(),
         );
@@ -502,9 +748,11 @@ impl PreferencesWindow {
 
         let footer = create_footer(mtm, contract, &indicator.root, target);
         unsafe {
-            sidebar
-                .table()
-                .setNextKeyView(Some(indicator.controls.first_key_view()));
+            sidebar.table().setNextKeyView(Some(
+                indicator
+                    .controls
+                    .first_key_view_for(PreferencesArea::Colors),
+            ));
         }
         window.setInitialFirstResponder(Some(sidebar.table()));
         let delegate =
@@ -537,13 +785,14 @@ impl PreferencesWindow {
                 0
             });
         self.disk_and_mole
-            .warning_threshold
-            .selectItemWithTitle(&threshold_title(state.preferences.warning_threshold));
+            .warning_threshold_target
+            .apply(state.preferences.warning_threshold);
         self.disk_and_mole
             .warning_threshold
             .setEnabled(state.preferences.mole_integration_enabled);
         self.indicator
             .apply_preferences(&state.preferences.indicator);
+        self._area_target.refresh_selected_area();
         let save_failed = state.preferences_save_status == PreferencesSaveStatus::Failed;
         let footer =
             PreferencesFooterPresentation::new(state.can_undo_indicator_reset, save_failed);
@@ -551,10 +800,15 @@ impl PreferencesWindow {
         self._host
             .set_can_undo_indicator_reset(state.can_undo_indicator_reset);
         unsafe {
-            self.indicator
-                .controls
-                .last_key_view()
-                .setNextKeyView(Some(&self._footer.reset_all));
+            for last in self.indicator.controls.last_key_views() {
+                last.setNextKeyView(Some(&self._footer.reset_all));
+            }
+            self.disk_and_mole
+                .mole_checkbox
+                .setNextKeyView(Some(&self.disk_and_mole.warning_threshold));
+            self.disk_and_mole
+                .warning_threshold
+                .setNextKeyView(Some(self._sidebar.table()));
             if footer.undo_visible {
                 self._footer
                     .reset_all
@@ -892,51 +1146,109 @@ fn create_disk_and_mole_page(
         NSSize::new(180.0, 24.0),
     ));
 
-    let threshold = unsafe {
-        let popup = NSPopUpButton::initWithFrame_pullsDown(
-            NSPopUpButton::alloc(mtm),
-            NSRect::new(NSPoint::new(245.0, 66.0), NSSize::new(110.0, 30.0)),
-            false,
-        );
-        popup.setTarget(Some(target as &AnyObject));
-        popup.setAction(Some(sel!(changeWarningThreshold:)));
-        popup
-    };
-    for value in [70, 75, 80, 85, 90, 95] {
-        threshold.addItemWithTitle(&threshold_title(
-            WarningThreshold::try_from(value).expect("known threshold"),
-        ));
+    let threshold = NSSlider::initWithFrame(
+        NSSlider::alloc(mtm),
+        NSRect::new(NSPoint::new(245.0, 66.0), NSSize::new(165.0, 30.0)),
+    );
+    configure_discrete_slider(&threshold, disk_threshold_slider_contract());
+    let threshold_value = NSTextField::labelWithString(ns_string!("90%"), mtm);
+    threshold_value.setFrame(NSRect::new(
+        NSPoint::new(420.0, 66.0),
+        NSSize::new(54.0, 30.0),
+    ));
+    threshold_value.setAccessibilityIdentifier(Some(ns_string!("disk.warning.threshold.value")));
+    let threshold_target = DiskThresholdTarget::new(
+        mtm,
+        target.event_proxy(),
+        threshold.clone(),
+        threshold_value.clone(),
+    );
+    unsafe {
+        threshold.setTarget(Some(&*threshold_target as &AnyObject));
+        threshold.setAction(Some(sel!(changeWarningThreshold:)));
     }
-    threshold.setAccessibilityLabel(Some(ns_string!("Limite de aviso do disco")));
-    threshold.setAccessibilityHelp(Some(ns_string!(
-        "Escolha o percentual de ocupação que inicia a observação de pouco espaço."
-    )));
+    threshold_target.apply(WarningThreshold::default());
 
     content.addSubview(&heading);
     content.addSubview(&checkbox);
     content.addSubview(&explanation);
     content.addSubview(&threshold_label);
     content.addSubview(&threshold);
+    content.addSubview(&threshold_value);
     root.addSubview(&content);
 
     DiskAndMolePage {
         root,
         mole_checkbox: checkbox,
         warning_threshold: threshold,
+        _warning_threshold_value: threshold_value,
+        warning_threshold_target: threshold_target,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use statlet::core::WarningThreshold;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use super::super::common::should_intercept_indicator_undo;
     use super::{
-        get_or_create_window, select_visible_area, PreferencesArea, PreferencesAreaState,
-        PreferencesFooterPresentation, PreferencesRegion, PreferencesShellContract,
-        RegionPlacement,
+        disk_threshold_slider_contract, font_size_slider_contract, get_or_create_window,
+        label_spacing_slider_contract, select_visible_area, warning_threshold_from_slider_value,
+        PreferencesArea, PreferencesAreaState, PreferencesFooterPresentation, PreferencesRegion,
+        PreferencesShellContract, RegionPlacement,
     };
+
+    #[test]
+    fn discrete_slider_contracts_match_the_approved_domain_ranges() {
+        let spacing = label_spacing_slider_contract();
+        assert_eq!(
+            (
+                spacing.min(),
+                spacing.max(),
+                spacing.step(),
+                spacing.ticks()
+            ),
+            (0, 4, 1, 5)
+        );
+        assert_eq!(spacing.identifier(), "indicator.labels.spacing");
+
+        let font = font_size_slider_contract();
+        assert_eq!(
+            (font.min(), font.max(), font.step(), font.ticks()),
+            (9, 14, 1, 6)
+        );
+        assert_eq!(font.identifier(), "indicator.font.size");
+
+        let disk = disk_threshold_slider_contract();
+        assert_eq!(
+            (disk.min(), disk.max(), disk.step(), disk.ticks()),
+            (70, 95, 5, 6)
+        );
+        assert_eq!(disk.identifier(), "disk.warning.threshold");
+
+        for contract in [spacing, font, disk] {
+            assert!(contract.continuous());
+            assert!(contract.tick_values_only());
+            assert!(!contract.accessibility_label().is_empty());
+            assert!(!contract.accessibility_help().is_empty());
+        }
+    }
+
+    #[test]
+    fn disk_slider_values_cross_the_public_warning_threshold_seam() {
+        for value in [70, 75, 80, 85, 90, 95] {
+            assert_eq!(
+                warning_threshold_from_slider_value(value).map(WarningThreshold::get),
+                Some(u8::try_from(value).unwrap())
+            );
+        }
+
+        for value in [69, 71, 94, 96] {
+            assert_eq!(warning_threshold_from_slider_value(value), None);
+        }
+    }
 
     #[test]
     fn setting_the_sidebar_releases_the_visible_area_borrow_before_selection() {
@@ -947,24 +1259,36 @@ mod tests {
             state.replace(next);
         });
 
-        assert_eq!(state.borrow().visible(), PreferencesArea::Indicator);
+        assert_eq!(state.borrow().visible(), PreferencesArea::Colors);
     }
 
     #[test]
     fn selecting_an_area_shows_exactly_one_preferences_page() {
-        let areas = [PreferencesArea::Indicator, PreferencesArea::DiskAndMole];
+        let areas = [
+            PreferencesArea::Colors,
+            PreferencesArea::Labels,
+            PreferencesArea::Typography,
+            PreferencesArea::Refresh,
+            PreferencesArea::DiskAndMole,
+        ];
         let state = PreferencesAreaState::new();
 
-        assert_eq!(state.visible(), PreferencesArea::Indicator);
+        assert_eq!(state.visible(), PreferencesArea::Colors);
         assert_eq!(
-            areas.iter().filter(|area| state.is_visible(**area)).count(),
+            areas
+                .iter()
+                .filter(|area| state.visible() == **area)
+                .count(),
             1
         );
 
         let state = state.select(PreferencesArea::DiskAndMole);
         assert_eq!(state.visible(), PreferencesArea::DiskAndMole);
         assert_eq!(
-            areas.iter().filter(|area| state.is_visible(**area)).count(),
+            areas
+                .iter()
+                .filter(|area| state.visible() == **area)
+                .count(),
             1
         );
     }
@@ -974,7 +1298,10 @@ mod tests {
         let contract = PreferencesShellContract::new();
 
         assert_eq!(contract.content_size(), (860.0, 700.0));
-        assert_eq!(PreferencesArea::Indicator.sidebar_label(), "Indicador");
+        assert_eq!(PreferencesArea::Colors.sidebar_label(), "Cores");
+        assert_eq!(PreferencesArea::Labels.sidebar_label(), "Rótulos");
+        assert_eq!(PreferencesArea::Typography.sidebar_label(), "Tipografia");
+        assert_eq!(PreferencesArea::Refresh.sidebar_label(), "Atualização");
         assert_eq!(PreferencesArea::DiskAndMole.sidebar_label(), "Disco e Mole");
     }
 
@@ -984,7 +1311,10 @@ mod tests {
 
         assert_eq!(contract.content_size(), (860.0, 700.0));
         assert_eq!(contract.sidebar_width(), 180.0);
-        assert_eq!(PreferencesArea::Indicator.sidebar_label(), "Indicador");
+        assert_eq!(PreferencesArea::Colors.sidebar_label(), "Cores");
+        assert_eq!(PreferencesArea::Labels.sidebar_label(), "Rótulos");
+        assert_eq!(PreferencesArea::Typography.sidebar_label(), "Tipografia");
+        assert_eq!(PreferencesArea::Refresh.sidebar_label(), "Atualização");
         assert_eq!(PreferencesArea::DiskAndMole.sidebar_label(), "Disco e Mole");
         assert_eq!(
             contract.sidebar_accessibility_identifier(),
@@ -992,13 +1322,25 @@ mod tests {
         );
         assert_eq!(
             PreferencesArea::from_sidebar_row(0),
-            Some(PreferencesArea::Indicator)
+            Some(PreferencesArea::Colors)
         );
         assert_eq!(
             PreferencesArea::from_sidebar_row(1),
+            Some(PreferencesArea::Labels)
+        );
+        assert_eq!(
+            PreferencesArea::from_sidebar_row(2),
+            Some(PreferencesArea::Typography)
+        );
+        assert_eq!(
+            PreferencesArea::from_sidebar_row(3),
+            Some(PreferencesArea::Refresh)
+        );
+        assert_eq!(
+            PreferencesArea::from_sidebar_row(4),
             Some(PreferencesArea::DiskAndMole)
         );
-        assert_eq!(PreferencesArea::from_sidebar_row(2), None);
+        assert_eq!(PreferencesArea::from_sidebar_row(5), None);
     }
 
     #[test]
