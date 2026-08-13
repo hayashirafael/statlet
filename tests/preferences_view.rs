@@ -132,6 +132,7 @@ fn appearance_drafts_survive_collapsing_and_reopening_variants() {
 fn tab_order_visits_each_visible_well_and_hex_then_the_next_group() {
     use ColorEditorFocusTarget::{
         DarkHex, DarkWell, LightHex, LightWell, Mode, NextGroup, SharedHex, SharedWell,
+        VariantsToggle,
     };
 
     let shared = SrgbColor::parse_hex("#34C759").unwrap();
@@ -144,13 +145,63 @@ fn tab_order_visits_each_visible_well_and_hex_then_the_next_group() {
         }),
     });
 
-    assert_eq!(state.tab_order(), &[Mode, SharedWell, SharedHex, NextGroup]);
+    assert_eq!(
+        state.tab_order(),
+        &[Mode, SharedWell, SharedHex, VariantsToggle, NextGroup]
+    );
 
     state.set_variants_enabled(true);
     assert_eq!(
         state.tab_order(),
-        &[Mode, LightWell, LightHex, DarkWell, DarkHex, NextGroup,]
+        &[
+            Mode,
+            LightWell,
+            LightHex,
+            DarkWell,
+            DarkHex,
+            VariantsToggle,
+            NextGroup,
+        ]
     );
+}
+
+#[test]
+fn metrics_only_ticks_do_not_change_the_preferences_controls_presentation() {
+    use statlet::core::{AppEvent, MemoryPressure, StatletCore, SystemSnapshot};
+    use statlet::preferences_view::PreferencesControlsCache;
+
+    let mut app = StatletCore::new();
+    let mut cache = PreferencesControlsCache::default();
+    assert!(cache.should_apply(app.state()));
+
+    app.handle(AppEvent::MetricsSample(SystemSnapshot {
+        cpu_percent: 81.0,
+        ram_percent: 64.0,
+        memory_pressure: MemoryPressure::Warning,
+    }));
+
+    assert!(!cache.should_apply(app.state()));
+}
+
+#[test]
+fn relevant_preferences_state_changes_the_controls_presentation() {
+    use statlet::core::{AppEvent, PreferencesSaveResult, StatletCore};
+    use statlet::preferences_view::PreferencesControlsCache;
+
+    let mut app = StatletCore::new();
+    let mut cache = PreferencesControlsCache::default();
+    assert!(cache.should_apply(app.state()));
+
+    app.handle(AppEvent::SetMoleIntegrationEnabled(true));
+    assert!(cache.should_apply(app.state()));
+
+    app.handle(AppEvent::ResetIndicatorConfirmed);
+    assert!(cache.should_apply(app.state()));
+
+    app.handle(AppEvent::PreferencesSaveFinished(
+        PreferencesSaveResult::Failed,
+    ));
+    assert!(cache.should_apply(app.state()));
 }
 
 #[test]

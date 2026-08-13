@@ -466,6 +466,7 @@ impl ColorEditor {
             ColorEditorFocusTarget::LightHex => &self.light.hex,
             ColorEditorFocusTarget::DarkWell => &self.dark.well,
             ColorEditorFocusTarget::DarkHex => &self.dark.hex,
+            ColorEditorFocusTarget::VariantsToggle => &self.variants_toggle,
             ColorEditorFocusTarget::NextGroup => next,
         }
     }

@@ -14,7 +14,7 @@ use objc2_foundation::{
 };
 use statlet::core::{AppEvent, AppState, PreferencesSaveStatus, WarningThreshold};
 use statlet::indicator_preferences::IndicatorPreferences;
-use statlet::preferences_view::preserve_scroll_origin_from_top;
+use statlet::preferences_view::{preserve_scroll_origin_from_top, PreferencesControlsCache};
 
 use super::common::{threshold_title, ControlTarget, PreferencesWindowHost};
 use super::{IndicatorFontFallback, IndicatorLayoutDiagnostics, IndicatorSurfaceUpdate};
@@ -240,12 +240,16 @@ struct IndicatorPage {
 
 impl IndicatorPage {
     fn apply_preferences(&self, preferences: &IndicatorPreferences) {
+        let previous_controls_height = self.controls.content_height();
+        self.controls.apply(preferences);
+        let controls_height = self.controls.content_height();
+        if controls_height == previous_controls_height {
+            return;
+        }
+
         let clip_view = self.groups_scroll.contentView();
         let old_bounds = clip_view.bounds();
         let old_document_height = self.groups_document.frame().size.height;
-
-        self.controls.apply(preferences);
-        let controls_height = self.controls.content_height();
         let document_height = controls_height + 32.0;
         self.controls
             .view()
@@ -311,6 +315,7 @@ pub(super) struct PreferencesWindow {
     indicator: IndicatorPage,
     disk_and_mole: DiskAndMolePage,
     _footer: PreferencesFooter,
+    controls_cache: RefCell<PreferencesControlsCache>,
     _area_target: Retained<PreferencesControlTarget>,
     _delegate: Retained<PreferencesWindowDelegate>,
 }
@@ -391,12 +396,17 @@ impl PreferencesWindow {
             indicator,
             disk_and_mole,
             _footer: footer,
+            controls_cache: RefCell::new(PreferencesControlsCache::default()),
             _area_target: area_target,
             _delegate: delegate,
         }
     }
 
     pub(super) fn apply(&self, state: &AppState, _previews: Option<&PreviewImages>) {
+        if !self.controls_cache.borrow_mut().should_apply(state) {
+            return;
+        }
+
         self.disk_and_mole
             .mole_checkbox
             .setState(if state.preferences.mole_integration_enabled {

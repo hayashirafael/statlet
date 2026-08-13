@@ -422,4 +422,74 @@ mod tests {
             0.0
         );
     }
+
+    #[test]
+    fn every_editor_visibility_combination_has_consistent_non_overlapping_slots() {
+        for mask in 0_u8..8 {
+            let visibility = IndicatorControlsVisibility {
+                cpu_editor: mask & 0b001 != 0,
+                ram_editor: mask & 0b010 != 0,
+                labels_editor: mask & 0b100 != 0,
+            };
+            let layout = IndicatorControlsLayout::new(visibility);
+
+            assert_eq!(layout.cpu_editor().is_some(), visibility.cpu_editor);
+            assert_eq!(layout.ram_editor().is_some(), visibility.ram_editor);
+            assert_eq!(layout.labels_editor().is_some(), visibility.labels_editor);
+
+            let slots = [
+                Some(layout.colors_heading()),
+                Some(layout.cpu_row().vertical()),
+                layout.cpu_editor(),
+                Some(layout.ram_row().vertical()),
+                layout.ram_editor(),
+                Some(layout.labels_heading()),
+                Some(layout.labels_visibility_row().vertical()),
+                Some(layout.labels_mode_row().vertical()),
+                layout.labels_editor(),
+                Some(layout.typography_heading()),
+                Some(layout.family_row().vertical()),
+                Some(layout.size_row().vertical()),
+                Some(layout.weight_row().vertical()),
+                Some(layout.font_fallback_warning()),
+                Some(layout.layout_warning()),
+                Some(layout.update_heading()),
+                Some(layout.interval_row().vertical()),
+                Some(layout.interval_help()),
+                Some(layout.interval_error()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+            for pair in slots.windows(2) {
+                let gap = pair[1].top() - pair[0].bottom();
+                assert!(gap >= INLINE_GAP, "mask {mask:03b}: gap {gap}");
+                assert!(
+                    gap <= 16.0 || gap == GROUP_GAP,
+                    "mask {mask:03b}: unexpected gap {gap}"
+                );
+            }
+            for gap in [
+                layout.labels_heading().top()
+                    - layout
+                        .ram_editor()
+                        .unwrap_or(layout.ram_row().vertical())
+                        .bottom(),
+                layout.typography_heading().top()
+                    - layout
+                        .labels_editor()
+                        .unwrap_or(layout.labels_mode_row().vertical())
+                        .bottom(),
+                layout.update_heading().top() - layout.layout_warning().bottom(),
+            ] {
+                assert_eq!(gap, GROUP_GAP, "mask {mask:03b}");
+            }
+            assert_eq!(
+                layout.content_height(),
+                layout.interval_error().bottom(),
+                "mask {mask:03b}"
+            );
+        }
+    }
 }

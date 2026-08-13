@@ -528,6 +528,7 @@ impl IndicatorLayoutViews {
 pub(super) struct IndicatorControls {
     view: Retained<NSStackView>,
     layout_views: IndicatorLayoutViews,
+    layout_visibility: Cell<Option<IndicatorControlsVisibility>>,
     content_height: Cell<f64>,
     cpu_mode: Retained<NSSegmentedControl>,
     reset_cpu_and_ram: Retained<NSButton>,
@@ -826,6 +827,7 @@ impl IndicatorControls {
         let controls = Self {
             view,
             layout_views,
+            layout_visibility: Cell::new(None),
             content_height: Cell::new(0.0),
             cpu_mode,
             reset_cpu_and_ram,
@@ -919,11 +921,15 @@ impl IndicatorControls {
         if !labels_fixed {
             self.labels_editor.deactivate();
         }
-        self.apply_layout(IndicatorControlsVisibility {
+        let visibility = IndicatorControlsVisibility {
             cpu_editor: cpu_fixed,
             ram_editor: ram_fixed,
             labels_editor: labels_fixed,
-        });
+        };
+        if self.layout_visibility.get() != Some(visibility) {
+            self.apply_layout(visibility);
+            self.layout_visibility.set(Some(visibility));
+        }
 
         unsafe {
             if cpu_fixed {

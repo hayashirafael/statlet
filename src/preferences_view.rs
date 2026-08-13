@@ -1,3 +1,4 @@
+use crate::core::{AppState, Preferences, PreferencesSaveStatus};
 use crate::indicator_preferences::{
     AppearanceColors, FixedColorPreferences, MetricsRefreshInterval, SrgbColor,
 };
@@ -10,6 +11,39 @@ pub use layout::{
 };
 
 const SYSTEM_MONOSPACED_LABEL: &str = "System Monospaced";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreferencesControlsPresentation {
+    preferences: Preferences,
+    can_undo_indicator_reset: bool,
+    preferences_save_status: PreferencesSaveStatus,
+}
+
+impl PreferencesControlsPresentation {
+    pub fn from_state(state: &AppState) -> Self {
+        Self {
+            preferences: state.preferences.clone(),
+            can_undo_indicator_reset: state.can_undo_indicator_reset,
+            preferences_save_status: state.preferences_save_status,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct PreferencesControlsCache {
+    current: Option<PreferencesControlsPresentation>,
+}
+
+impl PreferencesControlsCache {
+    pub fn should_apply(&mut self, state: &AppState) -> bool {
+        let next = PreferencesControlsPresentation::from_state(state);
+        if self.current.as_ref() == Some(&next) {
+            return false;
+        }
+        self.current = Some(next);
+        true
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FontRow {
@@ -321,6 +355,7 @@ pub enum ColorEditorFocusTarget {
     LightHex,
     DarkWell,
     DarkHex,
+    VariantsToggle,
     NextGroup,
 }
 
@@ -328,6 +363,7 @@ const SHARED_TAB_ORDER: &[ColorEditorFocusTarget] = &[
     ColorEditorFocusTarget::Mode,
     ColorEditorFocusTarget::SharedWell,
     ColorEditorFocusTarget::SharedHex,
+    ColorEditorFocusTarget::VariantsToggle,
     ColorEditorFocusTarget::NextGroup,
 ];
 
@@ -337,6 +373,7 @@ const APPEARANCE_TAB_ORDER: &[ColorEditorFocusTarget] = &[
     ColorEditorFocusTarget::LightHex,
     ColorEditorFocusTarget::DarkWell,
     ColorEditorFocusTarget::DarkHex,
+    ColorEditorFocusTarget::VariantsToggle,
     ColorEditorFocusTarget::NextGroup,
 ];
 
