@@ -406,6 +406,7 @@ impl IndicatorControlsTarget {
             if let Some(control) = &restore_mode {
                 restore_identifier_segment(control, previous_mode);
             }
+            let _ = proxy.send_event(RuntimeEvent::App(AppEvent::CancelMetricPngImport(metric)));
         });
         panel.beginSheetModalForWindow_completionHandler(parent, &completion);
     }

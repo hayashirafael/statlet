@@ -4,6 +4,7 @@ use statlet::core::{
     AppEffect, AppEvent, MetricPngAssetMutation, MetricPngImportResult, MetricPngRemovalResult,
     PreferencesSaveStatus, StatletCore,
 };
+use statlet::indicator_preferences::IndicatorPreferenceGroup;
 use statlet::indicator_preferences::{MetricIdentifierMode, MetricKind, PngIconMetadata};
 
 #[test]
@@ -170,6 +171,97 @@ fn changing_identifier_mode_cancels_an_in_flight_png_import() {
         AppEffect::CancelMetricPngImport(MetricKind::Cpu)
     );
     assert_eq!(effects[1], AppEffect::RequestIndicatorRedraw);
+}
+
+#[test]
+fn choosing_another_png_invalidates_the_in_flight_import_before_starting_the_reselection() {
+    let mut app = StatletCore::new();
+    app.handle(AppEvent::ChooseMetricPng {
+        metric: MetricKind::Cpu,
+        source: PathBuf::from("/tmp/slow.png"),
+    });
+
+    let effects = app.handle(AppEvent::ChooseMetricPng {
+        metric: MetricKind::Cpu,
+        source: PathBuf::from("/tmp/reselected.png"),
+    });
+
+    assert_eq!(
+        effects,
+        vec![
+            AppEffect::CancelMetricPngImport(MetricKind::Cpu),
+            AppEffect::ImportMetricPng {
+                metric: MetricKind::Cpu,
+                source: PathBuf::from("/tmp/reselected.png"),
+            },
+        ]
+    );
+    assert!(app.state().indicator_icon_pending(MetricKind::Cpu));
+}
+
+#[test]
+fn cancelling_the_picker_invalidates_an_existing_in_flight_import() {
+    let mut app = StatletCore::new();
+    app.handle(AppEvent::ChooseMetricPng {
+        metric: MetricKind::Ram,
+        source: PathBuf::from("/tmp/slow.png"),
+    });
+
+    let effects = app.handle(AppEvent::CancelMetricPngImport(MetricKind::Ram));
+
+    assert_eq!(
+        effects,
+        vec![AppEffect::CancelMetricPngImport(MetricKind::Ram)]
+    );
+    assert!(!app.state().indicator_icon_pending(MetricKind::Ram));
+}
+
+#[test]
+fn identifier_group_reset_invalidates_both_pending_imports_even_when_values_are_default() {
+    let mut app = StatletCore::new();
+    for metric in [MetricKind::Cpu, MetricKind::Ram] {
+        app.handle(AppEvent::ChooseMetricPng {
+            metric,
+            source: PathBuf::from(format!("/tmp/{metric:?}.png")),
+        });
+    }
+
+    let effects = app.handle(AppEvent::ResetIndicatorGroup(
+        IndicatorPreferenceGroup::CpuAndRam,
+    ));
+
+    assert_eq!(
+        effects,
+        vec![
+            AppEffect::CancelMetricPngImport(MetricKind::Cpu),
+            AppEffect::CancelMetricPngImport(MetricKind::Ram),
+        ]
+    );
+    assert!(!app.state().indicator_icon_pending(MetricKind::Cpu));
+    assert!(!app.state().indicator_icon_pending(MetricKind::Ram));
+}
+
+#[test]
+fn global_reset_invalidates_both_pending_imports_even_when_values_are_default() {
+    let mut app = StatletCore::new();
+    for metric in [MetricKind::Cpu, MetricKind::Ram] {
+        app.handle(AppEvent::ChooseMetricPng {
+            metric,
+            source: PathBuf::from(format!("/tmp/{metric:?}.png")),
+        });
+    }
+
+    let effects = app.handle(AppEvent::ResetIndicatorConfirmed);
+
+    assert_eq!(
+        effects,
+        vec![
+            AppEffect::CancelMetricPngImport(MetricKind::Cpu),
+            AppEffect::CancelMetricPngImport(MetricKind::Ram),
+        ]
+    );
+    assert!(!app.state().indicator_icon_pending(MetricKind::Cpu));
+    assert!(!app.state().indicator_icon_pending(MetricKind::Ram));
 }
 
 #[test]

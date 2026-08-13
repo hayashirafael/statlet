@@ -114,6 +114,7 @@ pub enum AppEvent {
         metric: MetricKind,
         source: PathBuf,
     },
+    CancelMetricPngImport(MetricKind),
     MetricPngImportFinished {
         metric: MetricKind,
         result: MetricPngImportResult,
@@ -126,6 +127,10 @@ pub enum AppEvent {
     MetricPngPersistenceFailed {
         metric: MetricKind,
         previous: MetricIdentifierPreferences,
+        message: String,
+    },
+    MetricPngTransactionCleanupFailed {
+        metric: MetricKind,
         message: String,
     },
     UpdateIndicator(IndicatorPreferenceChange),
@@ -485,9 +490,12 @@ impl StatletCore {
             AppEvent::ClearHistoryConfirmed => vec![AppEffect::ClearHistory],
             AppEvent::ChooseMetricPng { metric, source } => {
                 self.state.indicator_icon_errors[metric_index(metric)] = None;
+                let mut effects = self.cancel_pending_png_imports([metric]);
                 self.state.indicator_icon_pending[metric_index(metric)] = true;
-                vec![AppEffect::ImportMetricPng { metric, source }]
+                effects.push(AppEffect::ImportMetricPng { metric, source });
+                effects
             }
+            AppEvent::CancelMetricPngImport(metric) => self.cancel_pending_png_imports([metric]),
             AppEvent::MetricPngImportFinished { metric, result } => match result {
                 MetricPngImportResult::Imported(metadata) => {
                     self.state.indicator_icon_pending[metric_index(metric)] = false;
@@ -576,6 +584,10 @@ impl StatletCore {
                 self.state.indicator_icon_errors[metric_index(metric)] = Some(message);
                 vec![AppEffect::RequestIndicatorRedraw]
             }
+            AppEvent::MetricPngTransactionCleanupFailed { metric, message } => {
+                self.state.indicator_icon_errors[metric_index(metric)] = Some(message);
+                Vec::new()
+            }
             AppEvent::UpdateIndicator(change) => {
                 let previous_interval = self.state.preferences.indicator.refresh_interval;
                 let identifier_metric = match &change {
@@ -604,20 +616,29 @@ impl StatletCore {
             AppEvent::ResetIndicatorGroup(group) => {
                 let previous = self.state.preferences.indicator.clone();
                 self.state.preferences.indicator.reset(group);
+                let mut effects = if group == IndicatorPreferenceGroup::CpuAndRam {
+                    self.cancel_pending_png_imports([MetricKind::Cpu, MetricKind::Ram])
+                } else {
+                    Vec::new()
+                };
                 if self.state.preferences.indicator == previous {
-                    return Vec::new();
+                    return effects;
                 }
-                self.indicator_effects(previous.refresh_interval)
+                effects.extend(self.indicator_effects(previous.refresh_interval));
+                effects
             }
             AppEvent::ResetIndicatorConfirmed => {
                 let previous = self.state.preferences.indicator.clone();
                 self.indicator_reset_undo = Some(previous.clone());
                 self.state.can_undo_indicator_reset = true;
                 self.state.preferences.indicator = IndicatorPreferences::default();
+                let mut effects =
+                    self.cancel_pending_png_imports([MetricKind::Cpu, MetricKind::Ram]);
                 if self.state.preferences.indicator == previous {
-                    return Vec::new();
+                    return effects;
                 }
-                self.indicator_effects(previous.refresh_interval)
+                effects.extend(self.indicator_effects(previous.refresh_interval));
+                effects
             }
             AppEvent::UndoIndicatorReset => {
                 let Some(previous) = self.indicator_reset_undo.take() else {
@@ -650,6 +671,24 @@ impl StatletCore {
                 Vec::new()
             }
         }
+    }
+
+    fn cancel_pending_png_imports(
+        &mut self,
+        metrics: impl IntoIterator<Item = MetricKind>,
+    ) -> Vec<AppEffect> {
+        metrics
+            .into_iter()
+            .filter_map(|metric| {
+                let pending = &mut self.state.indicator_icon_pending[metric_index(metric)];
+                if *pending {
+                    *pending = false;
+                    Some(AppEffect::CancelMetricPngImport(metric))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn indicator_effects(&self, previous_interval: MetricsRefreshInterval) -> Vec<AppEffect> {

@@ -79,3 +79,28 @@ O checkpoint `670f1d3` recebeu quatro achados técnicos e nota visual 8,5/10. Es
 - `rtk git diff --check` — aprovado.
 - `rtk bash -n scripts/*.sh tests/package_contract.sh` — aprovado.
 - `rtk bash tests/package_contract.sh` — build release, bundle arm64/macOS 14+, assinatura ad hoc hardened runtime, ZIP, checksum, privacy manifest e notices aprovados.
+
+## Rework final de concorrência e disco — Task `task_c7bdc63ef1b7`
+
+Os dois P2 do review final foram reproduzidos no checkpoint `6c5781e` e fechados sem editar os artefatos do QA visual concorrente:
+
+- reselecionar outro PNG agora emite cancelamento explícito antes da nova importação; cancelar o `NSOpenPanel` invalida qualquer preparo pendente da métrica; reset de CPU/RAM e reset global cancelam CPU e RAM inclusive quando as preferências já estão nos defaults. O runtime reaproveita o contador por métrica existente, portanto completions da geração anterior são descartados antes de chegar ao reducer;
+- a transação de asset passou a depender de uma fronteira de filesystem injetável nos testes. `commit`, rollback e compensações de `begin_replace`/`begin_remove` tentam todas as etapas aplicáveis, agregam falhas de remoção, restauração, cleanup e `fsync`, e nunca descartam silenciosamente o erro. Falha de cleanup depois de salvar preferências permanece observável no estado da métrica sem declarar o save como falho; falha de rollback durante save rejeitado restaura o estado anterior e expõe o detalhe combinado em PT-BR;
+- o `Drop` de transação/PNG preparado registra no stderr qualquer cleanup inesperado que não possa mais ser propagado, enquanto os caminhos normais retornam `Result` até o runtime.
+
+### Ciclos RED → GREEN e sensibilidade
+
+- RED: o novo evento de cancelamento ainda não existia; GREEN: 12 testes do fluxo passaram com os quatro casos de invalidar reseleção, cancelamento, reset do grupo e reset global.
+- RED: a fronteira `AssetFileSystem` ainda não existia; GREEN: quatro testes com fault injection passaram cobrindo rollback com quatro falhas combinadas, compensação falha após `fsync`, cleanup falho no commit e cleanup falho após escrita temporária parcial.
+- Sensibilidade confirmada: neutralizar temporariamente a emissão de cancelamento fez os quatro testes `invalidates` falharem; restaurado o código, 4/4 passaram. Neutralizar temporariamente a agregação de erros fez 3/3 testes de fault injection falharem; restaurado o código, 3/3 passaram.
+- O runtime possui testes adicionais para propagação de falha de cleanup após commit e falha de rollback após save rejeitado.
+
+### Evidências frescas
+
+- `rtk cargo test --test indicator_png_flow --test png_icon_assets --bin statlet` — 92 testes aprovados em 3 suítes.
+- `rtk cargo test` — 256 testes aprovados em 27 suítes.
+- `rtk cargo clippy --all-targets -- -D warnings` — sem achados.
+- `rtk cargo fmt --check` — aprovado.
+- `rtk git diff --check` — aprovado.
+- `rtk bash -n scripts/*.sh tests/package_contract.sh` — aprovado.
+- `rtk bash tests/package_contract.sh` — contrato completo do bundle aprovado para arm64/macOS 14+, com assinatura ad hoc hardened runtime, privacy manifest, notices, ZIP e checksum.

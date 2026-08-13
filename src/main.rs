@@ -825,7 +825,7 @@ fn spawn_png_preparation_with(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn persist_metric_png_change(
+fn persist_metric_png_change<T: MetricPngTransaction>(
     store: &PreferencesStore,
     schedule: &mut RuntimeSchedule<Preferences>,
     now: Duration,
@@ -833,18 +833,27 @@ fn persist_metric_png_change(
     metric: MetricKind,
     previous: statlet::indicator_preferences::MetricIdentifierPreferences,
     preferences: Preferences,
-    transaction: PngAssetTransaction,
+    transaction: T,
 ) -> Vec<AppEffect> {
     schedule.queue_save(now, preferences.clone());
     schedule.request_save_now(now);
     debug_assert_eq!(schedule.due_save(now), Some(preferences.clone()));
     match store.save(preferences.clone()) {
         Ok(()) => {
-            transaction.commit();
+            let cleanup_error = transaction.commit().err();
             schedule.finish_save(&preferences, true);
-            core.handle(AppEvent::PreferencesSaveFinished(
+            let mut effects = core.handle(AppEvent::PreferencesSaveFinished(
                 PreferencesSaveResult::Saved,
-            ))
+            ));
+            if let Some(error) = cleanup_error {
+                effects.extend(core.handle(AppEvent::MetricPngTransactionCleanupFailed {
+                    metric,
+                    message: format!(
+                        "O PNG foi salvo, mas a limpeza segura da transação falhou: {error}"
+                    ),
+                }));
+            }
+            effects
         }
         Err(error) => {
             eprintln!("Statlet could not save preferences for a PNG change: {error}");
@@ -865,6 +874,21 @@ fn persist_metric_png_change(
                 message,
             })
         }
+    }
+}
+
+trait MetricPngTransaction {
+    fn commit(self) -> Result<(), String>;
+    fn rollback(self) -> Result<(), String>;
+}
+
+impl MetricPngTransaction for PngAssetTransaction {
+    fn commit(self) -> Result<(), String> {
+        PngAssetTransaction::commit(self).map_err(|error| error.user_message().to_owned())
+    }
+
+    fn rollback(self) -> Result<(), String> {
+        PngAssetTransaction::rollback(self).map_err(|error| error.user_message().to_owned())
     }
 }
 
@@ -1131,6 +1155,94 @@ mod tests {
         );
         assert_eq!(core.state().preferences.indicator.identifiers.cpu, previous);
         assert_eq!(effects, vec![AppEffect::RequestIndicatorRedraw]);
+    }
+
+    #[derive(Debug)]
+    struct FaultInjectedTransaction {
+        commit_error: Option<String>,
+        rollback_error: Option<String>,
+    }
+
+    impl super::MetricPngTransaction for FaultInjectedTransaction {
+        fn commit(self) -> Result<(), String> {
+            self.commit_error.map_or(Ok(()), Err)
+        }
+
+        fn rollback(self) -> Result<(), String> {
+            self.rollback_error.map_or(Ok(()), Err)
+        }
+    }
+
+    #[test]
+    fn committed_preferences_surface_transaction_cleanup_failure() {
+        let directory = tempdir().unwrap();
+        let preferences_store = PreferencesStore::new(directory.path().join("preferences.json"));
+        let mut core = StatletCore::new();
+        let previous = core.state().preferences.indicator.identifiers.cpu.clone();
+        let preferences = core.state().preferences.clone();
+        let mut schedule = statlet::runtime_schedule::RuntimeSchedule::new();
+
+        let effects = super::persist_metric_png_change(
+            &preferences_store,
+            &mut schedule,
+            Duration::ZERO,
+            &mut core,
+            MetricKind::Cpu,
+            previous,
+            preferences,
+            FaultInjectedTransaction {
+                commit_error: Some("fault injected during backup cleanup".into()),
+                rollback_error: None,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            core.state().preferences_save_status,
+            PreferencesSaveStatus::Saved
+        );
+        assert!(core
+            .state()
+            .indicator_icon_error(MetricKind::Cpu)
+            .unwrap()
+            .contains("fault injected during backup cleanup"));
+    }
+
+    #[test]
+    fn failed_preferences_save_surfaces_rollback_failure() {
+        let directory = tempdir().unwrap();
+        let blocker = directory.path().join("not-a-directory");
+        fs::write(&blocker, b"block preference parent").unwrap();
+        let preferences_store = PreferencesStore::new(blocker.join("preferences.json"));
+        let mut core = StatletCore::new();
+        let previous = core.state().preferences.indicator.identifiers.ram.clone();
+        let preferences = core.state().preferences.clone();
+        let mut schedule = statlet::runtime_schedule::RuntimeSchedule::new();
+
+        let effects = super::persist_metric_png_change(
+            &preferences_store,
+            &mut schedule,
+            Duration::ZERO,
+            &mut core,
+            MetricKind::Ram,
+            previous,
+            preferences,
+            FaultInjectedTransaction {
+                commit_error: None,
+                rollback_error: Some("fault injected while restoring previous.png".into()),
+            },
+        );
+
+        assert_eq!(effects, vec![AppEffect::RequestIndicatorRedraw]);
+        assert_eq!(
+            core.state().preferences_save_status,
+            PreferencesSaveStatus::Failed
+        );
+        assert!(core
+            .state()
+            .indicator_icon_error(MetricKind::Ram)
+            .unwrap()
+            .contains("fault injected while restoring previous.png"));
     }
 
     #[test]

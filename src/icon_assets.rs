@@ -16,6 +16,44 @@ const MAX_SOURCE_PIXELS: u64 = 16_777_216;
 const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TEMPORARY_PATH_ATTEMPTS: usize = 1_024;
 
+trait AssetFileSystem: fmt::Debug + Send + Sync {
+    fn create_dir(&self, path: &Path) -> io::Result<()>;
+    fn write_temporary(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
+    fn remove_dir(&self, path: &Path) -> io::Result<()>;
+    fn sync_directory(&self, path: &Path) -> io::Result<()>;
+}
+
+#[derive(Debug)]
+struct NativeAssetFileSystem;
+
+impl AssetFileSystem for NativeAssetFileSystem {
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        fs::create_dir(path)
+    }
+
+    fn write_temporary(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        write_temporary(path, bytes)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        fs::remove_dir(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        File::open(path)?.sync_all()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PngImportErrorKind {
     SourceTooLarge,
@@ -166,6 +204,7 @@ fn invalid_png() -> PngImportError {
 pub struct IconAssetStore {
     directory: PathBuf,
     temp_sequence: Arc<AtomicU64>,
+    file_system: Arc<dyn AssetFileSystem>,
 }
 
 #[derive(Debug)]
@@ -187,7 +226,14 @@ impl PreparedPngAsset {
 
 impl Drop for PreparedPngAsset {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.temporary);
+        if let Err(error) = fs::remove_file(&self.temporary) {
+            if error.kind() != io::ErrorKind::NotFound {
+                eprintln!(
+                    "Statlet could not clean a prepared PNG at {}: {error}",
+                    self.temporary.display()
+                );
+            }
+        }
     }
 }
 
@@ -205,48 +251,88 @@ pub struct PngAssetTransaction {
     backup: Option<PathBuf>,
     mutation: AssetMutation,
     active: bool,
+    file_system: Arc<dyn AssetFileSystem>,
 }
 
 impl PngAssetTransaction {
-    pub fn commit(mut self) {
-        if let Some(backup) = &self.backup {
-            let _ = fs::remove_file(backup);
-        }
-        let _ = fs::remove_dir(&self.transaction_directory);
-        let _ = File::open(&self.directory).and_then(|directory| directory.sync_all());
+    pub fn commit(mut self) -> Result<(), PngImportError> {
         self.active = false;
+        let mut failures = Vec::new();
+        if let Some(backup) = &self.backup {
+            record_operation_failure(
+                &mut failures,
+                "remover o backup confirmado",
+                backup,
+                self.file_system.remove_file(backup),
+                true,
+            );
+        }
+        record_operation_failure(
+            &mut failures,
+            "limpar a transação",
+            &self.transaction_directory,
+            self.file_system.remove_dir(&self.transaction_directory),
+            true,
+        );
+        record_operation_failure(
+            &mut failures,
+            "sincronizar o diretório",
+            &self.directory,
+            self.file_system.sync_directory(&self.directory),
+            false,
+        );
+        transaction_result("Não foi possível concluir a transação do PNG", failures)
     }
 
     pub fn rollback(mut self) -> Result<(), PngImportError> {
-        self.rollback_inner().map_err(file_system_error)?;
         self.active = false;
-        Ok(())
+        self.rollback_inner()
     }
 
-    fn rollback_inner(&self) -> io::Result<()> {
+    fn rollback_inner(&self) -> Result<(), PngImportError> {
+        let mut failures = Vec::new();
         if self.mutation == AssetMutation::Replace {
-            match fs::remove_file(&self.destination) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+            record_operation_failure(
+                &mut failures,
+                "remover o PNG novo",
+                &self.destination,
+                self.file_system.remove_file(&self.destination),
+                true,
+            );
         }
         if let Some(backup) = &self.backup {
-            fs::rename(backup, &self.destination)?;
+            record_operation_failure(
+                &mut failures,
+                "restaurar o PNG anterior",
+                backup,
+                self.file_system.rename(backup, &self.destination),
+                false,
+            );
         }
-        match fs::remove_dir(&self.transaction_directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        File::open(&self.directory)?.sync_all()
+        record_operation_failure(
+            &mut failures,
+            "limpar a transação",
+            &self.transaction_directory,
+            self.file_system.remove_dir(&self.transaction_directory),
+            true,
+        );
+        record_operation_failure(
+            &mut failures,
+            "sincronizar o diretório",
+            &self.directory,
+            self.file_system.sync_directory(&self.directory),
+            false,
+        );
+        transaction_result("Não foi possível restaurar a transação do PNG", failures)
     }
 }
 
 impl Drop for PngAssetTransaction {
     fn drop(&mut self) {
         if self.active {
-            let _ = self.rollback_inner();
+            if let Err(error) = self.rollback_inner() {
+                eprintln!("Statlet could not roll back an abandoned PNG transaction: {error}");
+            }
         }
     }
 }
@@ -256,6 +342,16 @@ impl IconAssetStore {
         Self {
             directory,
             temp_sequence: Arc::new(AtomicU64::new(0)),
+            file_system: Arc::new(NativeAssetFileSystem),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_file_system(directory: PathBuf, file_system: Arc<dyn AssetFileSystem>) -> Self {
+        Self {
+            directory,
+            temp_sequence: Arc::new(AtomicU64::new(0)),
+            file_system,
         }
     }
 
@@ -317,7 +413,7 @@ impl IconAssetStore {
     ) -> Result<PngIconMetadata, PngImportError> {
         let prepared = self.prepare_bytes(metric, source_name, bytes)?;
         let metadata = prepared.metadata().clone();
-        self.begin_replace(prepared)?.commit();
+        self.begin_replace(prepared)?.commit()?;
         Ok(metadata)
     }
 
@@ -375,64 +471,96 @@ impl IconAssetStore {
     ) -> Result<PngAssetTransaction, PngImportError> {
         let destination = self.path_for(prepared.metric);
         let transaction_directory = self.create_transaction_directory(&destination)?;
-        let backup = match move_existing_to_backup(&destination, &transaction_directory) {
+        let backup = match move_existing_to_backup(
+            self.file_system.as_ref(),
+            &destination,
+            &transaction_directory,
+        ) {
             Ok(backup) => backup,
             Err(error) => {
-                let _ = fs::remove_dir(&transaction_directory);
-                return Err(file_system_error(error));
+                let cleanup = self.cleanup_empty_transaction(&transaction_directory);
+                return Err(compensated_operation_error(
+                    "Não foi possível preparar o backup do PNG",
+                    error,
+                    cleanup,
+                ));
             }
         };
-        if let Err(error) = fs::rename(&prepared.temporary, &destination) {
-            if let Some(backup) = &backup {
-                let _ = fs::rename(backup, &destination);
-            }
-            let _ = fs::remove_dir(&transaction_directory);
-            return Err(file_system_error(error));
+        if let Err(error) = self.file_system.rename(&prepared.temporary, &destination) {
+            let transaction = self.transaction(
+                destination,
+                transaction_directory,
+                backup,
+                AssetMutation::Replace,
+            );
+            let rollback = transaction.rollback();
+            return Err(compensated_operation_error(
+                "Não foi possível instalar o PNG",
+                error,
+                rollback,
+            ));
         }
-        if let Err(error) = File::open(&self.directory).and_then(|directory| directory.sync_all()) {
-            let _ = fs::remove_file(&destination);
-            if let Some(backup) = &backup {
-                let _ = fs::rename(backup, &destination);
-            }
-            let _ = fs::remove_dir(&transaction_directory);
-            return Err(file_system_error(error));
+        if let Err(error) = self.file_system.sync_directory(&self.directory) {
+            let transaction = self.transaction(
+                destination,
+                transaction_directory,
+                backup,
+                AssetMutation::Replace,
+            );
+            let rollback = transaction.rollback();
+            return Err(compensated_operation_error(
+                "Não foi possível instalar o PNG",
+                error,
+                rollback,
+            ));
         }
-        Ok(PngAssetTransaction {
-            directory: self.directory.clone(),
+        Ok(self.transaction(
             destination,
             transaction_directory,
             backup,
-            mutation: AssetMutation::Replace,
-            active: true,
-        })
+            AssetMutation::Replace,
+        ))
     }
 
     pub fn begin_remove(&self, metric: MetricKind) -> Result<PngAssetTransaction, PngImportError> {
         fs::create_dir_all(&self.directory).map_err(file_system_error)?;
         let destination = self.path_for(metric);
         let transaction_directory = self.create_transaction_directory(&destination)?;
-        let backup = match move_existing_to_backup(&destination, &transaction_directory) {
+        let backup = match move_existing_to_backup(
+            self.file_system.as_ref(),
+            &destination,
+            &transaction_directory,
+        ) {
             Ok(backup) => backup,
             Err(error) => {
-                let _ = fs::remove_dir(&transaction_directory);
-                return Err(file_system_error(error));
+                let cleanup = self.cleanup_empty_transaction(&transaction_directory);
+                return Err(compensated_operation_error(
+                    "Não foi possível preparar a remoção do PNG",
+                    error,
+                    cleanup,
+                ));
             }
         };
-        if let Err(error) = File::open(&self.directory).and_then(|directory| directory.sync_all()) {
-            if let Some(backup) = &backup {
-                let _ = fs::rename(backup, &destination);
-            }
-            let _ = fs::remove_dir(&transaction_directory);
-            return Err(file_system_error(error));
+        if let Err(error) = self.file_system.sync_directory(&self.directory) {
+            let transaction = self.transaction(
+                destination,
+                transaction_directory,
+                backup,
+                AssetMutation::Remove,
+            );
+            let rollback = transaction.rollback();
+            return Err(compensated_operation_error(
+                "Não foi possível remover o PNG",
+                error,
+                rollback,
+            ));
         }
-        Ok(PngAssetTransaction {
-            directory: self.directory.clone(),
+        Ok(self.transaction(
             destination,
             transaction_directory,
             backup,
-            mutation: AssetMutation::Remove,
-            active: true,
-        })
+            AssetMutation::Remove,
+        ))
     }
 
     fn write_unique_temporary(
@@ -448,14 +576,29 @@ impl IconAssetStore {
                 self.temp_sequence.fetch_add(1, Ordering::Relaxed),
                 suffix,
             );
-            match write_temporary(&temporary, bytes) {
+            match self.file_system.write_temporary(&temporary, bytes) {
                 Ok(()) => return Ok(temporary),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     last_collision = Some(error);
                 }
                 Err(error) => {
-                    let _ = fs::remove_file(&temporary);
-                    return Err(file_system_error(error));
+                    let mut failures = Vec::new();
+                    record_operation_failure(
+                        &mut failures,
+                        "limpar o PNG temporário incompleto",
+                        &temporary,
+                        self.file_system.remove_file(&temporary),
+                        true,
+                    );
+                    let cleanup = transaction_result(
+                        "Não foi possível limpar o PNG temporário incompleto",
+                        failures,
+                    );
+                    return Err(compensated_operation_error(
+                        "Não foi possível gravar o PNG temporário",
+                        error,
+                        cleanup,
+                    ));
                 }
             }
         }
@@ -486,7 +629,7 @@ impl IconAssetStore {
                 self.temp_sequence.fetch_add(1, Ordering::Relaxed),
                 "transaction",
             );
-            match fs::create_dir(&path) {
+            match self.file_system.create_dir(&path) {
                 Ok(()) => return Ok(path),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     last_collision = Some(error);
@@ -500,6 +643,46 @@ impl IconAssetStore {
                 "could not allocate an icon transaction directory",
             )
         })))
+    }
+
+    fn transaction(
+        &self,
+        destination: PathBuf,
+        transaction_directory: PathBuf,
+        backup: Option<PathBuf>,
+        mutation: AssetMutation,
+    ) -> PngAssetTransaction {
+        PngAssetTransaction {
+            directory: self.directory.clone(),
+            destination,
+            transaction_directory,
+            backup,
+            mutation,
+            active: true,
+            file_system: self.file_system.clone(),
+        }
+    }
+
+    fn cleanup_empty_transaction(
+        &self,
+        transaction_directory: &Path,
+    ) -> Result<(), PngImportError> {
+        let mut failures = Vec::new();
+        record_operation_failure(
+            &mut failures,
+            "limpar a transação",
+            transaction_directory,
+            self.file_system.remove_dir(transaction_directory),
+            true,
+        );
+        record_operation_failure(
+            &mut failures,
+            "sincronizar o diretório",
+            &self.directory,
+            self.file_system.sync_directory(&self.directory),
+            false,
+        );
+        transaction_result("Não foi possível limpar a transação do PNG", failures)
     }
 
     pub fn remove(&self, metric: MetricKind) -> Result<(), PngImportError> {
@@ -528,6 +711,7 @@ fn write_temporary(temporary: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn move_existing_to_backup(
+    file_system: &dyn AssetFileSystem,
     destination: &Path,
     transaction_directory: &Path,
 ) -> io::Result<Option<PathBuf>> {
@@ -535,8 +719,49 @@ fn move_existing_to_backup(
         return Ok(None);
     }
     let backup = transaction_directory.join("previous.png");
-    fs::rename(destination, &backup)?;
+    file_system.rename(destination, &backup)?;
     Ok(Some(backup))
+}
+
+fn record_operation_failure(
+    failures: &mut Vec<String>,
+    operation: &str,
+    path: &Path,
+    result: io::Result<()>,
+    ignore_not_found: bool,
+) {
+    if let Err(error) = result {
+        if ignore_not_found && error.kind() == io::ErrorKind::NotFound {
+            return;
+        }
+        failures.push(format!("{operation} em {}: {error}", path.display()));
+    }
+}
+
+fn transaction_result(summary: &str, failures: Vec<String>) -> Result<(), PngImportError> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(PngImportError::new(
+            PngImportErrorKind::FileSystem,
+            format!("{summary}: {}", failures.join("; ")),
+        ))
+    }
+}
+
+fn compensated_operation_error(
+    operation: &str,
+    primary: io::Error,
+    compensation: Result<(), PngImportError>,
+) -> PngImportError {
+    let compensation = compensation
+        .err()
+        .map(|error| format!("; a compensação também falhou: {error}"))
+        .unwrap_or_default();
+    PngImportError::new(
+        PngImportErrorKind::FileSystem,
+        format!("{operation}: {primary}{compensation}"),
+    )
 }
 
 fn file_system_error(error: io::Error) -> PngImportError {
@@ -544,4 +769,196 @@ fn file_system_error(error: io::Error) -> PngImportError {
         PngImportErrorKind::FileSystem,
         format!("Não foi possível salvar o PNG: {error}"),
     )
+}
+
+#[cfg(test)]
+mod fault_injection_tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FaultPoint {
+        CreateDirectory,
+        WriteTemporary,
+        Rename,
+        RemoveFile,
+        RemoveDirectory,
+        SyncDirectory,
+    }
+
+    #[derive(Debug, Default)]
+    struct FaultInjectingFileSystem {
+        failures: Mutex<VecDeque<FaultPoint>>,
+        calls: Mutex<Vec<FaultPoint>>,
+    }
+
+    impl FaultInjectingFileSystem {
+        fn arm(&self, failures: impl IntoIterator<Item = FaultPoint>) {
+            self.failures.lock().unwrap().extend(failures);
+        }
+
+        fn record(&self, point: FaultPoint) -> io::Result<()> {
+            self.calls.lock().unwrap().push(point);
+            let mut failures = self.failures.lock().unwrap();
+            if failures.front() == Some(&point) {
+                failures.pop_front();
+                Err(io::Error::other(format!("fault injected at {point:?}")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl AssetFileSystem for FaultInjectingFileSystem {
+        fn create_dir(&self, path: &Path) -> io::Result<()> {
+            self.record(FaultPoint::CreateDirectory)?;
+            fs::create_dir(path)
+        }
+
+        fn write_temporary(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+            if let Err(error) = self.record(FaultPoint::WriteTemporary) {
+                fs::write(path, b"partial PNG from injected write failure")?;
+                return Err(error);
+            }
+            super::write_temporary(path, bytes)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.record(FaultPoint::Rename)?;
+            fs::rename(from, to)
+        }
+
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            self.record(FaultPoint::RemoveFile)?;
+            fs::remove_file(path)
+        }
+
+        fn remove_dir(&self, path: &Path) -> io::Result<()> {
+            self.record(FaultPoint::RemoveDirectory)?;
+            fs::remove_dir(path)
+        }
+
+        fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            self.record(FaultPoint::SyncDirectory)?;
+            File::open(path)?.sync_all()
+        }
+    }
+
+    #[test]
+    fn rollback_attempts_every_compensation_step_and_reports_all_failures() {
+        let directory = tempdir().unwrap();
+        let native_store = IconAssetStore::new(directory.path().to_path_buf());
+        native_store
+            .import_bytes(MetricKind::Cpu, "old.png", &png([0x11, 0x22, 0x33, 0xFF]))
+            .unwrap();
+        let file_system = Arc::new(FaultInjectingFileSystem::default());
+        let store =
+            IconAssetStore::with_file_system(directory.path().to_path_buf(), file_system.clone());
+        let prepared = store
+            .prepare_bytes(MetricKind::Cpu, "new.png", &png([0xAA, 0xBB, 0xCC, 0xFF]))
+            .unwrap();
+        let transaction = store.begin_replace(prepared).unwrap();
+        file_system.arm([
+            FaultPoint::RemoveFile,
+            FaultPoint::Rename,
+            FaultPoint::RemoveDirectory,
+            FaultPoint::SyncDirectory,
+        ]);
+
+        let error = transaction.rollback().unwrap_err();
+
+        assert!(error.user_message().contains("remover o PNG novo"));
+        assert!(error.user_message().contains("restaurar o PNG anterior"));
+        assert!(error.user_message().contains("limpar a transação"));
+        assert!(error.user_message().contains("sincronizar o diretório"));
+        assert!(file_system.failures.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn begin_replace_propagates_failures_from_its_disk_compensation() {
+        let directory = tempdir().unwrap();
+        let native_store = IconAssetStore::new(directory.path().to_path_buf());
+        native_store
+            .import_bytes(MetricKind::Cpu, "old.png", &png([0x11, 0x22, 0x33, 0xFF]))
+            .unwrap();
+        let file_system = Arc::new(FaultInjectingFileSystem::default());
+        let store =
+            IconAssetStore::with_file_system(directory.path().to_path_buf(), file_system.clone());
+        let prepared = store
+            .prepare_bytes(MetricKind::Cpu, "new.png", &png([0xAA, 0xBB, 0xCC, 0xFF]))
+            .unwrap();
+        file_system.arm([
+            FaultPoint::SyncDirectory,
+            FaultPoint::Rename,
+            FaultPoint::RemoveDirectory,
+        ]);
+
+        let error = store.begin_replace(prepared).unwrap_err();
+
+        assert!(error.user_message().contains("instalar o PNG"));
+        assert!(error.user_message().contains("restaurar o PNG anterior"));
+        assert!(error.user_message().contains("limpar a transação"));
+        assert!(file_system.failures.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn commit_propagates_backup_cleanup_and_directory_sync_failures() {
+        let directory = tempdir().unwrap();
+        let native_store = IconAssetStore::new(directory.path().to_path_buf());
+        native_store
+            .import_bytes(MetricKind::Cpu, "old.png", &png([0x11, 0x22, 0x33, 0xFF]))
+            .unwrap();
+        let file_system = Arc::new(FaultInjectingFileSystem::default());
+        let store =
+            IconAssetStore::with_file_system(directory.path().to_path_buf(), file_system.clone());
+        let prepared = store
+            .prepare_bytes(MetricKind::Cpu, "new.png", &png([0xAA, 0xBB, 0xCC, 0xFF]))
+            .unwrap();
+        let transaction = store.begin_replace(prepared).unwrap();
+        file_system.arm([
+            FaultPoint::RemoveFile,
+            FaultPoint::RemoveDirectory,
+            FaultPoint::SyncDirectory,
+        ]);
+
+        let error = transaction.commit().unwrap_err();
+
+        assert!(error.user_message().contains("remover o backup confirmado"));
+        assert!(error.user_message().contains("limpar a transação"));
+        assert!(error.user_message().contains("sincronizar o diretório"));
+        assert!(file_system.failures.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_temporary_write_propagates_its_cleanup_failure() {
+        let directory = tempdir().unwrap();
+        let file_system = Arc::new(FaultInjectingFileSystem::default());
+        let store =
+            IconAssetStore::with_file_system(directory.path().to_path_buf(), file_system.clone());
+        file_system.arm([FaultPoint::WriteTemporary, FaultPoint::RemoveFile]);
+
+        let error = store
+            .prepare_bytes(MetricKind::Cpu, "new.png", &png([0xAA, 0xBB, 0xCC, 0xFF]))
+            .unwrap_err();
+
+        assert!(error.user_message().contains("gravar o PNG temporário"));
+        assert!(error
+            .user_message()
+            .contains("limpar o PNG temporário incompleto"));
+        assert!(file_system.failures.lock().unwrap().is_empty());
+    }
+
+    fn png(color: [u8; 4]) -> Vec<u8> {
+        let image = RgbaImage::from_pixel(12, 12, Rgba(color));
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
 }
