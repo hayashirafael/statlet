@@ -11,7 +11,8 @@ use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly
 use objc2_app_kit::{
     NSAccessibility, NSAccessibilityAnnouncementKey,
     NSAccessibilityAnnouncementRequestedNotification, NSAccessibilityPostNotification,
-    NSAccessibilityPostNotificationWithUserInfo, NSAccessibilityValueChangedNotification, NSAlert,
+    NSAccessibilityPostNotificationWithUserInfo, NSAccessibilityPriorityKey,
+    NSAccessibilityPriorityLevel, NSAccessibilityValueChangedNotification, NSAlert,
     NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSFocusRingType, NSLineBreakMode,
@@ -22,8 +23,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSArray, NSDate, NSDateFormatter, NSDateFormatterStyle,
-    NSDictionary, NSFileManager, NSIndexSet, NSNotification, NSObject, NSObjectProtocol, NSPoint,
-    NSRect, NSSize, NSString,
+    NSDictionary, NSFileManager, NSIndexSet, NSNotification, NSNumber, NSObject, NSObjectProtocol,
+    NSPoint, NSRect, NSSize, NSString,
 };
 use statlet::core::{AppEvent, AppState, Preferences, WarningThreshold, WindowKind};
 use statlet::disk::format_decimal_gigabytes;
@@ -775,6 +776,26 @@ struct SystemUsageLayout {
     process_scroll: NSRect,
 }
 
+const SYSTEM_USAGE_MIN_CONTENT_WIDTH: f64 = 620.0;
+const SYSTEM_USAGE_MIN_CONTENT_HEIGHT: f64 = 620.0;
+#[cfg(test)]
+const PROCESS_TABLE_HEADER_HEIGHT: f64 = 25.0;
+const PROCESS_TABLE_ROW_HEIGHT: f64 = 22.0;
+const PROCESS_TABLE_ROW_SPACING: f64 = 2.0;
+
+fn system_usage_min_content_size() -> NSSize {
+    NSSize::new(
+        SYSTEM_USAGE_MIN_CONTENT_WIDTH,
+        SYSTEM_USAGE_MIN_CONTENT_HEIGHT,
+    )
+}
+
+#[cfg(test)]
+fn process_table_height_for_visible_rows(rows: usize) -> f64 {
+    PROCESS_TABLE_HEADER_HEIGHT
+        + rows as f64 * (PROCESS_TABLE_ROW_HEIGHT + PROCESS_TABLE_ROW_SPACING)
+}
+
 fn system_usage_layout(size: NSSize) -> SystemUsageLayout {
     let top = size.height;
     let detail_labels = std::array::from_fn(|index| {
@@ -1251,12 +1272,7 @@ impl SystemUsageWindow {
 }
 
 fn post_accessibility_announcement(element: &AnyObject, announcement: &str) {
-    let user_info = NSDictionary::from_retained_objects(
-        &[unsafe { NSAccessibilityAnnouncementKey }],
-        &[Retained::into_super(Retained::into_super(
-            NSString::from_str(announcement),
-        ))],
-    );
+    let user_info = accessibility_announcement_user_info(announcement);
     unsafe {
         NSAccessibilityPostNotificationWithUserInfo(
             element,
@@ -1264,6 +1280,22 @@ fn post_accessibility_announcement(element: &AnyObject, announcement: &str) {
             Some(&user_info),
         )
     };
+}
+
+fn accessibility_announcement_user_info(
+    announcement: &str,
+) -> Retained<NSDictionary<NSString, AnyObject>> {
+    NSDictionary::from_retained_objects(
+        &[unsafe { NSAccessibilityAnnouncementKey }, unsafe {
+            NSAccessibilityPriorityKey
+        }],
+        &[
+            Retained::into_super(Retained::into_super(NSString::from_str(announcement))),
+            Retained::into_super(Retained::into_super(Retained::into_super(
+                NSNumber::numberWithInteger(NSAccessibilityPriorityLevel::Medium.0),
+            ))),
+        ],
+    )
 }
 
 fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> SystemUsageWindow {
@@ -1284,7 +1316,7 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
     window.setDelegate(Some(ProtocolObject::from_ref(target)));
     window.setCollectionBehavior(NSWindowCollectionBehavior::MoveToActiveSpace);
     window.setTitle(ns_string!("Uso do sistema"));
-    window.setContentMinSize(NSSize::new(620.0, 520.0));
+    window.setContentMinSize(system_usage_min_content_size());
     window.center();
     let content = window
         .contentView()
@@ -1375,6 +1407,8 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
             NSSize::new((layout.process_scroll.size.width - 20.0).max(1.0), 188.0),
         ),
     );
+    process_table.setRowHeight(PROCESS_TABLE_ROW_HEIGHT);
+    process_table.setIntercellSpacing(NSSize::new(3.0, PROCESS_TABLE_ROW_SPACING));
     process_table.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
     process_table.setColumnAutoresizingStyle(
         NSTableViewColumnAutoresizingStyle::FirstColumnOnlyAutoresizingStyle,
@@ -1849,13 +1883,40 @@ fn threshold_title(threshold: WarningThreshold) -> Retained<objc2_foundation::NS
 #[cfg(test)]
 mod tests {
     use super::{
-        detail_label_display_text, detail_label_frame, detail_value_display_text,
-        focused_process_disappearance_announcement, memory_composition_stroke_style,
-        process_cell_presentation, process_selection_after_update, process_table_column_widths,
-        system_usage_layout,
+        accessibility_announcement_user_info, detail_label_display_text, detail_label_frame,
+        detail_value_display_text, focused_process_disappearance_announcement,
+        memory_composition_stroke_style, process_cell_presentation, process_selection_after_update,
+        process_table_column_widths, process_table_height_for_visible_rows, system_usage_layout,
+        system_usage_min_content_size,
+    };
+    use objc2::msg_send;
+    use objc2_app_kit::{
+        NSAccessibilityAnnouncementKey, NSAccessibilityPriorityKey, NSAccessibilityPriorityLevel,
     };
     use objc2_foundation::NSSize;
     use statlet::stats::ProcessRowViewModel;
+
+    #[test]
+    fn native_announcement_payload_includes_message_and_medium_priority() {
+        let payload = accessibility_announcement_user_info("Pressão da memória crítica.");
+
+        assert_eq!(payload.count(), 2);
+        let announcement = payload
+            .objectForKey(unsafe { NSAccessibilityAnnouncementKey })
+            .expect("announcement value");
+        let priority = payload
+            .objectForKey(unsafe { NSAccessibilityPriorityKey })
+            .expect("priority value");
+        let announcement: String = unsafe {
+            let description: objc2::rc::Retained<objc2_foundation::NSString> =
+                msg_send![&*announcement, description];
+            description.to_string()
+        };
+        let priority: isize = unsafe { msg_send![&*priority, integerValue] };
+
+        assert_eq!(announcement, "Pressão da memória crítica.");
+        assert_eq!(priority, NSAccessibilityPriorityLevel::Medium.0);
+    }
 
     #[test]
     fn native_process_cells_have_distinct_column_aware_accessibility_labels() {
@@ -1907,14 +1968,16 @@ mod tests {
 
     #[test]
     fn system_usage_layout_fits_without_overlap_at_the_declared_minimum() {
-        let layout = system_usage_layout(NSSize::new(620.0, 520.0));
+        let minimum = system_usage_min_content_size();
+        let layout = system_usage_layout(minimum);
         let max_x = |frame: objc2_foundation::NSRect| frame.origin.x + frame.size.width;
         let max_y = |frame: objc2_foundation::NSRect| frame.origin.y + frame.size.height;
 
-        assert!(max_x(layout.segmented) <= 620.0);
-        assert!(max_y(layout.segmented) <= 520.0);
+        assert_eq!(minimum, NSSize::new(620.0, 620.0));
+        assert!(max_x(layout.segmented) <= minimum.width);
+        assert!(max_y(layout.segmented) <= minimum.height);
         assert!(max_x(layout.primary) < layout.detail_labels[0].origin.x);
-        assert!(max_x(layout.memory_composition) <= 620.0);
+        assert!(max_x(layout.memory_composition) <= minimum.width);
         assert!(max_y(layout.detail_labels[0]) <= layout.memory_composition.origin.y);
         assert!(max_y(layout.memory_composition) < layout.segmented.origin.y);
         assert!(max_x(layout.history_heading) < layout.detail_labels[4].origin.x);
@@ -1922,7 +1985,10 @@ mod tests {
         assert!(max_y(layout.history_summary) < layout.graph.origin.y);
         assert!(max_y(layout.process_heading) < layout.history_summary.origin.y);
         assert!(max_y(layout.process_scroll) < layout.process_heading.origin.y);
-        assert!(layout.process_scroll.size.height >= 50.0);
+        assert!(
+            layout.process_scroll.size.height >= process_table_height_for_visible_rows(5),
+            "the declared minimum must show the header plus five process rows"
+        );
     }
 
     #[test]

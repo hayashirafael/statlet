@@ -200,6 +200,7 @@ impl SystemUsageAccessibilityUpdate {
 pub struct SystemUsageAccessibilityCoordinator {
     ram_state: Option<SystemUsageAccessibilityState>,
     gpu_state: Option<SystemUsageAccessibilityState>,
+    last_ram_pressure: Option<MemoryPressure>,
     pending_summary_focus: Option<SystemUsageSection>,
 }
 
@@ -217,6 +218,12 @@ impl SystemUsageAccessibilityCoordinator {
         section: SystemUsageSection,
         state: SystemUsageAccessibilityState,
     ) -> SystemUsageAccessibilityUpdate {
+        let previous_ram_pressure = self.last_ram_pressure;
+        if let (SystemUsageSection::Ram, SystemUsageAccessibilityState::MemoryPressure(pressure)) =
+            (section, state)
+        {
+            self.last_ram_pressure = Some(pressure);
+        }
         let previous = match section {
             SystemUsageSection::Ram => self.ram_state.replace(state),
             SystemUsageSection::Gpu => self.gpu_state.replace(state),
@@ -227,7 +234,12 @@ impl SystemUsageAccessibilityCoordinator {
         }
         SystemUsageAccessibilityUpdate {
             announcement: previous.and_then(|previous| {
-                accessibility_transition_announcement(section, previous, state)
+                accessibility_transition_announcement(
+                    section,
+                    previous,
+                    state,
+                    previous_ram_pressure,
+                )
             }),
             focus_summary,
         }
@@ -238,6 +250,7 @@ fn accessibility_transition_announcement(
     section: SystemUsageSection,
     previous: SystemUsageAccessibilityState,
     current: SystemUsageAccessibilityState,
+    previous_ram_pressure: Option<MemoryPressure>,
 ) -> Option<String> {
     if previous == current {
         return None;
@@ -251,21 +264,32 @@ fn accessibility_transition_announcement(
         });
     }
     if was_interrupted && !is_interrupted && accessibility_state_is_available(current) {
-        return Some(match section {
+        let recovery = match section {
             SystemUsageSection::Ram => "Leitura de RAM restabelecida.".to_owned(),
             SystemUsageSection::Gpu => "Leitura de GPU restabelecida.".to_owned(),
+        };
+        return Some(match (section, current) {
+            (SystemUsageSection::Ram, SystemUsageAccessibilityState::MemoryPressure(pressure))
+                if previous_ram_pressure.is_some_and(|previous| previous != pressure) =>
+            {
+                format!("{recovery} {}", memory_pressure_announcement(pressure))
+            }
+            _ => recovery,
         });
     }
     match (section, current) {
-        (SystemUsageSection::Ram, SystemUsageAccessibilityState::MemoryPressure(pressure)) => Some(
-            match pressure {
-                MemoryPressure::Normal => "Pressão da memória normal.",
-                MemoryPressure::Warning => "Pressão da memória em atenção.",
-                MemoryPressure::Critical => "Pressão da memória crítica.",
-            }
-            .to_owned(),
-        ),
+        (SystemUsageSection::Ram, SystemUsageAccessibilityState::MemoryPressure(pressure)) => {
+            Some(memory_pressure_announcement(pressure).to_owned())
+        }
         _ => None,
+    }
+}
+
+fn memory_pressure_announcement(pressure: MemoryPressure) -> &'static str {
+    match pressure {
+        MemoryPressure::Normal => "Pressão da memória normal.",
+        MemoryPressure::Warning => "Pressão da memória em atenção.",
+        MemoryPressure::Critical => "Pressão da memória crítica.",
     }
 }
 

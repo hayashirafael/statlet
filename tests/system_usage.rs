@@ -467,6 +467,41 @@ fn accessibility_transitions_are_coalesced_and_human_section_focus_is_consumed_o
 }
 
 #[test]
+fn ram_recovery_coalesces_a_pressure_change_that_happened_during_failure() {
+    for (recovered_pressure, expected) in [
+        (
+            MemoryPressure::Warning,
+            "Leitura de RAM restabelecida. Pressão da memória em atenção.",
+        ),
+        (
+            MemoryPressure::Critical,
+            "Leitura de RAM restabelecida. Pressão da memória crítica.",
+        ),
+    ] {
+        let mut coordinator = SystemUsageAccessibilityCoordinator::new();
+        coordinator.observe(
+            SystemUsageSection::Ram,
+            SystemUsageAccessibilityState::MemoryPressure(MemoryPressure::Normal),
+        );
+        coordinator.observe(
+            SystemUsageSection::Ram,
+            SystemUsageAccessibilityState::Stale,
+        );
+
+        assert_eq!(
+            coordinator
+                .observe(
+                    SystemUsageSection::Ram,
+                    SystemUsageAccessibilityState::MemoryPressure(recovered_pressure),
+                )
+                .announcement
+                .as_deref(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
 fn graph_keyboard_navigation_skips_gaps_and_exposes_selected_value_and_time() {
     let points = vec![
         statlet::stats::UsagePoint {
