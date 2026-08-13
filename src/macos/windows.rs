@@ -1303,8 +1303,21 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
     }
     process_scroll.setDocumentView(Some(&process_table));
 
-    let ram_shortcut = shortcut_button(mtm, target, "1", sel!(selectSystemUsageRam:));
-    let gpu_shortcut = shortcut_button(mtm, target, "2", sel!(selectSystemUsageGpu:));
+    let [ram_key, gpu_key, close_key] = system_usage_shortcut_keys();
+    let ram_shortcut = shortcut_button(
+        mtm,
+        target as &AnyObject,
+        ram_key,
+        sel!(selectSystemUsageRam:),
+    );
+    let gpu_shortcut = shortcut_button(
+        mtm,
+        target as &AnyObject,
+        gpu_key,
+        sel!(selectSystemUsageGpu:),
+    );
+    let close_shortcut =
+        shortcut_button(mtm, &*window as &AnyObject, close_key, sel!(performClose:));
 
     content.addSubview(&segmented_control);
     content.addSubview(&primary_value);
@@ -1318,6 +1331,7 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
     content.addSubview(&process_scroll);
     content.addSubview(&ram_shortcut);
     content.addSubview(&gpu_shortcut);
+    content.addSubview(&close_shortcut);
     window.setInitialFirstResponder(Some(&segmented_control));
 
     SystemUsageWindow {
@@ -1343,17 +1357,12 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
 
 fn shortcut_button(
     mtm: MainThreadMarker,
-    target: &ControlTarget,
+    target: &AnyObject,
     key: &str,
     action: objc2::runtime::Sel,
 ) -> Retained<NSButton> {
     let button = unsafe {
-        NSButton::buttonWithTitle_target_action(
-            ns_string!(""),
-            Some(target as &AnyObject),
-            Some(action),
-            mtm,
-        )
+        NSButton::buttonWithTitle_target_action(ns_string!(""), Some(target), Some(action), mtm)
     };
     button.setFrame(NSRect::new(
         NSPoint::new(-20.0, -20.0),
@@ -1365,6 +1374,10 @@ fn shortcut_button(
     button
 }
 
+fn system_usage_shortcut_keys() -> [&'static str; 3] {
+    ["1", "2", "w"]
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -1372,6 +1385,11 @@ mod tests {
     use statlet::core::{AppState, StatletCore};
 
     use super::{prepare_preferences_for_show, release_preferences, RetainedStateConsumer};
+
+    #[test]
+    fn system_usage_shortcuts_include_the_native_close_command() {
+        assert_eq!(super::system_usage_shortcut_keys(), ["1", "2", "w"]);
+    }
 
     #[derive(Default)]
     struct RecordingStateConsumer {
