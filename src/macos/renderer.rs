@@ -17,8 +17,8 @@ use objc2_app_kit::{
 use objc2_foundation::{NSDictionary, NSMutableAttributedString, NSPoint, NSSize, NSString};
 
 use statlet::indicator::{
-    measure_stable_layout, IndicatorRun, IndicatorScene, LayoutDiagnostics, SegmentColor,
-    SemanticColor, StableLayout, TextMeasurer,
+    measure_stable_layout, measure_stable_layout_with_prefixes, IndicatorRun, IndicatorScene,
+    LayoutDiagnostics, SegmentColor, SemanticColor, StableLayout, TextMeasurer,
 };
 use statlet::indicator_preferences::{FontWeight, TypographyPreferences};
 
@@ -75,7 +75,8 @@ struct LayoutKey {
     resolved_family: String,
     size: u8,
     weight: FontWeight,
-    labels_visible: bool,
+    cpu_prefix: Option<String>,
+    ram_prefix: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -287,15 +288,16 @@ pub struct PreviewImages {
     pub dark: Retained<NSImage>,
 }
 
-fn labels_visible(scene: &IndicatorScene) -> bool {
-    line_has_label(&scene.top, "C") || line_has_label(&scene.bottom, "R")
-}
-
-fn line_has_label(runs: &[IndicatorRun], label: &str) -> bool {
-    let text = runs.iter().map(|run| run.text.as_str()).collect::<String>();
-    text.strip_prefix(label)
-        .and_then(|remainder| remainder.chars().next())
-        .is_some_and(char::is_whitespace)
+fn label_prefix(runs: &[IndicatorRun]) -> Option<String> {
+    match runs {
+        [label, value] if value.text.ends_with('%') => Some(label.text.clone()),
+        [combined] => combined
+            .text
+            .rsplit_once(char::is_whitespace)
+            .filter(|(_, value)| value.ends_with('%'))
+            .map(|(label, _)| format!("{label} ")),
+        _ => None,
+    }
 }
 
 type TextAttributes = Retained<NSDictionary<NSString, AnyObject>>;
@@ -448,15 +450,22 @@ impl Renderer {
         let resolved = self.resolve_typography(typography);
         let font = resolved.font;
         let measurer = resolved.measurer;
-        let labels_visible = labels_visible(scene);
+        let cpu_prefix = label_prefix(&scene.top);
+        let ram_prefix = label_prefix(&scene.bottom);
         let layout_key = LayoutKey {
             resolved_family: font.resolved_family.clone(),
             size: typography.size.points(),
             weight: typography.weight,
-            labels_visible,
+            cpu_prefix,
+            ram_prefix,
         };
         let layout = self.cache.resolve_layout(slot, &layout_key, || {
-            measure_stable_layout(&measurer, labels_visible, self.default_width)
+            measure_stable_layout_with_prefixes(
+                &measurer,
+                layout_key.cpu_prefix.as_deref(),
+                layout_key.ram_prefix.as_deref(),
+                self.default_width,
+            )
         });
         let appearance_name = appearance.name().to_string();
         let paint_key = paint_key(scene, layout_key.clone(), appearance_name);
@@ -902,7 +911,8 @@ mod tests {
             resolved_family: family.to_owned(),
             size: 12,
             weight: FontWeight::Medium,
-            labels_visible,
+            cpu_prefix: labels_visible.then(|| "C ".to_owned()),
+            ram_prefix: labels_visible.then(|| "R ".to_owned()),
         }
     }
 
@@ -1276,9 +1286,9 @@ mod tests {
         let consolidated = scene_with_lines(&["C 42%"], &["R 68%"]);
         let hidden = scene_with_lines(&["42%"], &["68%"]);
 
-        assert!(labels_visible(&split));
-        assert!(labels_visible(&consolidated));
-        assert!(!labels_visible(&hidden));
+        assert!(label_prefix(&split.top).is_some());
+        assert!(label_prefix(&consolidated.top).is_some());
+        assert!(label_prefix(&hidden.top).is_none());
     }
 
     #[test]

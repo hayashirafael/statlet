@@ -105,11 +105,66 @@ pub enum LabelColorMode {
     Fixed,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndicatorLabel(String);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidIndicatorLabel;
+
+impl IndicatorLabel {
+    pub const MAX_CHARACTERS: usize = 10;
+
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidIndicatorLabel> {
+        let value = value.into();
+        let value = value.trim();
+        if value.is_empty() || value.chars().count() > Self::MAX_CHARACTERS {
+            return Err(InvalidIndicatorLabel);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LabelSpacing(u8);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidLabelSpacing;
+
+impl TryFrom<u8> for LabelSpacing {
+    type Error = InvalidLabelSpacing;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0..=4 => Ok(Self(value)),
+            _ => Err(InvalidLabelSpacing),
+        }
+    }
+}
+
+impl LabelSpacing {
+    pub const fn spaces(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl Default for LabelSpacing {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LabelPreferences {
     pub visible: bool,
     pub color_mode: LabelColorMode,
     pub fixed: FixedColorPreferences,
+    pub cpu: IndicatorLabel,
+    pub ram: IndicatorLabel,
+    pub spacing: LabelSpacing,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,6 +315,9 @@ impl Default for IndicatorPreferences {
                     use_appearance_variants: false,
                     variants: None,
                 },
+                cpu: IndicatorLabel("C".to_owned()),
+                ram: IndicatorLabel("R".to_owned()),
+                spacing: LabelSpacing::default(),
             },
             typography: TypographyPreferences {
                 family: FontFamilyPreference::SystemMonospaced,

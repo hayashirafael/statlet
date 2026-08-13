@@ -71,6 +71,8 @@ Enquanto o campo estiver incompleto ou inválido, a última cor válida continua
 
 Um único controle **Mostrar rótulos C/R** governa as duas linhas. Não é possível ocultar apenas um deles.
 
+Cada linha oferece seu próprio campo de rótulo. O campo aceita de 1 a 10 caracteres Unicode depois de remover espaços externos; valores vazios ou maiores são rejeitados sem alterar a preferência já válida. Um terceiro campo escolhe de 0 a 4 espaços entre o rótulo e o percentual. O padrão compacto continua `C 18% / R 63%`.
+
 Quando visíveis, existem três modos de cor:
 
 - **Neutra**: usa a cor de texto semântica do macOS, como na v1;
@@ -248,7 +250,6 @@ Antes de release, validar:
 - ocultar somente uma das métricas ou somente um dos rótulos;
 - intervalos independentes por métrica;
 - tamanhos, famílias ou pesos de fonte independentes por métrica;
-- editar os textos `C` e `R`;
 - transparência de cor;
 - personalizar os limiares ou as cores do modo dinâmico;
 - presets, importação ou exportação de temas;

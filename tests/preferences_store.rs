@@ -2,7 +2,8 @@ use std::fs;
 
 use statlet::core::{Preferences, WarningThreshold};
 use statlet::indicator_preferences::{
-    FontFamilyPreference, IndicatorPreferences, MetricsRefreshInterval,
+    FontFamilyPreference, IndicatorLabel, IndicatorPreferences, LabelSpacing,
+    MetricsRefreshInterval,
 };
 use statlet::preferences::PreferencesStore;
 use tempfile::tempdir;
@@ -32,6 +33,9 @@ fn version_one_migrates_disk_values_and_defaults_the_indicator() {
     assert!(loaded.mole_integration_enabled);
     assert_eq!(loaded.warning_threshold.get(), 95);
     assert_eq!(loaded.indicator, IndicatorPreferences::default());
+    assert_eq!(loaded.indicator.labels.cpu.as_str(), "C");
+    assert_eq!(loaded.indicator.labels.ram.as_str(), "R");
+    assert_eq!(loaded.indicator.labels.spacing.spaces(), 1);
 }
 
 #[test]
@@ -53,6 +57,26 @@ fn version_two_round_trip_preserves_nested_indicator_preferences() {
         saved["indicator"]["typography"]["family"],
         serde_json::json!({ "named": "Avenir Next" })
     );
+}
+
+#[test]
+fn version_two_round_trip_preserves_custom_labels_and_spacing() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("preferences.json");
+    let store = PreferencesStore::new(path.clone());
+    let mut expected = Preferences::default();
+    expected.indicator.labels.cpu = IndicatorLabel::new("CPU uso").unwrap();
+    expected.indicator.labels.ram = IndicatorLabel::new("Memória").unwrap();
+    expected.indicator.labels.spacing = LabelSpacing::try_from(3).unwrap();
+
+    store.save(expected.clone()).unwrap();
+
+    assert_eq!(store.load(), expected);
+    let saved =
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(saved["indicator"]["labels"]["cpu"], "CPU uso");
+    assert_eq!(saved["indicator"]["labels"]["ram"], "Memória");
+    assert_eq!(saved["indicator"]["labels"]["spacing"], 3);
 }
 
 #[test]
@@ -224,7 +248,10 @@ fn valid_versioned_preferences_round_trip_with_atomic_replacement() {
                         "shared": "#8E8E93",
                         "useAppearanceVariants": false,
                         "variants": null
-                    }
+                    },
+                    "cpu": "C",
+                    "ram": "R",
+                    "spacing": 1
                 },
                 "typography": {
                     "family": "systemMonospaced",

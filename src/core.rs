@@ -4,8 +4,8 @@ use crate::disk::DiskObservation;
 use crate::history::HistoryEventKind;
 use crate::indicator_preferences::{
     AppearanceColors, FontFamilyPreference, FontSize, FontWeight, IndicatorAppearance,
-    IndicatorPreferenceGroup, IndicatorPreferences, LabelColorMode, MetricColorMode,
-    MetricColorPreferences, MetricKind, MetricsRefreshInterval, SrgbColor,
+    IndicatorLabel, IndicatorPreferenceGroup, IndicatorPreferences, LabelColorMode, LabelSpacing,
+    MetricColorMode, MetricColorPreferences, MetricKind, MetricsRefreshInterval, SrgbColor,
 };
 use crate::mole::MoleStatus;
 
@@ -135,6 +135,9 @@ pub enum IndicatorPreferenceChange {
         color: SrgbColor,
     },
     SetLabelsVisible(bool),
+    SetCpuLabel(IndicatorLabel),
+    SetRamLabel(IndicatorLabel),
+    SetLabelSpacing(LabelSpacing),
     SetLabelColorMode(LabelColorMode),
     SetLabelSharedColor(SrgbColor),
     SetLabelVariantsEnabled(bool),
@@ -512,6 +515,11 @@ impl IndicatorPreferenceChange {
             }
             Self::SetLabelsVisible(visible) => {
                 replace_if_changed(&mut indicator.labels.visible, visible)
+            }
+            Self::SetCpuLabel(label) => replace_if_changed(&mut indicator.labels.cpu, label),
+            Self::SetRamLabel(label) => replace_if_changed(&mut indicator.labels.ram, label),
+            Self::SetLabelSpacing(spacing) => {
+                replace_if_changed(&mut indicator.labels.spacing, spacing)
             }
             Self::SetLabelColorMode(mode) => {
                 replace_if_changed(&mut indicator.labels.color_mode, mode)

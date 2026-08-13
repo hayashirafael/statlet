@@ -12,7 +12,7 @@
 
 - Implement from the commit containing this approved plan (whose design parent is `14ecc8746d7b326cd03f70534395b96bacd7def5`) in an isolated worktree created with `superpowers:using-git-worktrees`; do not implement directly on the current `main` checkout.
 - Read `CONTEXT.md`, ADR 0001, and `docs/superpowers/specs/2026-08-12-indicator-customization-design.md` before the first code change.
-- Preserve one status item with CPU above RAM; do not add reordering, per-metric intervals, custom label text, alpha, presets, graphs, processes, or new permanent metrics.
+- Preserve one status item with CPU above RAM; do not add reordering, per-metric intervals, alpha, presets, graphs, processes, or new permanent metrics. CPU/RAM label text and its compact spacing are explicitly configurable under the bounded contract below.
 - Preserve CPU, RAM, memory-pressure, disk, notification, history, and Mole semantics exactly.
 - Defaults must reproduce v1: dynamic CPU/RAM, visible neutral labels, system monospaced 12 pt medium, and 2-second metric refresh.
 - Accept only whole font sizes `9..=14` and whole metric intervals `1..=60` seconds.

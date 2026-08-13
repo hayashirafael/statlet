@@ -1,4 +1,6 @@
-use statlet::indicator::{measure_stable_layout, TextMeasurer};
+use statlet::indicator::{
+    measure_stable_layout, measure_stable_layout_with_prefixes, TextMeasurer,
+};
 
 struct FakeMeasurer;
 
@@ -39,6 +41,20 @@ fn hiding_labels_removes_their_width_from_the_stable_measurement() {
 
     assert_eq!(layout.cpu_width, 24.0);
     assert_eq!(layout.ram_width, 24.0);
+}
+
+#[test]
+fn custom_label_prefixes_and_spacing_are_measured_before_rendering() {
+    let layout = measure_stable_layout_with_prefixes(
+        &FakeMeasurer,
+        Some("CPU uso  "),
+        Some("Memória  "),
+        40.0,
+    );
+
+    assert_eq!(layout.cpu_width, FakeMeasurer.width("CPU uso  100%"));
+    assert_eq!(layout.ram_width, FakeMeasurer.width("Memória  100%"));
+    assert_eq!(layout.base_width(), layout.ram_width);
 }
 
 #[test]

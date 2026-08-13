@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::core::{Preferences, WarningThreshold};
 use crate::indicator_preferences::{
     AppearanceColors, FixedColorPreferences, FontFamilyPreference, FontSize, FontWeight,
-    IndicatorPreferences, LabelColorMode, LabelPreferences, MetricColorMode,
-    MetricColorPreferences, MetricsRefreshInterval, SrgbColor, TypographyPreferences,
+    IndicatorLabel, IndicatorPreferences, LabelColorMode, LabelPreferences, LabelSpacing,
+    MetricColorMode, MetricColorPreferences, MetricsRefreshInterval, SrgbColor,
+    TypographyPreferences,
 };
 
 const CURRENT_VERSION: u8 = 2;
@@ -337,6 +338,12 @@ struct StoredLabelPreferences {
     visible: bool,
     color_mode: StoredLabelColorMode,
     fixed: StoredFixedColorPreferences,
+    #[serde(default)]
+    cpu: Option<String>,
+    #[serde(default)]
+    ram: Option<String>,
+    #[serde(default)]
+    spacing: Option<u8>,
 }
 
 impl From<LabelPreferences> for StoredLabelPreferences {
@@ -345,16 +352,38 @@ impl From<LabelPreferences> for StoredLabelPreferences {
             visible: preferences.visible,
             color_mode: preferences.color_mode.into(),
             fixed: preferences.fixed.into(),
+            cpu: Some(preferences.cpu.as_str().to_owned()),
+            ram: Some(preferences.ram.as_str().to_owned()),
+            spacing: Some(preferences.spacing.spaces() as u8),
         }
     }
 }
 
 impl StoredLabelPreferences {
     fn into_preferences(self) -> Option<LabelPreferences> {
+        let defaults = IndicatorPreferences::default().labels;
         Some(LabelPreferences {
             visible: self.visible,
             color_mode: self.color_mode.into(),
             fixed: self.fixed.into_preferences()?,
+            cpu: self
+                .cpu
+                .map(IndicatorLabel::new)
+                .transpose()
+                .ok()?
+                .unwrap_or(defaults.cpu),
+            ram: self
+                .ram
+                .map(IndicatorLabel::new)
+                .transpose()
+                .ok()?
+                .unwrap_or(defaults.ram),
+            spacing: self
+                .spacing
+                .map(LabelSpacing::try_from)
+                .transpose()
+                .ok()?
+                .unwrap_or(defaults.spacing),
         })
     }
 }

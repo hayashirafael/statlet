@@ -81,8 +81,20 @@ pub fn compose_indicator(
     let ram_color = metric_color(status.ram.severity, preferences.ram_color, appearance);
 
     IndicatorScene {
-        top: metric_runs(&status.cpu, cpu_color, preferences, appearance),
-        bottom: metric_runs(&status.ram, ram_color, preferences, appearance),
+        top: metric_runs(
+            &status.cpu,
+            cpu_color,
+            preferences,
+            preferences.labels.cpu.as_str(),
+            appearance,
+        ),
+        bottom: metric_runs(
+            &status.ram,
+            ram_color,
+            preferences,
+            preferences.labels.ram.as_str(),
+            appearance,
+        ),
         disk_badge: status.disk_badge.map(|badge| match badge {
             DiskBadge::Warning => IndicatorRun {
                 text: " !".to_owned(),
@@ -182,6 +194,7 @@ fn metric_runs(
     metric: &MetricContent,
     metric_color: SegmentColor,
     preferences: &IndicatorPreferences,
+    label: &str,
     appearance: IndicatorAppearance,
 ) -> Vec<IndicatorRun> {
     let mut runs = Vec::with_capacity(2);
@@ -194,7 +207,7 @@ fn metric_runs(
             }
         };
         runs.push(IndicatorRun {
-            text: format!("{} ", metric.label),
+            text: format!("{label}{}", " ".repeat(preferences.labels.spacing.spaces())),
             color,
         });
     }
@@ -264,8 +277,22 @@ pub fn measure_stable_layout(
     labels_visible: bool,
     default_width: f64,
 ) -> StableLayout {
-    let cpu_width = widest_metric_width(measurer, "C", labels_visible);
-    let ram_width = widest_metric_width(measurer, "R", labels_visible);
+    let (cpu_prefix, ram_prefix) = if labels_visible {
+        (Some("C "), Some("R "))
+    } else {
+        (None, None)
+    };
+    measure_stable_layout_with_prefixes(measurer, cpu_prefix, ram_prefix, default_width)
+}
+
+pub fn measure_stable_layout_with_prefixes(
+    measurer: &impl TextMeasurer,
+    cpu_prefix: Option<&str>,
+    ram_prefix: Option<&str>,
+    default_width: f64,
+) -> StableLayout {
+    let cpu_width = widest_metric_width(measurer, cpu_prefix);
+    let ram_width = widest_metric_width(measurer, ram_prefix);
     let base_width = cpu_width.max(ram_width);
 
     StableLayout {
@@ -280,14 +307,10 @@ pub fn measure_stable_layout(
     }
 }
 
-fn widest_metric_width(measurer: &impl TextMeasurer, label: &str, labels_visible: bool) -> f64 {
+fn widest_metric_width(measurer: &impl TextMeasurer, prefix: Option<&str>) -> f64 {
     (0..=100)
         .map(|percent| {
-            let text = if labels_visible {
-                format!("{label} {percent}%")
-            } else {
-                format!("{percent}%")
-            };
+            let text = format!("{}{}%", prefix.unwrap_or(""), percent);
             measurer.width(&text)
         })
         .fold(0.0, f64::max)

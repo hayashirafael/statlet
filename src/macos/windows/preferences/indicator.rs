@@ -14,8 +14,9 @@ use objc2_foundation::{
 };
 use statlet::core::{AppEvent, IndicatorPreferenceChange};
 use statlet::indicator_preferences::{
-    FontFamilyPreference, FontSize, FontWeight, IndicatorPreferenceGroup, IndicatorPreferences,
-    LabelColorMode, MetricColorMode, MetricKind, TypographyPreferences,
+    FontFamilyPreference, FontSize, FontWeight, IndicatorLabel, IndicatorPreferenceGroup,
+    IndicatorPreferences, LabelColorMode, LabelSpacing, MetricColorMode, MetricKind,
+    TypographyPreferences,
 };
 use statlet::preferences_view::{
     ColorEditorState, IndicatorControlsLayout, IndicatorControlsVisibility, IntervalDraft,
@@ -35,6 +36,12 @@ struct IndicatorControlsTargetIvars {
     selected_font_size: Cell<FontSize>,
     interval_draft: RefCell<IntervalDraft>,
     font_resources: RefCell<Option<FontResources>>,
+    selected_cpu_label: RefCell<IndicatorLabel>,
+    selected_ram_label: RefCell<IndicatorLabel>,
+    selected_label_spacing: Cell<LabelSpacing>,
+    cpu_label_field: Retained<NSTextField>,
+    ram_label_field: Retained<NSTextField>,
+    label_spacing_field: Retained<NSTextField>,
     font_size: Retained<NSTextField>,
     interval_field: Retained<NSTextField>,
     interval_stepper: Retained<NSStepper>,
@@ -100,6 +107,21 @@ define_class!(
         #[unsafe(method(resetLabels:))]
         fn reset_labels(&self, _sender: &NSButton) {
             self.reset_group(IndicatorPreferenceGroup::Labels);
+        }
+
+        #[unsafe(method(commitCpuLabel:))]
+        fn commit_cpu_label_action(&self, sender: &NSTextField) {
+            self.commit_label(sender, true);
+        }
+
+        #[unsafe(method(commitRamLabel:))]
+        fn commit_ram_label_action(&self, sender: &NSTextField) {
+            self.commit_label(sender, false);
+        }
+
+        #[unsafe(method(commitLabelSpacing:))]
+        fn commit_label_spacing_action(&self, sender: &NSTextField) {
+            self.commit_label_spacing(sender);
         }
 
         #[unsafe(method(openFontPicker:))]
@@ -178,6 +200,12 @@ define_class!(
                 self.commit_font_size(&field);
             } else if std::ptr::eq(&*field, &*self.ivars().interval_field) {
                 self.commit_refresh_interval(&field);
+            } else if std::ptr::eq(&*field, &*self.ivars().cpu_label_field) {
+                self.commit_label(&field, true);
+            } else if std::ptr::eq(&*field, &*self.ivars().ram_label_field) {
+                self.commit_label(&field, false);
+            } else if std::ptr::eq(&*field, &*self.ivars().label_spacing_field) {
+                self.commit_label_spacing(&field);
             }
         }
     }
@@ -267,6 +295,64 @@ impl IndicatorControlsTarget {
             Err(error) => set_inline_error(&self.ivars().interval_error, Some(error.message())),
         }
     }
+
+    fn commit_label(&self, field: &NSTextField, cpu: bool) {
+        if self.ivars().applying.get() {
+            return;
+        }
+        let Ok(label) = IndicatorLabel::new(field.stringValue().to_string()) else {
+            let selected = if cpu {
+                self.ivars().selected_cpu_label.borrow().clone()
+            } else {
+                self.ivars().selected_ram_label.borrow().clone()
+            };
+            field.setStringValue(&objc2_foundation::NSString::from_str(selected.as_str()));
+            return;
+        };
+        field.setStringValue(&objc2_foundation::NSString::from_str(label.as_str()));
+        let previous = if cpu {
+            self.ivars().selected_cpu_label.replace(label.clone())
+        } else {
+            self.ivars().selected_ram_label.replace(label.clone())
+        };
+        if label != previous {
+            self.send(if cpu {
+                IndicatorPreferenceChange::SetCpuLabel(label)
+            } else {
+                IndicatorPreferenceChange::SetRamLabel(label)
+            });
+        }
+    }
+
+    fn commit_label_spacing(&self, field: &NSTextField) {
+        if self.ivars().applying.get() {
+            return;
+        }
+        let spacing = field
+            .stringValue()
+            .to_string()
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .and_then(|value| LabelSpacing::try_from(value).ok());
+        let Some(spacing) = spacing else {
+            field.setStringValue(&objc2_foundation::NSString::from_str(
+                &self
+                    .ivars()
+                    .selected_label_spacing
+                    .get()
+                    .spaces()
+                    .to_string(),
+            ));
+            return;
+        };
+        field.setStringValue(&objc2_foundation::NSString::from_str(
+            &spacing.spaces().to_string(),
+        ));
+        if spacing != self.ivars().selected_label_spacing.replace(spacing) {
+            self.send(IndicatorPreferenceChange::SetLabelSpacing(spacing));
+        }
+    }
 }
 
 struct IndicatorLayoutViews {
@@ -280,6 +366,12 @@ struct IndicatorLayoutViews {
     ram_editor: Retained<NSStackView>,
     labels_heading: Retained<NSTextField>,
     labels_visible: Retained<NSButton>,
+    cpu_label_text: Retained<NSTextField>,
+    cpu_label_field: Retained<NSTextField>,
+    ram_label_text: Retained<NSTextField>,
+    ram_label_field: Retained<NSTextField>,
+    label_spacing_text: Retained<NSTextField>,
+    label_spacing_field: Retained<NSTextField>,
     labels_mode: Retained<NSSegmentedControl>,
     reset_labels: Retained<NSButton>,
     labels_editor: Retained<NSStackView>,
@@ -386,6 +478,42 @@ impl IndicatorLayoutViews {
         set_slot_frame(
             &self.reset_labels,
             390.0,
+            labels_visibility_y,
+            labels_visibility.height(),
+        );
+        set_slot_frame(
+            &self.cpu_label_text,
+            90.0,
+            labels_visibility_y,
+            labels_visibility.height(),
+        );
+        set_slot_frame(
+            &self.cpu_label_field,
+            128.0,
+            labels_visibility_y,
+            labels_visibility.height(),
+        );
+        set_slot_frame(
+            &self.ram_label_text,
+            194.0,
+            labels_visibility_y,
+            labels_visibility.height(),
+        );
+        set_slot_frame(
+            &self.ram_label_field,
+            234.0,
+            labels_visibility_y,
+            labels_visibility.height(),
+        );
+        set_slot_frame(
+            &self.label_spacing_text,
+            300.0,
+            labels_visibility_y,
+            labels_visibility.height(),
+        );
+        set_slot_frame(
+            &self.label_spacing_field,
+            346.0,
             labels_visibility_y,
             labels_visibility.height(),
         );
@@ -610,11 +738,36 @@ impl IndicatorControls {
                 mtm,
             )
         };
-        labels_visible.setFrame(NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(220.0, 24.0),
-        ));
+        labels_visible.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(84.0, 24.0)));
+        labels_visible.setTitle(ns_string!("Mostrar"));
         labels_visible.setAccessibilityIdentifier(Some(ns_string!("indicator.labels.visible")));
+        let cpu_label_text = text_label(mtm, "CPU", 0.0);
+        cpu_label_text.setFrameSize(NSSize::new(34.0, 28.0));
+        let cpu_label_field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(128.0, 0.0), NSSize::new(60.0, 28.0)),
+        );
+        cpu_label_field.setAccessibilityLabel(Some(ns_string!("Rótulo de CPU, até 10 caracteres")));
+        cpu_label_field.setAccessibilityIdentifier(Some(ns_string!("indicator.labels.cpu")));
+        let ram_label_text = text_label(mtm, "RAM", 0.0);
+        ram_label_text.setFrameSize(NSSize::new(38.0, 28.0));
+        let ram_label_field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(234.0, 0.0), NSSize::new(60.0, 28.0)),
+        );
+        ram_label_field.setAccessibilityLabel(Some(ns_string!("Rótulo de RAM, até 10 caracteres")));
+        ram_label_field.setAccessibilityIdentifier(Some(ns_string!("indicator.labels.ram")));
+        let label_spacing_text = text_label(mtm, "Esp.", 0.0);
+        label_spacing_text.setFrameSize(NSSize::new(42.0, 28.0));
+        let label_spacing_field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(346.0, 0.0), NSSize::new(38.0, 28.0)),
+        );
+        label_spacing_field.setAccessibilityLabel(Some(ns_string!(
+            "Espaços entre rótulo e percentual, de 0 a 4"
+        )));
+        label_spacing_field
+            .setAccessibilityIdentifier(Some(ns_string!("indicator.labels.spacing")));
         let labels_mode = segmented(
             mtm,
             &["Neutra", "Igual ao valor", "Personalizada"],
@@ -730,6 +883,12 @@ impl IndicatorControls {
                 selected_font_size: Cell::new(defaults.typography.size),
                 interval_draft: RefCell::new(IntervalDraft::new(defaults.refresh_interval)),
                 font_resources: RefCell::new(None),
+                selected_cpu_label: RefCell::new(defaults.labels.cpu.clone()),
+                selected_ram_label: RefCell::new(defaults.labels.ram.clone()),
+                selected_label_spacing: Cell::new(defaults.labels.spacing),
+                cpu_label_field: cpu_label_field.clone(),
+                ram_label_field: ram_label_field.clone(),
+                label_spacing_field: label_spacing_field.clone(),
                 font_size: font_size.clone(),
                 interval_field: interval_field.clone(),
                 interval_stepper: interval_stepper.clone(),
@@ -742,6 +901,9 @@ impl IndicatorControls {
             &reset_cpu_and_ram,
             &ram_mode,
             &labels_visible,
+            &cpu_label_field,
+            &ram_label_field,
+            &label_spacing_field,
             &labels_mode,
             &reset_labels,
             &font_family,
@@ -764,6 +926,12 @@ impl IndicatorControls {
             ram_editor.view(),
             &*labels_heading,
             &*labels_visible,
+            &*cpu_label_text,
+            &*cpu_label_field,
+            &*ram_label_text,
+            &*ram_label_field,
+            &*label_spacing_text,
+            &*label_spacing_field,
             &*labels_mode,
             &*reset_labels,
             labels_editor.view(),
@@ -801,6 +969,12 @@ impl IndicatorControls {
             ram_editor: ram_editor.view().retain(),
             labels_heading: labels_heading.clone(),
             labels_visible: labels_visible.clone(),
+            cpu_label_text: cpu_label_text.clone(),
+            cpu_label_field: cpu_label_field.clone(),
+            ram_label_text: ram_label_text.clone(),
+            ram_label_field: ram_label_field.clone(),
+            label_spacing_text: label_spacing_text.clone(),
+            label_spacing_field: label_spacing_field.clone(),
             labels_mode: labels_mode.clone(),
             reset_labels: reset_labels.clone(),
             labels_editor: labels_editor.view().retain(),
@@ -876,6 +1050,31 @@ impl IndicatorControls {
             });
         self.target
             .ivars()
+            .selected_cpu_label
+            .replace(preferences.labels.cpu.clone());
+        self.target
+            .ivars()
+            .selected_ram_label
+            .replace(preferences.labels.ram.clone());
+        self.target
+            .ivars()
+            .selected_label_spacing
+            .set(preferences.labels.spacing);
+        self.layout_views
+            .cpu_label_field
+            .setStringValue(&objc2_foundation::NSString::from_str(
+                preferences.labels.cpu.as_str(),
+            ));
+        self.layout_views
+            .ram_label_field
+            .setStringValue(&objc2_foundation::NSString::from_str(
+                preferences.labels.ram.as_str(),
+            ));
+        self.layout_views.label_spacing_field.setStringValue(
+            &objc2_foundation::NSString::from_str(&preferences.labels.spacing.spaces().to_string()),
+        );
+        self.target
+            .ivars()
             .selected_family
             .replace(preferences.typography.family.clone());
         self.target
@@ -949,7 +1148,17 @@ impl IndicatorControls {
             }
             self.reset_cpu_and_ram
                 .setNextKeyView(Some(&self.labels_visible));
-            self.labels_visible.setNextKeyView(Some(&self.labels_mode));
+            self.labels_visible
+                .setNextKeyView(Some(&self.layout_views.cpu_label_field));
+            self.layout_views
+                .cpu_label_field
+                .setNextKeyView(Some(&self.layout_views.ram_label_field));
+            self.layout_views
+                .ram_label_field
+                .setNextKeyView(Some(&self.layout_views.label_spacing_field));
+            self.layout_views
+                .label_spacing_field
+                .setNextKeyView(Some(&self.labels_mode));
             if labels_fixed {
                 self.labels_editor.configure_key_order(
                     &self.labels_mode,
@@ -1139,6 +1348,9 @@ fn configure_actions(
     reset_cpu_and_ram: &NSButton,
     ram_mode: &NSSegmentedControl,
     labels_visible: &NSButton,
+    cpu_label_field: &NSTextField,
+    ram_label_field: &NSTextField,
+    label_spacing_field: &NSTextField,
     labels_mode: &NSSegmentedControl,
     reset_labels: &NSButton,
     font_family: &NSButton,
@@ -1166,6 +1378,18 @@ fn configure_actions(
             (
                 &**labels_visible as &objc2_app_kit::NSControl,
                 sel!(toggleLabelsVisible:),
+            ),
+            (
+                &**cpu_label_field as &objc2_app_kit::NSControl,
+                sel!(commitCpuLabel:),
+            ),
+            (
+                &**ram_label_field as &objc2_app_kit::NSControl,
+                sel!(commitRamLabel:),
+            ),
+            (
+                &**label_spacing_field as &objc2_app_kit::NSControl,
+                sel!(commitLabelSpacing:),
             ),
             (
                 &**labels_mode as &objc2_app_kit::NSControl,
@@ -1209,6 +1433,9 @@ fn configure_actions(
         }
         font_size.setDelegate(Some(ProtocolObject::from_ref(target)));
         interval_field.setDelegate(Some(ProtocolObject::from_ref(target)));
+        cpu_label_field.setDelegate(Some(ProtocolObject::from_ref(target)));
+        ram_label_field.setDelegate(Some(ProtocolObject::from_ref(target)));
+        label_spacing_field.setDelegate(Some(ProtocolObject::from_ref(target)));
     }
 }
 
