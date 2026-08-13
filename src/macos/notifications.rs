@@ -10,6 +10,7 @@ use objc2_user_notifications::{
 };
 use statlet::core::AppEvent;
 use statlet::disk::{format_decimal_gigabytes, DiskObservation};
+use statlet::runtime_profile::RuntimePresentation;
 use tao::event_loop::EventLoopProxy;
 
 use super::RuntimeEvent;
@@ -65,10 +66,15 @@ impl NotificationDelegate {
 pub struct NotificationManager {
     center: Retained<UNUserNotificationCenter>,
     _delegate: Retained<NotificationDelegate>,
+    presentation: RuntimePresentation,
 }
 
 impl NotificationManager {
-    pub fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Option<Self> {
+    pub fn new(
+        mtm: MainThreadMarker,
+        proxy: EventLoopProxy<RuntimeEvent>,
+        presentation: RuntimePresentation,
+    ) -> Option<Self> {
         if !current_process_supports_notifications() {
             return None;
         }
@@ -78,6 +84,7 @@ impl NotificationManager {
         Some(Self {
             center,
             _delegate: delegate,
+            presentation,
         })
     }
 
@@ -92,18 +99,25 @@ impl NotificationManager {
 
     pub fn deliver_disk_pressure(&self, observation: DiskObservation) {
         let content = UNMutableNotificationContent::new();
-        content.setTitle(&NSString::from_str("O disco continua acima do limite"));
+        content.setTitle(&NSString::from_str(
+            &self
+                .presentation
+                .notification_title("O disco continua acima do limite"),
+        ));
         content.setBody(&NSString::from_str(&format!(
             "{:.1}% ocupado, com {} disponível. Revise o espaço sem remover nada automaticamente.",
             observation.occupied_percent(),
             format_decimal_gigabytes(observation.available_bytes())
         )));
         content.setSound(Some(&UNNotificationSound::defaultSound()));
+        let production_request_id =
+            format!("statlet.disk.{}", observation.observed_at().as_nanos());
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
-            &NSString::from_str(&format!(
-                "statlet.disk.{}",
-                observation.observed_at().as_nanos()
-            )),
+            &NSString::from_str(
+                &self
+                    .presentation
+                    .notification_request_id(&production_request_id),
+            ),
             &content,
             None,
         );

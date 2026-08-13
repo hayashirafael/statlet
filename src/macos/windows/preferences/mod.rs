@@ -14,8 +14,10 @@ use objc2_foundation::{
     NSPoint, NSRect, NSSize,
 };
 use statlet::core::{AppEvent, AppState, PreferencesSaveStatus, WarningThreshold};
+use statlet::icon_assets::IconAssetStore;
 use statlet::indicator_preferences::IndicatorPreferences;
 use statlet::preferences_view::{preserve_scroll_origin_from_top, PreferencesControlsCache};
+use statlet::runtime_profile::RuntimePresentation;
 
 use super::common::{threshold_title, ControlTarget, PreferencesWindowHost};
 use super::{IndicatorFontFallback, IndicatorLayoutDiagnostics, IndicatorSurfaceUpdate};
@@ -26,7 +28,7 @@ mod font_picker;
 mod indicator;
 pub(super) mod preview;
 
-use indicator::{IndicatorAreaViews, IndicatorControls};
+use indicator::{IndicatorAreaViews, IndicatorControls, ThumbnailAssetPlan};
 use preview::PreviewPane;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -739,12 +741,17 @@ pub(super) struct PreferencesWindow {
 }
 
 impl PreferencesWindow {
-    pub(super) fn new(mtm: MainThreadMarker, target: &ControlTarget) -> Self {
+    pub(super) fn new(
+        mtm: MainThreadMarker,
+        target: &ControlTarget,
+        presentation: RuntimePresentation,
+        icon_asset_store: IconAssetStore,
+    ) -> Self {
         let contract = PreferencesShellContract::new();
         let (width, height) = contract.content_size();
         let host = PreferencesWindowHost::new(
             mtm,
-            "Preferências do Statlet",
+            &presentation.window_title("Preferências do Statlet"),
             NSSize::new(width, height),
             target.event_proxy(),
         );
@@ -753,7 +760,13 @@ impl PreferencesWindow {
             .contentView()
             .expect("preferences window content view");
 
-        let indicator = create_indicator_page(mtm, contract, target.event_proxy());
+        let indicator = create_indicator_page(
+            mtm,
+            contract,
+            target.event_proxy(),
+            presentation,
+            icon_asset_store,
+        );
         let disk_and_mole = create_disk_and_mole_page(mtm, contract, target);
         disk_and_mole.root.setHidden(true);
         content.addSubview(&indicator.root);
@@ -916,6 +929,8 @@ fn create_indicator_page(
     mtm: MainThreadMarker,
     contract: PreferencesShellContract,
     proxy: tao::event_loop::EventLoopProxy<crate::macos::RuntimeEvent>,
+    presentation: RuntimePresentation,
+    icon_asset_store: IconAssetStore,
 ) -> IndicatorPage {
     let root = NSView::initWithFrame(
         NSView::alloc(mtm),
@@ -947,7 +962,12 @@ fn create_indicator_page(
     ));
     groups_scroll.setDrawsBackground(false);
     groups_scroll.setAccessibilityLabel(Some(ns_string!("Grupos de preferências do indicador")));
-    let controls = IndicatorControls::new(mtm, proxy);
+    let controls = IndicatorControls::new(
+        mtm,
+        proxy,
+        presentation,
+        ThumbnailAssetPlan::new(icon_asset_store),
+    );
     let controls_height = controls.content_height();
     let groups_document = NSView::initWithFrame(
         NSView::alloc(mtm),

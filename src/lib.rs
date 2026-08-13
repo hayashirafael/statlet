@@ -9,5 +9,6 @@ pub mod metrics_schedule;
 pub mod mole;
 pub mod preferences;
 pub mod preferences_view;
+pub mod runtime_profile;
 pub mod runtime_schedule;
 pub mod system_usage;
