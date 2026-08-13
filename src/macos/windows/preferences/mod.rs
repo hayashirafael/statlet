@@ -14,6 +14,7 @@ use objc2_foundation::{
 };
 use statlet::core::{AppEvent, AppState, PreferencesSaveStatus, WarningThreshold};
 use statlet::indicator_preferences::IndicatorPreferences;
+use statlet::preferences_view::preserve_scroll_origin_from_top;
 
 use super::common::{threshold_title, ControlTarget, PreferencesWindowHost};
 use super::{IndicatorFontFallback, IndicatorLayoutDiagnostics, IndicatorSurfaceUpdate};
@@ -232,15 +233,20 @@ struct IndicatorPage {
     root: Retained<NSView>,
     preview: PreviewPane,
     controls: IndicatorControls,
-    _groups_scroll: Retained<NSScrollView>,
+    groups_scroll: Retained<NSScrollView>,
     groups_document: Retained<NSView>,
     groups_stack: Retained<NSStackView>,
 }
 
 impl IndicatorPage {
     fn apply_preferences(&self, preferences: &IndicatorPreferences) {
+        let clip_view = self.groups_scroll.contentView();
+        let old_bounds = clip_view.bounds();
+        let old_document_height = self.groups_document.frame().size.height;
+
         self.controls.apply(preferences);
         let controls_height = self.controls.content_height();
+        let document_height = controls_height + 32.0;
         self.controls
             .view()
             .setFrameSize(NSSize::new(560.0, controls_height));
@@ -249,7 +255,16 @@ impl IndicatorPage {
             NSSize::new(580.0, controls_height),
         ));
         self.groups_document
-            .setFrameSize(NSSize::new(612.0, controls_height + 32.0));
+            .setFrameSize(NSSize::new(612.0, document_height));
+
+        let origin_y = preserve_scroll_origin_from_top(
+            old_bounds.origin.y,
+            old_bounds.size.height,
+            old_document_height,
+            document_height,
+        );
+        clip_view.scrollToPoint(NSPoint::new(old_bounds.origin.x, origin_y));
+        self.groups_scroll.reflectScrolledClipView(&clip_view);
     }
 }
 
@@ -520,7 +535,7 @@ fn create_indicator_page(
         root,
         preview,
         controls,
-        _groups_scroll: groups_scroll,
+        groups_scroll,
         groups_document,
         groups_stack,
     }

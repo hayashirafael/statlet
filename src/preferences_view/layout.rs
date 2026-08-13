@@ -7,6 +7,19 @@ const ROW_HEIGHT: f64 = 28.0;
 const MESSAGE_HEIGHT: f64 = 20.0;
 const CONTROL_X: f64 = 100.0;
 
+pub fn preserve_scroll_origin_from_top(
+    origin_y: f64,
+    viewport_height: f64,
+    old_document_height: f64,
+    new_document_height: f64,
+) -> f64 {
+    let old_max_origin = (old_document_height - viewport_height).max(0.0);
+    let new_max_origin = (new_document_height - viewport_height).max(0.0);
+    let top_offset = old_max_origin - origin_y.clamp(0.0, old_max_origin);
+
+    (new_max_origin - top_offset).clamp(0.0, new_max_origin)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct IndicatorControlsVisibility {
     pub cpu_editor: bool,
@@ -350,7 +363,24 @@ mod tests {
         assert_eq!(layout.cpu_row().control_x(), layout.ram_row().control_x());
         assert_eq!(layout.colors_reset().vertical(), layout.colors_heading());
         assert!(layout.colors_reset().x() > layout.cpu_row().control_x());
+        assert_eq!(layout.colors_reset().width(), 160.0);
         assert_eq!(GROUP_GAP, 24.0);
+    }
+
+    #[test]
+    fn slot_heights_leave_the_minimum_inline_gap_between_real_frames() {
+        let layout = IndicatorControlsLayout::new(IndicatorControlsVisibility::default());
+
+        assert_eq!(layout.family_row().height(), ROW_HEIGHT);
+        assert_eq!(layout.interval_help().height(), MESSAGE_HEIGHT);
+        assert_eq!(
+            layout.size_row().top() - layout.family_row().bottom(),
+            INLINE_GAP
+        );
+        assert_eq!(
+            layout.interval_help().top() - layout.interval_row().bottom(),
+            INLINE_GAP
+        );
     }
 
     #[test]
@@ -370,6 +400,26 @@ mod tests {
         assert_eq!(
             ram.label_origin_y(layout.content_height()),
             ram.control_origin_y(layout.content_height())
+        );
+    }
+
+    #[test]
+    fn scroll_origin_preserves_top_offset_and_clamps_to_the_new_range() {
+        assert_eq!(
+            preserve_scroll_origin_from_top(304.0, 344.0, 648.0, 820.0),
+            476.0
+        );
+        assert_eq!(
+            preserve_scroll_origin_from_top(180.0, 344.0, 648.0, 820.0),
+            352.0
+        );
+        assert_eq!(
+            preserve_scroll_origin_from_top(180.0, 344.0, 648.0, 500.0),
+            32.0
+        );
+        assert_eq!(
+            preserve_scroll_origin_from_top(0.0, 344.0, 648.0, 500.0),
+            0.0
         );
     }
 }

@@ -304,28 +304,43 @@ struct IndicatorLayoutViews {
     interval_error: Retained<NSTextField>,
 }
 
+fn set_slot_frame(view: &NSView, x: f64, y: f64, height: f64) {
+    view.setFrame(NSRect::new(
+        NSPoint::new(x, y),
+        NSSize::new(view.frame().size.width, height),
+    ));
+}
+
 impl IndicatorLayoutViews {
     fn apply(&self, layout: &IndicatorControlsLayout) {
         let content_height = layout.content_height();
 
         let colors_heading = layout.colors_heading();
-        self.colors_heading
-            .setFrameOrigin(NSPoint::new(0.0, colors_heading.origin_y(content_height)));
+        set_slot_frame(
+            &self.colors_heading,
+            0.0,
+            colors_heading.origin_y(content_height),
+            colors_heading.height(),
+        );
         let colors_reset = layout.colors_reset();
-        self.reset_cpu_and_ram.setFrameOrigin(NSPoint::new(
-            colors_reset.x(),
-            colors_reset.origin_y(content_height),
+        self.reset_cpu_and_ram.setFrame(NSRect::new(
+            NSPoint::new(colors_reset.x(), colors_reset.origin_y(content_height)),
+            NSSize::new(colors_reset.width(), colors_reset.height()),
         ));
 
         let cpu_row = layout.cpu_row();
-        self.cpu_label.setFrameOrigin(NSPoint::new(
+        set_slot_frame(
+            &self.cpu_label,
             cpu_row.label_x(),
             cpu_row.label_origin_y(content_height),
-        ));
-        self.cpu_mode.setFrameOrigin(NSPoint::new(
+            cpu_row.height(),
+        );
+        set_slot_frame(
+            &self.cpu_mode,
             cpu_row.control_x(),
             cpu_row.control_origin_y(content_height),
-        ));
+            cpu_row.height(),
+        );
         if let Some(cpu_editor) = layout.cpu_editor() {
             self.cpu_editor.setFrame(NSRect::new(
                 NSPoint::new(0.0, cpu_editor.origin_y(content_height)),
@@ -334,14 +349,18 @@ impl IndicatorLayoutViews {
         }
 
         let ram_row = layout.ram_row();
-        self.ram_label.setFrameOrigin(NSPoint::new(
+        set_slot_frame(
+            &self.ram_label,
             ram_row.label_x(),
             ram_row.label_origin_y(content_height),
-        ));
-        self.ram_mode.setFrameOrigin(NSPoint::new(
+            ram_row.height(),
+        );
+        set_slot_frame(
+            &self.ram_mode,
             ram_row.control_x(),
             ram_row.control_origin_y(content_height),
-        ));
+            ram_row.height(),
+        );
         if let Some(ram_editor) = layout.ram_editor() {
             self.ram_editor.setFrame(NSRect::new(
                 NSPoint::new(0.0, ram_editor.origin_y(content_height)),
@@ -350,21 +369,33 @@ impl IndicatorLayoutViews {
         }
 
         let labels_heading = layout.labels_heading();
-        self.labels_heading
-            .setFrameOrigin(NSPoint::new(0.0, labels_heading.origin_y(content_height)));
+        set_slot_frame(
+            &self.labels_heading,
+            0.0,
+            labels_heading.origin_y(content_height),
+            labels_heading.height(),
+        );
         let labels_visibility = layout.labels_visibility_row();
         let labels_visibility_y = labels_visibility.origin_y(content_height);
-        self.labels_visible.setFrameOrigin(NSPoint::new(
+        set_slot_frame(
+            &self.labels_visible,
             labels_visibility.label_x(),
             labels_visibility_y,
-        ));
-        self.reset_labels
-            .setFrameOrigin(NSPoint::new(390.0, labels_visibility_y));
+            labels_visibility.height(),
+        );
+        set_slot_frame(
+            &self.reset_labels,
+            390.0,
+            labels_visibility_y,
+            labels_visibility.height(),
+        );
         let labels_mode = layout.labels_mode_row();
-        self.labels_mode.setFrameOrigin(NSPoint::new(
+        set_slot_frame(
+            &self.labels_mode,
             labels_mode.control_x(),
             labels_mode.control_origin_y(content_height),
-        ));
+            labels_mode.height(),
+        );
         if let Some(labels_editor) = layout.labels_editor() {
             self.labels_editor.setFrame(NSRect::new(
                 NSPoint::new(0.0, labels_editor.origin_y(content_height)),
@@ -373,64 +404,124 @@ impl IndicatorLayoutViews {
         }
 
         let typography_heading = layout.typography_heading();
-        self.typography_heading.setFrameOrigin(NSPoint::new(
+        set_slot_frame(
+            &self.typography_heading,
             0.0,
             typography_heading.origin_y(content_height),
-        ));
+            typography_heading.height(),
+        );
         let family_row = layout.family_row();
         let family_y = family_row.origin_y(content_height);
-        self.family_label
-            .setFrameOrigin(NSPoint::new(family_row.label_x(), family_y));
-        self.font_family
-            .setFrameOrigin(NSPoint::new(family_row.control_x(), family_y));
+        set_slot_frame(
+            &self.family_label,
+            family_row.label_x(),
+            family_y,
+            family_row.height(),
+        );
+        set_slot_frame(
+            &self.font_family,
+            family_row.control_x(),
+            family_y,
+            family_row.height(),
+        );
         let size_row = layout.size_row();
         let size_y = size_row.origin_y(content_height);
-        self.size_label
-            .setFrameOrigin(NSPoint::new(size_row.label_x(), size_y));
-        self.font_size
-            .setFrameOrigin(NSPoint::new(size_row.control_x(), size_y));
-        self.points_label
-            .setFrameOrigin(NSPoint::new(166.0, size_y));
+        set_slot_frame(
+            &self.size_label,
+            size_row.label_x(),
+            size_y,
+            size_row.height(),
+        );
+        set_slot_frame(
+            &self.font_size,
+            size_row.control_x(),
+            size_y,
+            size_row.height(),
+        );
+        set_slot_frame(&self.points_label, 166.0, size_y, size_row.height());
         let weight_row = layout.weight_row();
         let weight_y = weight_row.origin_y(content_height);
-        self.weight_label
-            .setFrameOrigin(NSPoint::new(weight_row.label_x(), weight_y));
-        self.font_weight
-            .setFrameOrigin(NSPoint::new(weight_row.control_x(), weight_y));
-        self.reset_typography
-            .setFrameOrigin(NSPoint::new(400.0, weight_y));
-        self.font_fallback_warning.setFrameOrigin(NSPoint::new(
+        set_slot_frame(
+            &self.weight_label,
+            weight_row.label_x(),
+            weight_y,
+            weight_row.height(),
+        );
+        set_slot_frame(
+            &self.font_weight,
+            weight_row.control_x(),
+            weight_y,
+            weight_row.height(),
+        );
+        set_slot_frame(&self.reset_typography, 400.0, weight_y, weight_row.height());
+        let font_fallback_warning = layout.font_fallback_warning();
+        set_slot_frame(
+            &self.font_fallback_warning,
             100.0,
-            layout.font_fallback_warning().origin_y(content_height),
-        ));
-        self.layout_warning.setFrameOrigin(NSPoint::new(
+            font_fallback_warning.origin_y(content_height),
+            font_fallback_warning.height(),
+        );
+        let layout_warning = layout.layout_warning();
+        set_slot_frame(
+            &self.layout_warning,
             100.0,
-            layout.layout_warning().origin_y(content_height),
-        ));
+            layout_warning.origin_y(content_height),
+            layout_warning.height(),
+        );
 
         let update_heading = layout.update_heading();
-        self.update_heading
-            .setFrameOrigin(NSPoint::new(0.0, update_heading.origin_y(content_height)));
+        set_slot_frame(
+            &self.update_heading,
+            0.0,
+            update_heading.origin_y(content_height),
+            update_heading.height(),
+        );
         let interval_row = layout.interval_row();
         let interval_y = interval_row.origin_y(content_height);
-        self.interval_label
-            .setFrameOrigin(NSPoint::new(interval_row.label_x(), interval_y));
-        self.interval_field
-            .setFrameOrigin(NSPoint::new(interval_row.control_x(), interval_y));
-        self.interval_stepper
-            .setFrameOrigin(NSPoint::new(164.0, interval_y));
-        self.seconds_label
-            .setFrameOrigin(NSPoint::new(194.0, interval_y));
-        self.reset_refresh_interval
-            .setFrameOrigin(NSPoint::new(350.0, interval_y));
-        self.interval_help.setFrameOrigin(NSPoint::new(
+        set_slot_frame(
+            &self.interval_label,
+            interval_row.label_x(),
+            interval_y,
+            interval_row.height(),
+        );
+        set_slot_frame(
+            &self.interval_field,
+            interval_row.control_x(),
+            interval_y,
+            interval_row.height(),
+        );
+        set_slot_frame(
+            &self.interval_stepper,
+            164.0,
+            interval_y,
+            interval_row.height(),
+        );
+        set_slot_frame(
+            &self.seconds_label,
+            194.0,
+            interval_y,
+            interval_row.height(),
+        );
+        set_slot_frame(
+            &self.reset_refresh_interval,
+            350.0,
+            interval_y,
+            interval_row.height(),
+        );
+        let interval_help = layout.interval_help();
+        set_slot_frame(
+            &self.interval_help,
             0.0,
-            layout.interval_help().origin_y(content_height),
-        ));
-        self.interval_error.setFrameOrigin(NSPoint::new(
+            interval_help.origin_y(content_height),
+            interval_help.height(),
+        );
+        let interval_error = layout.interval_error();
+        set_slot_frame(
+            &self.interval_error,
             100.0,
-            layout.interval_error().origin_y(content_height),
-        ));
+            interval_error.origin_y(content_height),
+            interval_error.height(),
+        );
     }
 }
 
@@ -478,7 +569,7 @@ impl IndicatorControls {
         let reset_cpu_and_ram = reset_button(
             mtm,
             "Restaurar CPU e RAM",
-            NSRect::new(NSPoint::new(390.0, 0.0), NSSize::new(160.0, 28.0)),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
         );
         let cpu_editor = ColorEditor::new(
             mtm,

@@ -5,7 +5,8 @@ use crate::indicator_preferences::{
 mod layout;
 
 pub use layout::{
-    ControlSlot, IndicatorControlsLayout, IndicatorControlsVisibility, RowSlot, VerticalSlot,
+    preserve_scroll_origin_from_top, ControlSlot, IndicatorControlsLayout,
+    IndicatorControlsVisibility, RowSlot, VerticalSlot,
 };
 
 const SYSTEM_MONOSPACED_LABEL: &str = "System Monospaced";
