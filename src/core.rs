@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::disk::DiskObservation;
 use crate::history::HistoryEventKind;
 use crate::mole::MoleStatus;
+use crate::stats::SystemUsageSection;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryPressure {
@@ -68,6 +69,7 @@ pub struct AppState {
     pub preferences: Preferences,
     pub latest_disk_observation: Option<DiskObservation>,
     pub mole_status: MoleStatus,
+    pub system_usage_section: SystemUsageSection,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -77,6 +79,8 @@ pub enum AppEvent {
     MetricsSample(SystemSnapshot),
     OpenPreferences,
     OpenHistory,
+    OpenSystemUsage,
+    SelectSystemUsageSection(SystemUsageSection),
     Quit,
     SetMoleIntegrationEnabled(bool),
     SetWarningThreshold(WarningThreshold),
@@ -94,6 +98,7 @@ pub enum WindowKind {
     Preferences,
     History,
     FreeSpace,
+    SystemUsage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +177,7 @@ impl StatletCore {
                 preferences,
                 latest_disk_observation: None,
                 mole_status: MoleStatus::Unknown,
+                system_usage_section: SystemUsageSection::Ram,
             },
             system_snapshot,
             disk_episode: DiskEpisode::default(),
@@ -209,6 +215,13 @@ impl StatletCore {
                 vec![AppEffect::ShowWindow(WindowKind::Preferences)]
             }
             AppEvent::OpenHistory => vec![AppEffect::ShowWindow(WindowKind::History)],
+            AppEvent::OpenSystemUsage => {
+                vec![AppEffect::ShowWindow(WindowKind::SystemUsage)]
+            }
+            AppEvent::SelectSystemUsageSection(section) => {
+                self.state.system_usage_section = section;
+                Vec::new()
+            }
             AppEvent::ReviewSpace | AppEvent::NotificationActivated => {
                 let mut effects = Vec::with_capacity(2);
                 if self.state.preferences.mole_integration_enabled {

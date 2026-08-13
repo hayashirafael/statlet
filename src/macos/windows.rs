@@ -1,22 +1,162 @@
+use std::cell::RefCell;
+
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAccessibility, NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication,
-    NSBackingStoreType, NSButton, NSControlStateValueOn, NSLineBreakMode, NSPopUpButton,
-    NSScrollView, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSButton, NSColor,
+    NSControlStateValueOn, NSEventModifierFlags, NSLineBreakMode, NSPopUpButton, NSScrollView,
+    NSSegmentSwitchTracking, NSSegmentedControl, NSTableColumn, NSTableView, NSTableViewDataSource,
+    NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSDate, NSDateFormatter, NSDateFormatterStyle, NSFileManager,
-    NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    ns_string, MainThreadMarker, NSArray, NSDate, NSDateFormatter, NSDateFormatterStyle,
+    NSFileManager, NSIndexSet, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 use statlet::core::{AppEvent, AppState, Preferences, WarningThreshold, WindowKind};
 use statlet::disk::format_decimal_gigabytes;
 use statlet::history::{History, HistoryEventKind, HistoryRecord, MAX_HISTORY_RECORDS};
 use statlet::mole::MoleStatus;
+use statlet::stats::{ProcessRowViewModel, SystemUsageSection, SystemUsageViewModel, UsagePoint};
 use tao::event_loop::EventLoopProxy;
 
 use super::RuntimeEvent;
+
+struct UsageGraphViewIvars {
+    points: RefCell<Vec<UsagePoint>>,
+}
+
+define_class!(
+    #[unsafe(super = NSView)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = UsageGraphViewIvars]
+    struct UsageGraphView;
+
+    unsafe impl NSObjectProtocol for UsageGraphView {}
+
+    impl UsageGraphView {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty_rect: NSRect) {
+            let bounds = self.bounds();
+            let points = self.ivars().points.borrow();
+            if points.len() < 2 {
+                return;
+            }
+            let path = NSBezierPath::new();
+            let width = (bounds.size.width - 4.0).max(1.0);
+            let height = (bounds.size.height - 4.0).max(1.0);
+            let last_index = (points.len() - 1) as f64;
+            let mut connected = false;
+            for (index, point) in points.iter().enumerate() {
+                let Some(value) = point.value.filter(|value| value.is_finite()) else {
+                    connected = false;
+                    continue;
+                };
+                let graph_point = NSPoint::new(
+                    2.0 + width * index as f64 / last_index,
+                    2.0 + height * value.clamp(0.0, 100.0) / 100.0,
+                );
+                if connected {
+                    path.lineToPoint(graph_point);
+                } else {
+                    path.moveToPoint(graph_point);
+                    connected = true;
+                }
+            }
+            let increase_contrast = NSWorkspace::sharedWorkspace()
+                .accessibilityDisplayShouldIncreaseContrast();
+            path.setLineWidth(if increase_contrast { 3.0 } else { 2.0 });
+            NSColor::controlAccentColor().setStroke();
+            path.stroke();
+        }
+    }
+);
+
+impl UsageGraphView {
+    fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(UsageGraphViewIvars {
+            points: RefCell::new(Vec::new()),
+        });
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    fn apply(&self, points: &[UsagePoint], accessibility_label: &str) {
+        self.ivars().points.replace(points.to_vec());
+        self.setAccessibilityElement(true);
+        self.setAccessibilityLabel(Some(&NSString::from_str(accessibility_label)));
+        self.setNeedsDisplay(true);
+    }
+}
+
+struct StatsTableDataSourceIvars {
+    rows: RefCell<Vec<ProcessRowViewModel>>,
+}
+
+define_class!(
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = StatsTableDataSourceIvars]
+    struct StatsTableDataSource;
+
+    unsafe impl NSObjectProtocol for StatsTableDataSource {}
+
+    unsafe impl NSTableViewDataSource for StatsTableDataSource {
+        #[unsafe(method(numberOfRowsInTableView:))]
+        fn number_of_rows(&self, _table_view: &NSTableView) -> isize {
+            self.ivars().rows.borrow().len() as isize
+        }
+
+        #[unsafe(method_id(tableView:objectValueForTableColumn:row:))]
+        fn object_value(
+            &self,
+            _table_view: &NSTableView,
+            table_column: Option<&NSTableColumn>,
+            row: isize,
+        ) -> Option<Retained<AnyObject>> {
+            usize::try_from(row)
+                .ok()
+                .and_then(|row| {
+                    let rows = self.ivars().rows.borrow();
+                    let process = rows.get(row)?;
+                    let column = table_column?.identifier().to_string();
+                    Some(if column == "memory" {
+                        process.memory.clone()
+                    } else {
+                        process.name.clone()
+                    })
+                })
+                .map(|value| Retained::into_super(Retained::into_super(NSString::from_str(&value))))
+        }
+    }
+);
+
+impl StatsTableDataSource {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(StatsTableDataSourceIvars {
+            rows: RefCell::new(Vec::new()),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+
+    fn replace_rows(&self, rows: &[ProcessRowViewModel]) {
+        self.ivars().rows.replace(rows.to_vec());
+    }
+
+    fn pid_at(&self, row: isize) -> Option<u32> {
+        usize::try_from(row)
+            .ok()
+            .and_then(|row| self.ivars().rows.borrow().get(row).map(|row| row.pid))
+    }
+
+    fn index_of_pid(&self, pid: u32) -> Option<usize> {
+        self.ivars()
+            .rows
+            .borrow()
+            .iter()
+            .position(|row| row.pid == pid)
+    }
+}
 
 struct ControlTargetIvars {
     proxy: EventLoopProxy<RuntimeEvent>,
@@ -57,6 +197,32 @@ define_class!(
                 .ivars()
                 .proxy
                 .send_event(RuntimeEvent::App(AppEvent::SetWarningThreshold(threshold)));
+        }
+
+        #[unsafe(method(changeSystemUsageSection:))]
+        fn change_system_usage_section(&self, sender: &NSSegmentedControl) {
+            let section = if sender.selectedSegment() == 1 {
+                SystemUsageSection::Gpu
+            } else {
+                SystemUsageSection::Ram
+            };
+            let _ = self.ivars().proxy.send_event(RuntimeEvent::App(
+                AppEvent::SelectSystemUsageSection(section),
+            ));
+        }
+
+        #[unsafe(method(selectSystemUsageRam:))]
+        fn select_system_usage_ram(&self, _sender: &NSButton) {
+            let _ = self.ivars().proxy.send_event(RuntimeEvent::App(
+                AppEvent::SelectSystemUsageSection(SystemUsageSection::Ram),
+            ));
+        }
+
+        #[unsafe(method(selectSystemUsageGpu:))]
+        fn select_system_usage_gpu(&self, _sender: &NSButton) {
+            let _ = self.ivars().proxy.send_event(RuntimeEvent::App(
+                AppEvent::SelectSystemUsageSection(SystemUsageSection::Gpu),
+            ));
         }
 
         #[unsafe(method(openMoleInTerminal:))]
@@ -100,6 +266,7 @@ pub struct WindowManager {
     preferences: Option<PreferencesWindow>,
     history: Option<HistoryWindow>,
     free_space: Option<FreeSpaceWindow>,
+    system_usage: Option<SystemUsageWindow>,
 }
 
 struct PreferencesWindow {
@@ -126,6 +293,22 @@ struct HistoryWindow {
     clear_button: Retained<NSButton>,
 }
 
+struct SystemUsageWindow {
+    window: Retained<NSWindow>,
+    segmented_control: Retained<NSSegmentedControl>,
+    primary_value: Retained<NSTextField>,
+    secondary_value: Retained<NSTextField>,
+    status: Retained<NSTextField>,
+    graph: Retained<UsageGraphView>,
+    history_summary: Retained<NSTextField>,
+    detail_labels: Vec<Retained<NSTextField>>,
+    detail_values: Vec<Retained<NSTextField>>,
+    process_heading: Retained<NSTextField>,
+    process_scroll: Retained<NSScrollView>,
+    process_table: Retained<NSTableView>,
+    process_data_source: Retained<StatsTableDataSource>,
+}
+
 impl WindowManager {
     pub fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Self {
         let control_target = ControlTarget::new(mtm, proxy);
@@ -134,6 +317,7 @@ impl WindowManager {
             preferences: None,
             history: None,
             free_space: None,
+            system_usage: None,
         }
     }
 
@@ -173,6 +357,16 @@ impl WindowManager {
                     .expect("free-space window was created")
                     .window
             }
+            WindowKind::SystemUsage => {
+                if self.system_usage.is_none() {
+                    self.system_usage = Some(create_system_usage_window(mtm, &self.control_target));
+                }
+                &self
+                    .system_usage
+                    .as_ref()
+                    .expect("system-usage window was created")
+                    .window
+            }
         };
 
         let app = NSApplication::sharedApplication(mtm);
@@ -195,6 +389,18 @@ impl WindowManager {
     pub fn update_history(&self, history: &History) {
         if let Some(window) = &self.history {
             window.apply(history);
+        }
+    }
+
+    pub fn system_usage_visible(&self) -> bool {
+        self.system_usage
+            .as_ref()
+            .is_some_and(|window| window.window.isVisible())
+    }
+
+    pub fn update_system_usage(&self, view_model: &SystemUsageViewModel) {
+        if let Some(window) = &self.system_usage {
+            window.apply(view_model);
         }
     }
 }
@@ -279,6 +485,270 @@ impl PreferencesWindow {
         self.warning_threshold
             .setEnabled(preferences.mole_integration_enabled);
     }
+}
+
+impl SystemUsageWindow {
+    fn apply(&self, view_model: &SystemUsageViewModel) {
+        self.segmented_control
+            .setSelectedSegment(match view_model.section {
+                SystemUsageSection::Ram => 0,
+                SystemUsageSection::Gpu => 1,
+            });
+        self.primary_value
+            .setStringValue(&NSString::from_str(&view_model.primary_value));
+        self.secondary_value
+            .setStringValue(&NSString::from_str(&view_model.secondary_value));
+        self.secondary_value
+            .setHidden(view_model.secondary_value.is_empty());
+        self.status
+            .setStringValue(&NSString::from_str(&view_model.status));
+        self.primary_value
+            .setAccessibilityLabel(Some(&NSString::from_str(&format!(
+                "{}, {}, {}",
+                view_model.primary_value, view_model.secondary_value, view_model.status
+            ))));
+        self.graph
+            .apply(&view_model.history, &view_model.history_accessibility_label);
+        self.history_summary
+            .setStringValue(&NSString::from_str(&view_model.history_accessibility_label));
+
+        for (index, label) in self.detail_labels.iter().enumerate() {
+            let Some(detail) = view_model.details.get(index) else {
+                label.setHidden(true);
+                self.detail_values[index].setHidden(true);
+                continue;
+            };
+            label.setHidden(false);
+            label.setStringValue(&NSString::from_str(detail.label));
+            self.detail_values[index].setHidden(false);
+            self.detail_values[index].setStringValue(&NSString::from_str(&detail.value));
+            self.detail_values[index].setAccessibilityLabel(Some(&NSString::from_str(&format!(
+                "{}: {}",
+                detail.label, detail.value
+            ))));
+        }
+
+        let shows_processes = view_model.section == SystemUsageSection::Ram;
+        self.process_heading.setHidden(!shows_processes);
+        self.process_scroll.setHidden(!shows_processes);
+        let selected_pid = self
+            .process_data_source
+            .pid_at(self.process_table.selectedRow());
+        let clip_view = self.process_scroll.contentView();
+        let scroll_origin = clip_view.bounds().origin;
+        self.process_data_source
+            .replace_rows(&view_model.process_rows);
+        self.process_table.reloadData();
+        clip_view.scrollToPoint(scroll_origin);
+        self.process_scroll.reflectScrolledClipView(&clip_view);
+        if let Some(index) = selected_pid.and_then(|pid| self.process_data_source.index_of_pid(pid))
+        {
+            self.process_table.selectRowIndexes_byExtendingSelection(
+                &NSIndexSet::indexSetWithIndex(index),
+                false,
+            );
+        }
+    }
+}
+
+fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> SystemUsageWindow {
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(680.0, 620.0)),
+            NSWindowStyleMask::Titled
+                | NSWindowStyleMask::Closable
+                | NSWindowStyleMask::Miniaturizable
+                | NSWindowStyleMask::Resizable,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    unsafe { window.setReleasedWhenClosed(false) };
+    window.setCollectionBehavior(NSWindowCollectionBehavior::MoveToActiveSpace);
+    window.setTitle(ns_string!("Uso do sistema"));
+    window.setMinSize(NSSize::new(620.0, 520.0));
+    window.center();
+    let content = window
+        .contentView()
+        .expect("system-usage window content view");
+
+    let labels =
+        NSArray::from_retained_slice(&[NSString::from_str("RAM"), NSString::from_str("GPU")]);
+    let segmented_control = unsafe {
+        NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
+            &labels,
+            NSSegmentSwitchTracking::SelectOne,
+            Some(target as &AnyObject),
+            Some(sel!(changeSystemUsageSection:)),
+            mtm,
+        )
+    };
+    segmented_control.setFrame(NSRect::new(
+        NSPoint::new(240.0, 566.0),
+        NSSize::new(200.0, 28.0),
+    ));
+    segmented_control.setSelectedSegment(0);
+    segmented_control.setAccessibilityLabel(Some(ns_string!("Seção de uso do sistema")));
+
+    let primary_value = text_label(
+        mtm,
+        "—",
+        NSRect::new(NSPoint::new(24.0, 510.0), NSSize::new(300.0, 38.0)),
+    );
+    primary_value.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(28.0)));
+    let secondary_value = text_label(
+        mtm,
+        "",
+        NSRect::new(NSPoint::new(24.0, 480.0), NSSize::new(300.0, 24.0)),
+    );
+    let status = text_label(
+        mtm,
+        "Coletando a primeira leitura…",
+        NSRect::new(NSPoint::new(24.0, 448.0), NSSize::new(310.0, 28.0)),
+    );
+    status.setTextColor(Some(&NSColor::secondaryLabelColor()));
+
+    let mut detail_labels = Vec::with_capacity(6);
+    let mut detail_values = Vec::with_capacity(6);
+    for index in 0..6 {
+        let y = 520.0 - index as f64 * 30.0;
+        let label = text_label(
+            mtm,
+            "",
+            NSRect::new(NSPoint::new(350.0, y), NSSize::new(190.0, 24.0)),
+        );
+        let value = text_label(
+            mtm,
+            "",
+            NSRect::new(NSPoint::new(540.0, y), NSSize::new(116.0, 24.0)),
+        );
+        value.setAlignment(objc2_app_kit::NSTextAlignment::Right);
+        value.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(13.0)));
+        label.setHidden(true);
+        value.setHidden(true);
+        content.addSubview(&label);
+        content.addSubview(&value);
+        detail_labels.push(label);
+        detail_values.push(value);
+    }
+
+    let history_heading = text_label(
+        mtm,
+        "Últimos 5 minutos",
+        NSRect::new(NSPoint::new(24.0, 410.0), NSSize::new(300.0, 26.0)),
+    );
+    history_heading.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(15.0)));
+    let graph = UsageGraphView::new(
+        mtm,
+        NSRect::new(NSPoint::new(24.0, 286.0), NSSize::new(632.0, 116.0)),
+    );
+    graph.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    let history_summary = text_label(
+        mtm,
+        "O histórico aparecerá após duas leituras.",
+        NSRect::new(NSPoint::new(24.0, 250.0), NSSize::new(632.0, 30.0)),
+    );
+    history_summary.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    history_summary.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+
+    let process_heading = text_label(
+        mtm,
+        "Maiores usos de memória agora",
+        NSRect::new(NSPoint::new(24.0, 218.0), NSSize::new(400.0, 26.0)),
+    );
+    process_heading.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(15.0)));
+    let process_scroll = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
+        NSRect::new(NSPoint::new(24.0, 24.0), NSSize::new(632.0, 188.0)),
+    );
+    process_scroll.setHasVerticalScroller(true);
+    process_scroll.setDrawsBackground(false);
+    process_scroll.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    let process_table = NSTableView::initWithFrame(
+        NSTableView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(612.0, 188.0)),
+    );
+    let process_column =
+        NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("process"));
+    process_column.setWidth(440.0);
+    process_column
+        .headerCell()
+        .setStringValue(ns_string!("Processo"));
+    let memory_column =
+        NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("memory"));
+    memory_column.setWidth(160.0);
+    memory_column
+        .headerCell()
+        .setStringValue(ns_string!("Memória"));
+    process_table.addTableColumn(&process_column);
+    process_table.addTableColumn(&memory_column);
+    process_table.setAccessibilityLabel(Some(ns_string!(
+        "Maiores usos de memória agora, colunas Processo e Memória"
+    )));
+    let process_data_source = StatsTableDataSource::new(mtm);
+    unsafe {
+        process_table.setDataSource(Some(ProtocolObject::from_ref(&*process_data_source)));
+    }
+    process_scroll.setDocumentView(Some(&process_table));
+
+    let ram_shortcut = shortcut_button(mtm, target, "1", sel!(selectSystemUsageRam:));
+    let gpu_shortcut = shortcut_button(mtm, target, "2", sel!(selectSystemUsageGpu:));
+
+    content.addSubview(&segmented_control);
+    content.addSubview(&primary_value);
+    content.addSubview(&secondary_value);
+    content.addSubview(&status);
+    content.addSubview(&history_heading);
+    content.addSubview(&graph);
+    content.addSubview(&history_summary);
+    content.addSubview(&process_heading);
+    content.addSubview(&process_scroll);
+    content.addSubview(&ram_shortcut);
+    content.addSubview(&gpu_shortcut);
+    window.setInitialFirstResponder(Some(&segmented_control));
+
+    SystemUsageWindow {
+        window,
+        segmented_control,
+        primary_value,
+        secondary_value,
+        status,
+        graph,
+        history_summary,
+        detail_labels,
+        detail_values,
+        process_heading,
+        process_scroll,
+        process_table,
+        process_data_source,
+    }
+}
+
+fn shortcut_button(
+    mtm: MainThreadMarker,
+    target: &ControlTarget,
+    key: &str,
+    action: objc2::runtime::Sel,
+) -> Retained<NSButton> {
+    let button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!(""),
+            Some(target as &AnyObject),
+            Some(action),
+            mtm,
+        )
+    };
+    button.setFrame(NSRect::new(
+        NSPoint::new(-20.0, -20.0),
+        NSSize::new(1.0, 1.0),
+    ));
+    button.setKeyEquivalent(&NSString::from_str(key));
+    button.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+    button.setAccessibilityElement(false);
+    button
 }
 
 fn create_preferences_window(mtm: MainThreadMarker, target: &ControlTarget) -> PreferencesWindow {

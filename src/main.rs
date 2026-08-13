@@ -22,11 +22,13 @@ use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
+use macos::gpu::MacGpuSampler;
 use macos::notifications::NotificationManager;
 use macos::renderer::Renderer;
 use macos::sampler::MacSampler;
 use macos::windows::WindowManager;
 use macos::RuntimeEvent;
+use statlet::stats::{ProcessSamplingSchedule, SystemUsageModel, SystemUsageSection};
 
 const METRICS_REFRESH: Duration = Duration::from_secs(2);
 
@@ -41,9 +43,12 @@ fn main() {
     let preferences_id: MenuId = preferences_item.id().clone();
     let history_item = MenuItem::new("Histórico…", true, None);
     let history_id: MenuId = history_item.id().clone();
+    let system_usage_item = MenuItem::new("Uso do sistema…", true, None);
+    let system_usage_id: MenuId = system_usage_item.id().clone();
     let quit = MenuItem::new("Sair", true, None);
     let quit_id: MenuId = quit.id().clone();
     let menu = Menu::new();
+    menu.append(&system_usage_item).expect("build menu");
     menu.append(&review_space_item).expect("build menu");
     menu.append(&preferences_item).expect("build menu");
     menu.append(&history_item).expect("build menu");
@@ -53,6 +58,8 @@ fn main() {
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let runtime_event = if event.id == review_space_id {
             Some(RuntimeEvent::App(AppEvent::ReviewSpace))
+        } else if event.id == system_usage_id {
+            Some(RuntimeEvent::App(AppEvent::OpenSystemUsage))
         } else if event.id == preferences_id {
             Some(RuntimeEvent::App(AppEvent::OpenPreferences))
         } else if event.id == history_id {
@@ -103,9 +110,7 @@ fn main() {
             runtime.initialize_native(marker, proxy.clone());
             let _ = proxy.send_event(RuntimeEvent::App(AppEvent::ApplicationLaunched));
             let _ = runtime.apply_effects(&startup_effects, &mut core);
-            let disk_effects = runtime
-                .samplers
-                .refresh(&mut core, &renderer, button.as_deref());
+            let disk_effects = runtime.refresh(&mut core, &renderer, button.as_deref());
             let _ = runtime.apply_effects(&disk_effects, &mut core);
             *control_flow = ControlFlow::WaitUntil(Instant::now() + METRICS_REFRESH);
         }
@@ -114,9 +119,7 @@ fn main() {
                 let marker = MainThreadMarker::new().expect("main-thread event loop");
                 button = macos::renderer::status_button(marker);
             }
-            let disk_effects = runtime
-                .samplers
-                .refresh(&mut core, &renderer, button.as_deref());
+            let disk_effects = runtime.refresh(&mut core, &renderer, button.as_deref());
             let _ = runtime.apply_effects(&disk_effects, &mut core);
             *control_flow = ControlFlow::WaitUntil(Instant::now() + METRICS_REFRESH);
         }
@@ -187,6 +190,31 @@ impl RuntimeAdapters {
     ) {
         self.windows = Some(WindowManager::new(marker, proxy.clone()));
         self.notifications = NotificationManager::new(marker, proxy);
+    }
+
+    fn refresh(
+        &mut self,
+        core: &mut StatletCore,
+        renderer: &Renderer,
+        button: Option<&objc2_app_kit::NSStatusBarButton>,
+    ) -> Vec<AppEffect> {
+        let system_usage_visible = self
+            .windows
+            .as_ref()
+            .is_some_and(WindowManager::system_usage_visible);
+        let effects = self
+            .samplers
+            .refresh(core, renderer, button, system_usage_visible);
+        self.update_system_usage_window(core.state().system_usage_section);
+        effects
+    }
+
+    fn update_system_usage_window(&self, section: SystemUsageSection) {
+        if let Some(windows) = &self.windows {
+            if windows.system_usage_visible() {
+                windows.update_system_usage(&self.samplers.system_usage_view_model(section));
+            }
+        }
     }
 
     fn apply_effects(&mut self, effects: &[AppEffect], core: &mut StatletCore) -> bool {
@@ -264,6 +292,7 @@ impl RuntimeAdapters {
         if let Some(windows) = &self.windows {
             windows.update_state(core.state());
         }
+        self.update_system_usage_window(core.state().system_usage_section);
         should_quit
     }
 }
@@ -354,6 +383,9 @@ struct RuntimeSamplers {
     disk: StartupVolumeSampler,
     disk_schedule: DiskSamplingSchedule,
     clock: ContinuousClock,
+    gpu: MacGpuSampler,
+    system_usage: SystemUsageModel,
+    process_schedule: ProcessSamplingSchedule,
 }
 
 impl RuntimeSamplers {
@@ -365,6 +397,9 @@ impl RuntimeSamplers {
             disk: StartupVolumeSampler::new(),
             disk_schedule: DiskSamplingSchedule::new(),
             clock: ContinuousClock::new().expect("initialize the macOS continuous clock"),
+            gpu: MacGpuSampler::new(),
+            system_usage: SystemUsageModel::new(),
+            process_schedule: ProcessSamplingSchedule::new(),
         }
     }
 
@@ -377,12 +412,26 @@ impl RuntimeSamplers {
         core: &mut StatletCore,
         renderer: &Renderer,
         button: Option<&objc2_app_kit::NSStatusBarButton>,
+        system_usage_visible: bool,
     ) -> Vec<AppEffect> {
         objc2::rc::autoreleasepool(|_| {
-            if let Some(snapshot) = self.metrics.sample() {
-                core.handle(AppEvent::MetricsSample(snapshot));
-            }
             let now = self.clock.now();
+            self.system_usage.set_visible(system_usage_visible);
+            self.process_schedule.set_visible(system_usage_visible, now);
+            match self.metrics.sample() {
+                Some(snapshot) => {
+                    core.handle(AppEvent::MetricsSample(snapshot.compact));
+                    self.system_usage.record_memory(now, Ok(snapshot.memory));
+                }
+                None => self.system_usage.record_memory(now, Err(())),
+            }
+            if system_usage_visible {
+                self.system_usage.record_gpu(now, self.gpu.sample());
+                if self.process_schedule.take_due(now) {
+                    self.system_usage
+                        .record_processes(Ok(self.metrics.sample_processes()));
+                }
+            }
             let effects = if self.disk_schedule.take_due(now) {
                 match self.disk.sample(now) {
                     Ok(observation) => core.handle(AppEvent::DiskObserved(observation)),
@@ -400,5 +449,12 @@ impl RuntimeSamplers {
             }
             effects
         })
+    }
+
+    fn system_usage_view_model(
+        &self,
+        section: SystemUsageSection,
+    ) -> statlet::stats::SystemUsageViewModel {
+        self.system_usage.view_model(section)
     }
 }

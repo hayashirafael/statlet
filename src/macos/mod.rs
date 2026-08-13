@@ -1,6 +1,7 @@
 use statlet::core::AppEvent;
 use statlet::mole::MoleDetection;
 
+pub mod gpu;
 pub mod notifications;
 pub mod renderer;
 pub mod sampler;

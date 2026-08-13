@@ -1,10 +1,16 @@
 use std::ffi::CString;
 use std::mem;
 
-use sysinfo::System;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use statlet::core::{MemoryPressure, SystemSnapshot};
-use statlet::metrics::{memory_from_counters, MemoryReading, VmCounters};
+use statlet::metrics::{detailed_memory_from_counters, MemoryReading, VmCounters};
+use statlet::stats::ProcessMemory;
+
+pub struct MacSystemSample {
+    pub compact: SystemSnapshot,
+    pub memory: MemoryReading,
+}
 
 pub struct MacSampler {
     system: System,
@@ -21,20 +27,40 @@ impl MacSampler {
         self.system.refresh_cpu_usage();
     }
 
-    pub fn sample(&mut self) -> Option<SystemSnapshot> {
+    pub fn sample(&mut self) -> Option<MacSystemSample> {
         self.system.refresh_cpu_usage();
         self.system.refresh_memory();
-        let memory = read_memory(self.system.total_memory())?;
+        let memory = read_memory(self.system.total_memory(), self.system.used_swap())?;
 
-        Some(SystemSnapshot {
-            cpu_percent: self.system.global_cpu_usage() as f64,
-            ram_percent: memory.percent,
-            memory_pressure: memory.pressure,
+        Some(MacSystemSample {
+            compact: SystemSnapshot {
+                cpu_percent: self.system.global_cpu_usage() as f64,
+                ram_percent: memory.percent,
+                memory_pressure: memory.pressure,
+            },
+            memory,
         })
+    }
+
+    pub fn sample_processes(&mut self) -> Vec<ProcessMemory> {
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+        self.system
+            .processes()
+            .iter()
+            .map(|(pid, process)| ProcessMemory {
+                pid: pid.as_u32(),
+                name: process.name().to_string_lossy().into_owned(),
+                memory_bytes: process.memory(),
+            })
+            .collect()
     }
 }
 
-fn read_memory(total_bytes: u64) -> Option<MemoryReading> {
+fn read_memory(total_bytes: u64, swap_used_bytes: u64) -> Option<MemoryReading> {
     let mut stats = unsafe { mem::zeroed::<libc::vm_statistics64>() };
     let mut count = libc::HOST_VM_INFO64_COUNT;
     #[allow(deprecated)]
@@ -55,7 +81,7 @@ fn read_memory(total_bytes: u64) -> Option<MemoryReading> {
         return None;
     }
 
-    Some(memory_from_counters(
+    Some(detailed_memory_from_counters(
         total_bytes,
         page_size as u64,
         VmCounters {
@@ -67,6 +93,7 @@ fn read_memory(total_bytes: u64) -> Option<MemoryReading> {
             purgeable: u64::from(stats.purgeable_count),
             external: u64::from(stats.external_page_count),
         },
+        swap_used_bytes,
         read_memory_pressure()?,
     ))
 }

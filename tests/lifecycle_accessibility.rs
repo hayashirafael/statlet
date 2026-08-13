@@ -3,6 +3,7 @@ use std::time::Duration;
 use statlet::core::{AppEffect, AppEvent, Preferences, StatletCore, WarningThreshold, WindowKind};
 use statlet::disk::DiskObservation;
 use statlet::history::HistoryEventKind;
+use statlet::stats::SystemUsageSection;
 
 fn enabled_core() -> StatletCore {
     StatletCore::with_preferences(Preferences {
@@ -46,6 +47,27 @@ fn reopening_without_visible_windows_exposes_preferences() {
             has_visible_windows: true,
         })
         .is_empty());
+}
+
+#[test]
+fn system_usage_window_preserves_its_selected_section_for_the_session() {
+    let mut app = StatletCore::new();
+
+    assert_eq!(
+        app.handle(AppEvent::OpenSystemUsage),
+        vec![AppEffect::ShowWindow(WindowKind::SystemUsage)]
+    );
+    assert_eq!(app.state().system_usage_section, SystemUsageSection::Ram);
+
+    assert!(app
+        .handle(AppEvent::SelectSystemUsageSection(SystemUsageSection::Gpu))
+        .is_empty());
+    assert_eq!(app.state().system_usage_section, SystemUsageSection::Gpu);
+    assert_eq!(
+        app.handle(AppEvent::OpenSystemUsage),
+        vec![AppEffect::ShowWindow(WindowKind::SystemUsage)]
+    );
+    assert_eq!(app.state().system_usage_section, SystemUsageSection::Gpu);
 }
 
 #[test]
