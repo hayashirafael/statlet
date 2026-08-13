@@ -57,3 +57,19 @@ fn label_group_reset_restores_compact_c_and_r_defaults() {
     assert_eq!(preferences.labels.ram.as_str(), "R");
     assert_eq!(preferences.labels.spacing.spaces(), 1);
 }
+
+#[test]
+fn repeated_valid_label_change_does_not_queue_a_second_save() {
+    let mut app = StatletCore::new();
+    let label = IndicatorLabel::new("CPU uso").unwrap();
+
+    app.handle(AppEvent::UpdateIndicator(
+        IndicatorPreferenceChange::SetCpuLabel(label.clone()),
+    ));
+
+    assert!(app
+        .handle(AppEvent::UpdateIndicator(
+            IndicatorPreferenceChange::SetCpuLabel(label),
+        ))
+        .is_empty());
+}

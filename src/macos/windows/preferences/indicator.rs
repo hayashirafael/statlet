@@ -111,17 +111,17 @@ define_class!(
 
         #[unsafe(method(commitCpuLabel:))]
         fn commit_cpu_label_action(&self, sender: &NSTextField) {
-            self.commit_label(sender, true);
+            self.commit_label(sender, MetricKind::Cpu, true);
         }
 
         #[unsafe(method(commitRamLabel:))]
         fn commit_ram_label_action(&self, sender: &NSTextField) {
-            self.commit_label(sender, false);
+            self.commit_label(sender, MetricKind::Ram, true);
         }
 
         #[unsafe(method(commitLabelSpacing:))]
         fn commit_label_spacing_action(&self, sender: &NSTextField) {
-            self.commit_label_spacing(sender);
+            self.commit_label_spacing(sender, true);
         }
 
         #[unsafe(method(openFontPicker:))]
@@ -201,11 +201,28 @@ define_class!(
             } else if std::ptr::eq(&*field, &*self.ivars().interval_field) {
                 self.commit_refresh_interval(&field);
             } else if std::ptr::eq(&*field, &*self.ivars().cpu_label_field) {
-                self.commit_label(&field, true);
+                self.commit_label(&field, MetricKind::Cpu, true);
             } else if std::ptr::eq(&*field, &*self.ivars().ram_label_field) {
-                self.commit_label(&field, false);
+                self.commit_label(&field, MetricKind::Ram, true);
             } else if std::ptr::eq(&*field, &*self.ivars().label_spacing_field) {
-                self.commit_label_spacing(&field);
+                self.commit_label_spacing(&field, true);
+            }
+        }
+
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, notification: &NSNotification) {
+            if self.ivars().applying.get() {
+                return;
+            }
+            let Some(field) = notification_text_field(notification) else {
+                return;
+            };
+            if std::ptr::eq(&*field, &*self.ivars().cpu_label_field) {
+                self.commit_label(&field, MetricKind::Cpu, false);
+            } else if std::ptr::eq(&*field, &*self.ivars().ram_label_field) {
+                self.commit_label(&field, MetricKind::Ram, false);
+            } else if std::ptr::eq(&*field, &*self.ivars().label_spacing_field) {
+                self.commit_label_spacing(&field, false);
             }
         }
     }
@@ -296,35 +313,36 @@ impl IndicatorControlsTarget {
         }
     }
 
-    fn commit_label(&self, field: &NSTextField, cpu: bool) {
+    fn commit_label(&self, field: &NSTextField, metric: MetricKind, restore_invalid: bool) {
         if self.ivars().applying.get() {
             return;
         }
         let Ok(label) = IndicatorLabel::new(field.stringValue().to_string()) else {
-            let selected = if cpu {
-                self.ivars().selected_cpu_label.borrow().clone()
-            } else {
-                self.ivars().selected_ram_label.borrow().clone()
-            };
-            field.setStringValue(&objc2_foundation::NSString::from_str(selected.as_str()));
+            if restore_invalid {
+                let selected = match metric {
+                    MetricKind::Cpu => self.ivars().selected_cpu_label.borrow().clone(),
+                    MetricKind::Ram => self.ivars().selected_ram_label.borrow().clone(),
+                };
+                field.setStringValue(&objc2_foundation::NSString::from_str(selected.as_str()));
+            }
             return;
         };
-        field.setStringValue(&objc2_foundation::NSString::from_str(label.as_str()));
-        let previous = if cpu {
-            self.ivars().selected_cpu_label.replace(label.clone())
-        } else {
-            self.ivars().selected_ram_label.replace(label.clone())
+        if restore_invalid {
+            field.setStringValue(&objc2_foundation::NSString::from_str(label.as_str()));
+        }
+        let previous = match metric {
+            MetricKind::Cpu => self.ivars().selected_cpu_label.replace(label.clone()),
+            MetricKind::Ram => self.ivars().selected_ram_label.replace(label.clone()),
         };
         if label != previous {
-            self.send(if cpu {
-                IndicatorPreferenceChange::SetCpuLabel(label)
-            } else {
-                IndicatorPreferenceChange::SetRamLabel(label)
+            self.send(match metric {
+                MetricKind::Cpu => IndicatorPreferenceChange::SetCpuLabel(label),
+                MetricKind::Ram => IndicatorPreferenceChange::SetRamLabel(label),
             });
         }
     }
 
-    fn commit_label_spacing(&self, field: &NSTextField) {
+    fn commit_label_spacing(&self, field: &NSTextField, restore_invalid: bool) {
         if self.ivars().applying.get() {
             return;
         }
@@ -336,19 +354,23 @@ impl IndicatorControlsTarget {
             .ok()
             .and_then(|value| LabelSpacing::try_from(value).ok());
         let Some(spacing) = spacing else {
-            field.setStringValue(&objc2_foundation::NSString::from_str(
-                &self
-                    .ivars()
-                    .selected_label_spacing
-                    .get()
-                    .spaces()
-                    .to_string(),
-            ));
+            if restore_invalid {
+                field.setStringValue(&objc2_foundation::NSString::from_str(
+                    &self
+                        .ivars()
+                        .selected_label_spacing
+                        .get()
+                        .spaces()
+                        .to_string(),
+                ));
+            }
             return;
         };
-        field.setStringValue(&objc2_foundation::NSString::from_str(
-            &spacing.spaces().to_string(),
-        ));
+        if restore_invalid {
+            field.setStringValue(&objc2_foundation::NSString::from_str(
+                &spacing.spaces().to_string(),
+            ));
+        }
         if spacing != self.ivars().selected_label_spacing.replace(spacing) {
             self.send(IndicatorPreferenceChange::SetLabelSpacing(spacing));
         }
@@ -740,6 +762,7 @@ impl IndicatorControls {
         };
         labels_visible.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(84.0, 24.0)));
         labels_visible.setTitle(ns_string!("Mostrar"));
+        labels_visible.setAccessibilityLabel(Some(ns_string!("Mostrar rótulos C/R")));
         labels_visible.setAccessibilityIdentifier(Some(ns_string!("indicator.labels.visible")));
         let cpu_label_text = text_label(mtm, "CPU", 0.0);
         cpu_label_text.setFrameSize(NSSize::new(34.0, 28.0));

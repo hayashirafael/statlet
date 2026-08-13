@@ -698,9 +698,7 @@ fn draw_metric_line(
                 context.appearance_name,
             )
             .drawAtPoint(NSPoint {
-                x: context
-                    .layout
-                    .value_origin(context.measurer, line_width, &value.text),
+                x: label_value_origin(context.measurer, &label.text),
                 y,
             });
         }
@@ -712,6 +710,10 @@ fn draw_metric_line(
         )
         .drawAtPoint(NSPoint { x: 0.0, y }),
     }
+}
+
+fn label_value_origin(measurer: &impl TextMeasurer, label: &str) -> f64 {
+    measurer.width(label)
 }
 
 fn attributed_scene_run(
@@ -903,6 +905,21 @@ mod tests {
 
         fn content_height(&self) -> f64 {
             18.0
+        }
+    }
+
+    #[test]
+    fn label_value_origin_uses_only_the_literal_label_prefix() {
+        let measurer = CountingMeasurer::new();
+
+        for label in ["C", "C ", "C  ", "C   ", "CPU    "] {
+            for value in ["0%", "9%", "10%", "99%", "100%"] {
+                assert_eq!(
+                    label_value_origin(&measurer, label),
+                    measurer.width(label),
+                    "{label:?} before {value}"
+                );
+            }
         }
     }
 
