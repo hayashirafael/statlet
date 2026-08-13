@@ -352,10 +352,10 @@ impl IndicatorControlsTarget {
         let Ok(index) = usize::try_from(sender.indexOfSelectedItem()) else {
             return;
         };
-        let Some(name) = SystemSymbolName::curated_names().get(index) else {
+        let Some(option) = SystemSymbolName::curated_options().get(index) else {
             return;
         };
-        let Ok(symbol) = SystemSymbolName::new(name) else {
+        let Ok(symbol) = SystemSymbolName::new(option.name()) else {
             return;
         };
         self.send(IndicatorPreferenceChange::SetMetricSystemSymbol { metric, symbol });
@@ -658,17 +658,19 @@ impl MetricIdentifierControls {
         &self,
         preferences: &statlet::indicator_preferences::MetricIdentifierPreferences,
         error: Option<&str>,
+        processing: bool,
         store: &IconAssetStore,
     ) {
         restore_identifier_segment(&self.mode, preferences.mode);
-        if let Some(index) = SystemSymbolName::curated_names()
+        if let Some(index) = SystemSymbolName::curated_options()
             .iter()
-            .position(|name| *name == preferences.system_symbol.as_str())
+            .position(|option| option.name() == preferences.system_symbol.as_str())
         {
             self.symbol
                 .selectItemAtIndex(isize::try_from(index).expect("curated symbol index fits"));
         }
-        let presentation = MetricIdentifierControlPresentation::new(preferences, error);
+        let presentation =
+            MetricIdentifierControlPresentation::with_processing(preferences, error, processing);
         self.symbol.setHidden(true);
         self.choose_png.setHidden(true);
         self.thumbnail.setHidden(true);
@@ -686,10 +688,16 @@ impl MetricIdentifierControls {
                 can_remove,
             } => {
                 self.choose_png.setHidden(false);
+                self.choose_png.setEnabled(!presentation.processing);
                 self.status.setHidden(false);
                 self.remove.setHidden(false);
-                self.remove.setEnabled(can_remove);
-                let status = presentation.error.as_deref().or(source_name.as_deref());
+                self.remove
+                    .setEnabled(can_remove && !presentation.processing);
+                let status = if presentation.processing {
+                    Some("Processando PNG…")
+                } else {
+                    presentation.error.as_deref().or(source_name.as_deref())
+                };
                 self.status
                     .setStringValue(&objc2_foundation::NSString::from_str(
                         status.unwrap_or("Nenhum PNG escolhido."),
@@ -704,7 +712,7 @@ impl MetricIdentifierControls {
                     .setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(
                         status.unwrap_or("Nenhum PNG escolhido."),
                     )));
-                if can_remove {
+                if can_remove && !presentation.processing {
                     if let Some(path) = store.path_for(self.metric).to_str() {
                         if let Some(image) = NSImage::initWithContentsOfFile(
                             NSImage::alloc(),
@@ -1598,7 +1606,7 @@ impl IndicatorControls {
             labels_editor,
             target,
         };
-        controls.apply(&IndicatorPreferences::default(), None, None);
+        controls.apply(&IndicatorPreferences::default(), None, None, false, false);
         controls
             .area_views()
             .set_visible_area(PreferencesArea::Colors);
@@ -1610,6 +1618,8 @@ impl IndicatorControls {
         preferences: &IndicatorPreferences,
         cpu_icon_error: Option<&str>,
         ram_icon_error: Option<&str>,
+        cpu_icon_pending: bool,
+        ram_icon_pending: bool,
     ) {
         self.target.ivars().applying.set(true);
         self.target
@@ -1631,11 +1641,13 @@ impl IndicatorControls {
         self.cpu_identifier.apply(
             &preferences.identifiers.cpu,
             cpu_icon_error,
+            cpu_icon_pending,
             &self.icon_asset_store,
         );
         self.ram_identifier.apply(
             &preferences.identifiers.ram,
             ram_icon_error,
+            ram_icon_pending,
             &self.icon_asset_store,
         );
         self.cpu_mode
@@ -1997,12 +2009,24 @@ fn metric_identifier_controls(
         NSRect::new(NSPoint::new(100.0, 0.0), NSSize::new(300.0, 30.0)),
         false,
     );
-    let names = SystemSymbolName::curated_names()
+    let labels = SystemSymbolName::curated_options()
         .iter()
-        .map(|name| objc2_foundation::NSString::from_str(name))
+        .map(|option| objc2_foundation::NSString::from_str(option.label_pt_br()))
         .collect::<Vec<_>>();
-    let name_refs = names.iter().map(|name| &**name).collect::<Vec<_>>();
-    symbol.addItemsWithTitles(&NSArray::from_slice(&name_refs));
+    let label_refs = labels.iter().map(|label| &**label).collect::<Vec<_>>();
+    symbol.addItemsWithTitles(&NSArray::from_slice(&label_refs));
+    for (index, option) in SystemSymbolName::curated_options().iter().enumerate() {
+        let Some(item) = symbol.itemAtIndex(index as isize) else {
+            continue;
+        };
+        let name = objc2_foundation::NSString::from_str(option.name());
+        let accessibility = objc2_foundation::NSString::from_str(option.label_pt_br());
+        if let Some(image) =
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(&name, Some(&accessibility))
+        {
+            item.setImage(Some(&image));
+        }
+    }
     symbol.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(&format!(
         "{prefix}.symbol"
     ))));

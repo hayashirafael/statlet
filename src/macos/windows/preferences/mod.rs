@@ -647,10 +647,17 @@ impl IndicatorPage {
         preferences: &IndicatorPreferences,
         cpu_icon_error: Option<&str>,
         ram_icon_error: Option<&str>,
+        cpu_icon_pending: bool,
+        ram_icon_pending: bool,
     ) {
         let previous_controls_height = self.controls.content_height();
-        self.controls
-            .apply(preferences, cpu_icon_error, ram_icon_error);
+        self.controls.apply(
+            preferences,
+            cpu_icon_error,
+            ram_icon_error,
+            cpu_icon_pending,
+            ram_icon_pending,
+        );
         let controls_height = self.controls.content_height();
         if controls_height == previous_controls_height {
             return;
@@ -830,6 +837,8 @@ impl PreferencesWindow {
             &state.preferences.indicator,
             state.indicator_icon_error(statlet::indicator_preferences::MetricKind::Cpu),
             state.indicator_icon_error(statlet::indicator_preferences::MetricKind::Ram),
+            state.indicator_icon_pending(statlet::indicator_preferences::MetricKind::Cpu),
+            state.indicator_icon_pending(statlet::indicator_preferences::MetricKind::Ram),
         );
         self._area_target.refresh_selected_area();
         let save_failed = state.preferences_save_status == PreferencesSaveStatus::Failed;

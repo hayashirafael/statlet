@@ -16,17 +16,18 @@ use objc2_app_kit::{
     NSAppearanceNameDarkAqua,
 };
 use statlet::core::{
-    AppEffect, AppEvent, MetricPngImportResult, MetricPngRemovalResult, Preferences,
-    PreferencesSaveResult, StatletCore,
+    AppEffect, AppEvent, MetricPngAssetMutation, MetricPngImportResult, MetricPngRemovalResult,
+    Preferences, PreferencesSaveResult, StatletCore,
 };
 use statlet::disk::macos::{ContinuousClock, StartupVolumeSampler};
 use statlet::disk::DiskSamplingSchedule;
 use statlet::history::{History, HistoryStore};
-use statlet::icon_assets::IconAssetStore;
+use statlet::icon_assets::{IconAssetStore, PngAssetTransaction, PreparedPngAsset};
 use statlet::indicator::{
-    compose_indicator, has_low_text_contrast, preview_accessibility_summary, PreviewBackground,
+    compose_indicator, has_low_text_contrast, preview_accessibility_summary_with_fallbacks,
+    preview_visible_summary, resolve_identifier_fallbacks, PreviewBackground,
 };
-use statlet::indicator_preferences::{IndicatorAppearance, MetricsRefreshInterval};
+use statlet::indicator_preferences::{IndicatorAppearance, MetricKind, MetricsRefreshInterval};
 use statlet::metrics_schedule::MetricsSamplingSchedule;
 use statlet::mole::{MoleDetection, MoleDetector, MoleInstallation, MoleStatus};
 use statlet::preferences::PreferencesStore;
@@ -145,6 +146,11 @@ fn main() {
         Event::UserEvent(runtime_event) => {
             let effects = match runtime_event {
                 RuntimeEvent::App(app_event) => core.handle(app_event),
+                RuntimeEvent::MetricPngPrepared {
+                    metric,
+                    generation,
+                    result,
+                } => runtime.finish_png_preparation(&mut core, metric, generation, result),
                 RuntimeEvent::VisualEnvironmentChanged => {
                     let marker = MainThreadMarker::new().expect("visual events run on main thread");
                     if let Some(request) = visual_environment_redraw_request(
@@ -288,6 +294,9 @@ struct RuntimeAdapters {
     visual_environment: VisualEnvironmentState<Retained<NSAppearance>>,
     schedule: RuntimeSchedule<Preferences>,
     review_space_item: MenuItem,
+    event_proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
+    png_import_generations: [u64; 2],
+    prepared_png_imports: [Option<PreparedPngAsset>; 2],
 }
 
 impl RuntimeAdapters {
@@ -307,12 +316,42 @@ impl RuntimeAdapters {
             history,
             windows: None,
             samplers: RuntimeSamplers::new(metrics_interval),
-            mole: RuntimeMole::new(proxy),
+            mole: RuntimeMole::new(proxy.clone()),
             notifications: None,
             visual_environment_observer: None,
             visual_environment: VisualEnvironmentState::default(),
             schedule: RuntimeSchedule::new(),
             review_space_item,
+            event_proxy: proxy,
+            png_import_generations: [0; 2],
+            prepared_png_imports: [None, None],
+        }
+    }
+
+    fn finish_png_preparation(
+        &mut self,
+        core: &mut StatletCore,
+        metric: MetricKind,
+        generation: u64,
+        result: Result<PreparedPngAsset, String>,
+    ) -> Vec<AppEffect> {
+        let index = metric_index(metric);
+        if self.png_import_generations[index] != generation {
+            return Vec::new();
+        }
+        match result {
+            Ok(prepared) => {
+                let metadata = prepared.metadata().clone();
+                self.prepared_png_imports[index] = Some(prepared);
+                core.handle(AppEvent::MetricPngImportFinished {
+                    metric,
+                    result: MetricPngImportResult::Imported(metadata),
+                })
+            }
+            Err(message) => core.handle(AppEvent::MetricPngImportFinished {
+                metric,
+                result: MetricPngImportResult::Failed(message),
+            }),
         }
     }
 
@@ -512,24 +551,85 @@ impl RuntimeAdapters {
                     Err(error) => eprintln!("Statlet could not clear history: {error}"),
                 },
                 AppEffect::ImportMetricPng { metric, source } => {
-                    let result = match self.icon_asset_store.import_file(metric, &source) {
-                        Ok(metadata) => MetricPngImportResult::Imported(metadata),
-                        Err(error) => {
-                            MetricPngImportResult::Failed(error.user_message().to_owned())
-                        }
-                    };
-                    pending
-                        .extend(core.handle(AppEvent::MetricPngImportFinished { metric, result }));
+                    let index = metric_index(metric);
+                    self.png_import_generations[index] =
+                        self.png_import_generations[index].wrapping_add(1);
+                    let generation = self.png_import_generations[index];
+                    if let Err(error) = spawn_png_preparation_with(
+                        self.icon_asset_store.clone(),
+                        metric,
+                        source,
+                        generation,
+                        {
+                            let proxy = self.event_proxy.clone();
+                            move |event| {
+                                let _ = proxy.send_event(event);
+                            }
+                        },
+                    ) {
+                        pending.extend(core.handle(AppEvent::MetricPngImportFinished {
+                            metric,
+                            result: MetricPngImportResult::Failed(format!(
+                                "Não foi possível iniciar o processamento do PNG: {error}"
+                            )),
+                        }));
+                    }
+                }
+                AppEffect::CancelMetricPngImport(metric) => {
+                    let index = metric_index(metric);
+                    self.png_import_generations[index] =
+                        self.png_import_generations[index].wrapping_add(1);
+                    self.prepared_png_imports[index] = None;
                 }
                 AppEffect::RemoveMetricPngAsset(metric) => {
-                    let result = match self.icon_asset_store.remove(metric) {
-                        Ok(()) => MetricPngRemovalResult::Removed,
-                        Err(error) => {
-                            MetricPngRemovalResult::Failed(error.user_message().to_owned())
-                        }
+                    pending.extend(core.handle(AppEvent::MetricPngRemovalFinished {
+                        metric,
+                        result: MetricPngRemovalResult::Removed,
+                    }));
+                }
+                AppEffect::PersistMetricPngChange {
+                    metric,
+                    mutation,
+                    previous,
+                    preferences,
+                } => {
+                    let transaction = match mutation {
+                        MetricPngAssetMutation::Replace => self.prepared_png_imports
+                            [metric_index(metric)]
+                        .take()
+                        .ok_or_else(|| {
+                            "O PNG preparado não está mais disponível; a escolha anterior foi restaurada."
+                                .to_owned()
+                        })
+                        .and_then(|prepared| {
+                            self.icon_asset_store
+                                .begin_replace(prepared)
+                                .map_err(|error| error.user_message().to_owned())
+                        }),
+                        MetricPngAssetMutation::Remove => self
+                            .icon_asset_store
+                            .begin_remove(metric)
+                            .map_err(|error| error.user_message().to_owned()),
                     };
-                    pending
-                        .extend(core.handle(AppEvent::MetricPngRemovalFinished { metric, result }));
+                    match transaction {
+                        Ok(transaction) => pending.extend(persist_metric_png_change(
+                            &self.preferences_store,
+                            &mut self.schedule,
+                            self.samplers.clock.now(),
+                            core,
+                            metric,
+                            previous,
+                            preferences,
+                            transaction,
+                        )),
+                        Err(message) => {
+                            pending.extend(core.handle(AppEvent::MetricPngPersistenceFailed {
+                                metric,
+                                previous,
+                                message,
+                            }))
+                        }
+                    }
                 }
                 AppEffect::Quit => should_quit = true,
             }
@@ -598,8 +698,12 @@ impl RuntimeAdapters {
             requested_family: light.font.requested_family.clone(),
             resolved_family: light.font.resolved_family.clone(),
         });
-        let light_colors = resolved_scene_srgb_colors(&light_scene, &light_appearance);
-        let dark_colors = resolved_scene_srgb_colors(&dark_scene, &dark_appearance);
+        let (light_resolved_scene, light_fallbacks) =
+            resolve_identifier_fallbacks(&light_scene, light.identifier_resolved);
+        let (dark_resolved_scene, dark_fallbacks) =
+            resolve_identifier_fallbacks(&dark_scene, dark.identifier_resolved);
+        let light_colors = resolved_scene_srgb_colors(&light_resolved_scene, &light_appearance);
+        let dark_colors = resolved_scene_srgb_colors(&dark_resolved_scene, &dark_appearance);
         let contrast_warnings = preview_contrast_warnings(&light_colors, &dark_colors);
         windows.update_indicator_surfaces(IndicatorSurfaceUpdate {
             previews: PreviewImages {
@@ -609,15 +713,27 @@ impl RuntimeAdapters {
             font_fallback,
             contrast_warnings,
             summaries: PreviewSummaries {
-                light: preview_accessibility_summary(
-                    &light_scene,
+                light_visible: preview_visible_summary(
+                    &light_resolved_scene,
+                    IndicatorAppearance::Light,
+                    light_fallbacks,
+                ),
+                dark_visible: preview_visible_summary(
+                    &dark_resolved_scene,
+                    IndicatorAppearance::Dark,
+                    dark_fallbacks,
+                ),
+                light: preview_accessibility_summary_with_fallbacks(
+                    &light_resolved_scene,
                     &light_colors,
                     IndicatorAppearance::Light,
+                    light_fallbacks,
                 ),
-                dark: preview_accessibility_summary(
-                    &dark_scene,
+                dark: preview_accessibility_summary_with_fallbacks(
+                    &dark_resolved_scene,
                     &dark_colors,
                     IndicatorAppearance::Dark,
+                    dark_fallbacks,
                 ),
             },
             layout: IndicatorLayoutDiagnostics {
@@ -671,6 +787,85 @@ fn save_preferences(
     let effects = core.handle(AppEvent::PreferencesSaveFinished(result));
     debug_assert!(effects.is_empty());
     succeeded
+}
+
+fn metric_index(metric: MetricKind) -> usize {
+    match metric {
+        MetricKind::Cpu => 0,
+        MetricKind::Ram => 1,
+    }
+}
+
+fn spawn_png_preparation_with(
+    store: IconAssetStore,
+    metric: MetricKind,
+    source: std::path::PathBuf,
+    generation: u64,
+    deliver: impl FnOnce(RuntimeEvent) + Send + 'static,
+) -> std::io::Result<()> {
+    thread::Builder::new()
+        .name(format!(
+            "statlet-png-{}",
+            match metric {
+                MetricKind::Cpu => "cpu",
+                MetricKind::Ram => "ram",
+            }
+        ))
+        .spawn(move || {
+            let result = store
+                .prepare_file(metric, &source)
+                .map_err(|error| error.user_message().to_owned());
+            deliver(RuntimeEvent::MetricPngPrepared {
+                metric,
+                generation,
+                result,
+            });
+        })?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_metric_png_change(
+    store: &PreferencesStore,
+    schedule: &mut RuntimeSchedule<Preferences>,
+    now: Duration,
+    core: &mut StatletCore,
+    metric: MetricKind,
+    previous: statlet::indicator_preferences::MetricIdentifierPreferences,
+    preferences: Preferences,
+    transaction: PngAssetTransaction,
+) -> Vec<AppEffect> {
+    schedule.queue_save(now, preferences.clone());
+    schedule.request_save_now(now);
+    debug_assert_eq!(schedule.due_save(now), Some(preferences.clone()));
+    match store.save(preferences.clone()) {
+        Ok(()) => {
+            transaction.commit();
+            schedule.finish_save(&preferences, true);
+            core.handle(AppEvent::PreferencesSaveFinished(
+                PreferencesSaveResult::Saved,
+            ))
+        }
+        Err(error) => {
+            eprintln!("Statlet could not save preferences for a PNG change: {error}");
+            schedule.finish_save(&preferences, false);
+            let rollback = transaction.rollback();
+            let message = match rollback {
+                Ok(()) => {
+                    "Não foi possível salvar as preferências; a escolha de PNG anterior foi restaurada."
+                        .to_owned()
+                }
+                Err(rollback_error) => format!(
+                    "Não foi possível salvar as preferências nem restaurar o PNG anterior: {rollback_error}"
+                ),
+            };
+            core.handle(AppEvent::MetricPngPersistenceFailed {
+                metric,
+                previous,
+                message,
+            })
+        }
+    }
 }
 
 struct RuntimeMole {
@@ -818,8 +1013,11 @@ impl RuntimeSamplers {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Cursor;
+    use std::sync::mpsc;
     use std::time::Duration;
 
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
     use statlet::core::{AppEvent, IndicatorPreferenceChange, Preferences, PreferencesSaveStatus};
     use statlet::indicator::{IndicatorRun, IndicatorScene, SegmentColor, SemanticColor};
@@ -828,10 +1026,112 @@ mod tests {
 
     use super::{
         apply_persistence_intent, preview_contrast_warnings, resolved_scene_srgb_colors,
-        save_preferences, visual_environment_redraw_request, PreferencesStore,
-        PreviewContrastWarnings, RuntimeSamplers, StatletCore, VisualEnvironment,
-        VisualEnvironmentState,
+        save_preferences, spawn_png_preparation_with, visual_environment_redraw_request, AppEffect,
+        IconAssetStore, MetricKind, PreferencesStore, PreviewContrastWarnings, RuntimeEvent,
+        RuntimeSamplers, StatletCore, VisualEnvironment, VisualEnvironmentState,
     };
+
+    #[test]
+    fn png_decode_resize_and_reencode_run_on_a_worker_thread() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("large.png");
+        let image = RgbaImage::from_pixel(128, 64, Rgba([0x22, 0x88, 0xCC, 0xFF]));
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        fs::write(&source, bytes.into_inner()).unwrap();
+        let store = IconAssetStore::new(directory.path().join("icons"));
+        let caller = std::thread::current().id();
+        let (sender, receiver) = mpsc::channel();
+
+        spawn_png_preparation_with(store, MetricKind::Cpu, source, 7, move |event| {
+            sender.send((std::thread::current().id(), event)).unwrap();
+        })
+        .unwrap();
+
+        let (worker, event) = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_ne!(worker, caller);
+        assert!(matches!(
+            event,
+            RuntimeEvent::MetricPngPrepared {
+                metric: MetricKind::Cpu,
+                generation: 7,
+                result: Ok(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn png_asset_and_preferences_roll_back_together_when_save_fails() {
+        let directory = tempdir().unwrap();
+        let asset_store = IconAssetStore::new(directory.path().join("icons"));
+        let png = |color| {
+            let image = RgbaImage::from_pixel(12, 12, Rgba(color));
+            let mut bytes = Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(image)
+                .write_to(&mut bytes, ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        };
+        asset_store
+            .import_bytes(
+                MetricKind::Cpu,
+                "original.png",
+                &png([0x11, 0x22, 0x33, 0xFF]),
+            )
+            .unwrap();
+        let original_asset = fs::read(asset_store.path_for(MetricKind::Cpu)).unwrap();
+        let prepared = asset_store
+            .prepare_bytes(
+                MetricKind::Cpu,
+                "replacement.png",
+                &png([0xAA, 0xBB, 0xCC, 0xFF]),
+            )
+            .unwrap();
+        let metadata = prepared.metadata().clone();
+        let transaction = asset_store.begin_replace(prepared).unwrap();
+        let blocker = directory.path().join("not-a-directory");
+        fs::write(&blocker, b"block preference parent").unwrap();
+        let preferences_store = PreferencesStore::new(blocker.join("preferences.json"));
+        let mut core = StatletCore::new();
+        let previous = core.state().preferences.indicator.identifiers.cpu.clone();
+        let effect = core
+            .handle(AppEvent::MetricPngImportFinished {
+                metric: MetricKind::Cpu,
+                result: statlet::core::MetricPngImportResult::Imported(metadata),
+            })
+            .into_iter()
+            .find_map(|effect| match effect {
+                AppEffect::PersistMetricPngChange {
+                    metric,
+                    previous,
+                    preferences,
+                    ..
+                } => Some((metric, previous, preferences)),
+                _ => None,
+            })
+            .unwrap();
+        let mut schedule = statlet::runtime_schedule::RuntimeSchedule::new();
+
+        let effects = super::persist_metric_png_change(
+            &preferences_store,
+            &mut schedule,
+            Duration::ZERO,
+            &mut core,
+            effect.0,
+            effect.1,
+            effect.2,
+            transaction,
+        );
+
+        assert_eq!(
+            fs::read(asset_store.path_for(MetricKind::Cpu)).unwrap(),
+            original_asset
+        );
+        assert_eq!(core.state().preferences.indicator.identifiers.cpu, previous);
+        assert_eq!(effects, vec![AppEffect::RequestIndicatorRedraw]);
+    }
 
     #[test]
     fn appearance_identity_change_requests_only_a_semantic_color_redraw() {

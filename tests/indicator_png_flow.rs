@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use statlet::core::{
-    AppEffect, AppEvent, MetricPngImportResult, MetricPngRemovalResult, StatletCore,
+    AppEffect, AppEvent, MetricPngAssetMutation, MetricPngImportResult, MetricPngRemovalResult,
+    PreferencesSaveStatus, StatletCore,
 };
 use statlet::indicator_preferences::{MetricIdentifierMode, MetricKind, PngIconMetadata};
 
@@ -24,6 +25,8 @@ fn choosing_a_png_requests_import_without_committing_preferences_early() {
         }]
     );
     assert_eq!(app.state().preferences, before);
+    assert!(app.state().indicator_icon_pending(MetricKind::Cpu));
+    assert!(!app.state().indicator_icon_pending(MetricKind::Ram));
 }
 
 #[test]
@@ -45,13 +48,75 @@ fn successful_import_commits_png_mode_redraws_and_saves_the_document() {
         Some(metadata)
     );
     assert_eq!(app.state().indicator_icon_error(MetricKind::Cpu), None);
+    assert!(!app.state().indicator_icon_pending(MetricKind::Cpu));
     assert_eq!(
         effects,
         vec![
             AppEffect::RequestIndicatorRedraw,
-            AppEffect::QueuePreferencesSave(app.state().preferences.clone()),
+            AppEffect::PersistMetricPngChange {
+                metric: MetricKind::Cpu,
+                mutation: MetricPngAssetMutation::Replace,
+                previous: statlet::indicator_preferences::IndicatorPreferences::default()
+                    .identifiers
+                    .cpu,
+                preferences: app.state().preferences.clone(),
+            },
         ]
     );
+}
+
+#[test]
+fn reimporting_equal_metadata_still_replaces_a_missing_or_corrupt_asset() {
+    let mut app = StatletCore::new();
+    let metadata = PngIconMetadata::new("custom-cpu.png", 24, 12, 812).unwrap();
+    app.handle(AppEvent::MetricPngImportFinished {
+        metric: MetricKind::Cpu,
+        result: MetricPngImportResult::Imported(metadata.clone()),
+    });
+
+    let effects = app.handle(AppEvent::MetricPngImportFinished {
+        metric: MetricKind::Cpu,
+        result: MetricPngImportResult::Imported(metadata),
+    });
+
+    assert!(matches!(
+        effects.as_slice(),
+        [
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::PersistMetricPngChange {
+                mutation: MetricPngAssetMutation::Replace,
+                ..
+            }
+        ]
+    ));
+}
+
+#[test]
+fn failed_preferences_save_rolls_back_imported_metadata_and_exposes_the_failure() {
+    let mut app = StatletCore::new();
+    let previous = app.state().preferences.indicator.identifiers.cpu.clone();
+    let metadata = PngIconMetadata::new("custom-cpu.png", 24, 12, 812).unwrap();
+    app.handle(AppEvent::MetricPngImportFinished {
+        metric: MetricKind::Cpu,
+        result: MetricPngImportResult::Imported(metadata),
+    });
+
+    let effects = app.handle(AppEvent::MetricPngPersistenceFailed {
+        metric: MetricKind::Cpu,
+        previous: previous.clone(),
+        message: "Não foi possível salvar as preferências; o PNG anterior foi restaurado.".into(),
+    });
+
+    assert_eq!(app.state().preferences.indicator.identifiers.cpu, previous);
+    assert_eq!(
+        app.state().preferences_save_status,
+        PreferencesSaveStatus::Failed
+    );
+    assert_eq!(
+        app.state().indicator_icon_error(MetricKind::Cpu),
+        Some("Não foi possível salvar as preferências; o PNG anterior foi restaurado.")
+    );
+    assert_eq!(effects, vec![AppEffect::RequestIndicatorRedraw]);
 }
 
 #[test]
@@ -73,6 +138,7 @@ fn failed_import_keeps_the_previous_mode_and_exposes_a_pt_br_error() {
         Some("Não foi possível abrir este arquivo como PNG.")
     );
     assert_eq!(app.state().indicator_icon_error(MetricKind::Cpu), None);
+    assert!(!app.state().indicator_icon_pending(MetricKind::Ram));
 
     app.handle(AppEvent::UpdateIndicator(
         statlet::core::IndicatorPreferenceChange::SetMetricIdentifierMode {
@@ -81,6 +147,29 @@ fn failed_import_keeps_the_previous_mode_and_exposes_a_pt_br_error() {
         },
     ));
     assert_eq!(app.state().indicator_icon_error(MetricKind::Ram), None);
+}
+
+#[test]
+fn changing_identifier_mode_cancels_an_in_flight_png_import() {
+    let mut app = StatletCore::new();
+    app.handle(AppEvent::ChooseMetricPng {
+        metric: MetricKind::Cpu,
+        source: PathBuf::from("/tmp/slow.png"),
+    });
+
+    let effects = app.handle(AppEvent::UpdateIndicator(
+        statlet::core::IndicatorPreferenceChange::SetMetricIdentifierMode {
+            metric: MetricKind::Cpu,
+            mode: MetricIdentifierMode::SystemSymbol,
+        },
+    ));
+
+    assert!(!app.state().indicator_icon_pending(MetricKind::Cpu));
+    assert_eq!(
+        effects[0],
+        AppEffect::CancelMetricPngImport(MetricKind::Cpu)
+    );
+    assert_eq!(effects[1], AppEffect::RequestIndicatorRedraw);
 }
 
 #[test]
@@ -118,10 +207,15 @@ fn removal_is_committed_only_after_the_asset_store_succeeds() {
         .png
         .is_none());
     assert_eq!(effects[0], AppEffect::RequestIndicatorRedraw);
-    assert_eq!(
-        effects[1],
-        AppEffect::QueuePreferencesSave(app.state().preferences.clone())
-    );
+    assert!(matches!(
+        &effects[1],
+        AppEffect::PersistMetricPngChange {
+            metric: MetricKind::Ram,
+            mutation: MetricPngAssetMutation::Remove,
+            preferences,
+            ..
+        } if preferences == &app.state().preferences
+    ));
 }
 
 #[test]

@@ -55,7 +55,64 @@ pub struct SystemSymbolName(String);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidSystemSymbolName;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CuratedSystemSymbol {
+    name: &'static str,
+    label_pt_br: &'static str,
+    introduced_year: u16,
+}
+
+pub const MACOS_14_SF_SYMBOL_CATALOG_YEAR: u16 = 2023;
+
+impl CuratedSystemSymbol {
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    pub const fn label_pt_br(self) -> &'static str {
+        self.label_pt_br
+    }
+
+    pub const fn introduced_year(self) -> u16 {
+        self.introduced_year
+    }
+}
+
 impl SystemSymbolName {
+    // Snapshot verified from Apple's CoreGlyphs `name_availability.plist` on
+    // 2026-08-13. The 2023 catalog is the one shipped with macOS 14 Sonoma.
+    const CURATED_OPTIONS: [CuratedSystemSymbol; 6] = [
+        CuratedSystemSymbol {
+            name: "cpu",
+            label_pt_br: "Processador",
+            introduced_year: 2020,
+        },
+        CuratedSystemSymbol {
+            name: "memorychip",
+            label_pt_br: "Chip de memória",
+            introduced_year: 2020,
+        },
+        CuratedSystemSymbol {
+            name: "gauge.with.dots.needle.33percent",
+            label_pt_br: "Medidor",
+            introduced_year: 2023,
+        },
+        CuratedSystemSymbol {
+            name: "waveform.path.ecg",
+            label_pt_br: "Batimento",
+            introduced_year: 2019,
+        },
+        CuratedSystemSymbol {
+            name: "chart.bar.fill",
+            label_pt_br: "Gráfico de barras",
+            introduced_year: 2019,
+        },
+        CuratedSystemSymbol {
+            name: "bolt.fill",
+            label_pt_br: "Energia",
+            introduced_year: 2019,
+        },
+    ];
     const CURATED_NAMES: [&'static str; 6] = [
         "cpu",
         "memorychip",
@@ -79,6 +136,17 @@ impl SystemSymbolName {
 
     pub const fn curated_names() -> &'static [&'static str] {
         &Self::CURATED_NAMES
+    }
+
+    pub const fn curated_options() -> &'static [CuratedSystemSymbol] {
+        &Self::CURATED_OPTIONS
+    }
+
+    pub fn label_pt_br(&self) -> &'static str {
+        Self::CURATED_OPTIONS
+            .iter()
+            .find(|option| option.name == self.0)
+            .map_or("Ícone do macOS", |option| option.label_pt_br)
     }
 }
 

@@ -120,10 +120,12 @@ fn png_metadata_fingerprint_changes_when_equal_sized_visual_content_changes() {
 fn stale_temporary_file_from_an_interrupted_process_does_not_block_import() {
     let directory = tempdir().unwrap();
     let store = IconAssetStore::new(directory.path().to_path_buf());
-    let stale = directory
-        .path()
-        .join(format!(".cpu.png.{}.tmp", std::process::id()));
-    std::fs::write(&stale, b"stale").unwrap();
+    for sequence in 0..32 {
+        let stale = directory
+            .path()
+            .join(format!(".cpu.png.{}.{sequence}.tmp", std::process::id()));
+        std::fs::write(stale, b"stale").unwrap();
+    }
 
     let result = store.import_bytes(
         MetricKind::Cpu,
@@ -133,6 +135,57 @@ fn stale_temporary_file_from_an_interrupted_process_does_not_block_import() {
 
     assert!(result.is_ok());
     assert!(store.path_for(MetricKind::Cpu).exists());
+}
+
+#[test]
+fn failed_preferences_save_can_roll_back_an_installed_png() {
+    let directory = tempdir().unwrap();
+    let store = IconAssetStore::new(directory.path().to_path_buf());
+    let original = png(12, 12, [0x11, 0x22, 0x33, 0xFF]);
+    let replacement = png(12, 12, [0xAA, 0xBB, 0xCC, 0xFF]);
+    store
+        .import_bytes(MetricKind::Cpu, "original.png", &original)
+        .unwrap();
+    let original_saved = std::fs::read(store.path_for(MetricKind::Cpu)).unwrap();
+
+    let prepared = store
+        .prepare_bytes(MetricKind::Cpu, "replacement.png", &replacement)
+        .unwrap();
+    let transaction = store.begin_replace(prepared).unwrap();
+    assert_ne!(
+        std::fs::read(store.path_for(MetricKind::Cpu)).unwrap(),
+        original_saved
+    );
+
+    transaction.rollback().unwrap();
+
+    assert_eq!(
+        std::fs::read(store.path_for(MetricKind::Cpu)).unwrap(),
+        original_saved
+    );
+}
+
+#[test]
+fn failed_preferences_save_can_roll_back_a_removed_png() {
+    let directory = tempdir().unwrap();
+    let store = IconAssetStore::new(directory.path().to_path_buf());
+    store
+        .import_bytes(
+            MetricKind::Ram,
+            "ram.png",
+            &png(12, 12, [0x44, 0x55, 0x66, 0xFF]),
+        )
+        .unwrap();
+    let saved = std::fs::read(store.path_for(MetricKind::Ram)).unwrap();
+
+    let transaction = store.begin_remove(MetricKind::Ram).unwrap();
+    assert!(!store.path_for(MetricKind::Ram).exists());
+    transaction.rollback().unwrap();
+
+    assert_eq!(
+        std::fs::read(store.path_for(MetricKind::Ram)).unwrap(),
+        saved
+    );
 }
 
 fn png(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {

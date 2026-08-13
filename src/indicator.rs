@@ -168,6 +168,15 @@ pub fn preview_accessibility_summary(
     resolved_colors: &[[f64; 3]],
     appearance: IndicatorAppearance,
 ) -> String {
+    preview_accessibility_summary_with_fallbacks(scene, resolved_colors, appearance, [false, false])
+}
+
+pub fn preview_accessibility_summary_with_fallbacks(
+    scene: &IndicatorScene,
+    resolved_colors: &[[f64; 3]],
+    appearance: IndicatorAppearance,
+    text_fallbacks: [bool; 2],
+) -> String {
     let mut color_index = 0;
     let (cpu, cpu_has_identifier) = preview_metric_summary(
         "CPU",
@@ -175,6 +184,7 @@ pub fn preview_accessibility_summary(
         scene.top_identifier.as_ref(),
         resolved_colors,
         &mut color_index,
+        text_fallbacks[0],
     );
     let (ram, ram_has_identifier) = preview_metric_summary(
         "RAM",
@@ -182,6 +192,7 @@ pub fn preview_accessibility_summary(
         scene.bottom_identifier.as_ref(),
         resolved_colors,
         &mut color_index,
+        text_fallbacks[1],
     );
     let uses_visual_identifier =
         scene.top_identifier.is_some() || scene.bottom_identifier.is_some();
@@ -216,12 +227,102 @@ pub fn preview_accessibility_summary(
     format!("Prévia {appearance}: {cpu}; {ram}; {labels}; {badge}.")
 }
 
+pub fn resolve_identifier_fallbacks(
+    scene: &IndicatorScene,
+    identifier_resolved: [bool; 2],
+) -> (IndicatorScene, [bool; 2]) {
+    let mut resolved = scene.clone();
+    let top_fallback = resolve_metric_identifier_fallback(
+        &mut resolved.top_identifier,
+        &mut resolved.top,
+        identifier_resolved[0],
+    );
+    let bottom_fallback = resolve_metric_identifier_fallback(
+        &mut resolved.bottom_identifier,
+        &mut resolved.bottom,
+        identifier_resolved[1],
+    );
+    (resolved, [top_fallback, bottom_fallback])
+}
+
+fn resolve_metric_identifier_fallback(
+    identifier: &mut Option<MetricIdentifierVisual>,
+    runs: &mut Vec<IndicatorRun>,
+    resolved: bool,
+) -> bool {
+    if resolved {
+        return false;
+    }
+    let Some(identifier) = identifier.take() else {
+        return false;
+    };
+    let (text, color) = match identifier {
+        MetricIdentifierVisual::SystemSymbol {
+            fallback_text,
+            color,
+            ..
+        } => (fallback_text, color),
+        MetricIdentifierVisual::Png {
+            fallback_text,
+            fallback_color,
+            ..
+        } => (fallback_text, fallback_color),
+    };
+    runs.insert(0, IndicatorRun { text, color });
+    true
+}
+
+pub fn preview_visible_summary(
+    scene: &IndicatorScene,
+    appearance: IndicatorAppearance,
+    text_fallbacks: [bool; 2],
+) -> String {
+    let appearance = match appearance {
+        IndicatorAppearance::Light => "Claro",
+        IndicatorAppearance::Dark => "Escuro",
+    };
+    let cpu = visible_metric_summary(
+        "CPU",
+        &scene.top,
+        scene.top_identifier.as_ref(),
+        text_fallbacks[0],
+    );
+    let ram = visible_metric_summary(
+        "RAM",
+        &scene.bottom,
+        scene.bottom_identifier.as_ref(),
+        text_fallbacks[1],
+    );
+    format!("{appearance}: {cpu} · {ram}.")
+}
+
+fn visible_metric_summary(
+    name: &str,
+    runs: &[IndicatorRun],
+    identifier: Option<&MetricIdentifierVisual>,
+    text_fallback: bool,
+) -> String {
+    let value = runs.last().map_or("—", |run| run.text.trim());
+    let presentation = if text_fallback {
+        "texto alternativo"
+    } else {
+        match identifier {
+            Some(MetricIdentifierVisual::SystemSymbol { .. }) => "ícone",
+            Some(MetricIdentifierVisual::Png { .. }) => "PNG",
+            None if runs.len() > 1 => "texto",
+            None => "sem rótulo",
+        }
+    };
+    format!("{name} {value} ({presentation})")
+}
+
 fn preview_metric_summary(
     name: &str,
     runs: &[IndicatorRun],
     identifier: Option<&MetricIdentifierVisual>,
     resolved_colors: &[[f64; 3]],
     color_index: &mut usize,
+    text_fallback: bool,
 ) -> (String, bool) {
     if let (Some(identifier), [value]) = (identifier, runs) {
         return match identifier {
@@ -238,7 +339,7 @@ fn preview_metric_summary(
                     format!(
                         "{name} {}, ícone do macOS {} na cor {identifier_color} e valor {value_color}",
                         value.text.trim(),
-                        symbol.as_str()
+                        symbol.label_pt_br()
                     ),
                     true,
                 )
@@ -270,10 +371,17 @@ fn preview_metric_summary(
                 .map_or_else(|| "cor indisponível".to_owned(), |color| color_hex(*color));
             *color_index += 1;
             (
-                format!(
-                    "{name} {}, rótulo {label_color} e valor {value_color}",
-                    value.text.trim()
-                ),
+                if text_fallback {
+                    format!(
+                        "{name} {}, fallback textual na cor {label_color} e valor {value_color}",
+                        value.text.trim()
+                    )
+                } else {
+                    format!(
+                        "{name} {}, rótulo {label_color} e valor {value_color}",
+                        value.text.trim()
+                    )
+                },
                 true,
             )
         }

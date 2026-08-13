@@ -42,3 +42,40 @@ Base confirmada: `a8f5ab43cd9f44312b115c2461a9628d5c967b70`
 - Aparência Light/Dark real, VoiceOver, Full Keyboard Access e inspeção visual do painel/menu bar permanecem para a Task filha de QA visual do run.
 - O teste dos SF Symbols comprova o runtime macOS atual e o bundle declara macOS 14+; compatibilidade visual no hardware/runtime mínimo ainda faz parte desse gate manual/CI específico.
 - Não houve push nem PR.
+
+## Rework da revisão e do QA visual — Task `task_4c97d1a0eb05`
+
+O checkpoint `670f1d3` recebeu quatro achados técnicos e nota visual 8,5/10. Este rework cobre os sete pontos antes de um novo QA:
+
+- importação e remoção de PNG agora usam uma transação de asset com backup e rollback. A preferência completa é salva imediatamente dentro da mesma operação; se o save falha, o arquivo anterior e o identificador anterior são restaurados juntos, com erro em PT-BR e estado de save falho;
+- leitura, decode, orientação, resize, reencode e escrita do candidato PNG executam em uma thread nomeada. A main event loop faz somente a troca curta por rename, persistência e atualização AppKit;
+- cada métrica mantém geração da importação assíncrona. Resultado obsoleto é descartado, mudança de modo cancela a geração corrente e a UI comunica `Processando PNG…` sem gravar o modo PNG antes do sucesso;
+- temporários usam contador por store e tentam o próximo nome em colisões. A regressão cria os nomes reais `.cpu.png.<pid>.<contador>.tmp`;
+- o catálogo é uma allowlist explícita com nome persistido, rótulo PT-BR e ano de introdução. O teste cruza a tabela com `CoreGlyphs.bundle/.../name_availability.plist` da Apple e exige ano até 2023, correspondente ao catálogo do macOS 14; o popup mostra rótulo humano e glyph nativo quando o AppKit o fornece;
+- o renderer devolve quais identificadores foram realmente resolvidos. Antes de compor as descrições, PNG/SF Symbol ausente vira o mesmo fallback textual desenhado; AX anuncia `fallback textual` e não anuncia o nome do PNG indisponível;
+- a descrição visual foi resumida para o estado essencial (`CPU/RAM` + texto/ícone/PNG/fallback), enquanto o label AX preserva cores, identificador resolvido e badge completos. Isso remove a causa do clipping sem empobrecer VoiceOver.
+
+### Ciclos RED → GREEN do rework
+
+- RED: o teste com 32 temporários no padrão real falhou em `result.is_ok()`; GREEN: alocação sequencial pula colisões e preserva os stales.
+- RED: `prepare_bytes`/`begin_replace` e o evento de rollback não existiam; GREEN: transações de replace/remove restauram bytes e reducer em falha de persistência.
+- RED: reimportar metadados iguais não emitia efeitos, deixando asset ausente/corrompido sem reparo; GREEN: toda importação aceita reinstala o candidato e redesenha.
+- RED: mudança de modo durante importação não tinha cancelamento; GREEN: `CancelMetricPngImport` invalida a geração e impede completion fora de ordem.
+- RED: preview de PNG ausente ainda continha o nome técnico no AX; GREEN: resolução do renderer alimenta cena de fallback, resumo visual curto e descrição AX fiel.
+- RED: catálogo expunha nomes técnicos e o teste chamado “minimum runtime” rodava somente no host atual; GREEN: labels PT-BR/glyphs, allowlist 2019–2023 conferida contra metadata Apple e teste de resolução local renomeado honestamente.
+
+### Limites específicos do rework
+
+- A prova automatizada do catálogo combina allowlist introduzida até 2023 e metadata Apple instalada. A resolução AppKit foi executada no host macOS 26.5.2; este terminal não contém runtime macOS 14 real. O novo QA visual e a validação em runtime mínimo continuam externos a este commit.
+- Os artefatos `.superpowers/sdd/2026-08-13-icon-option/visual-qa/` e `visual-qa.md` pertencem ao worker visual e não foram editados nem versionados por este worker.
+- O checkpoint precisa de nova avaliação visual com nota mínima 9/10; a rodada 8,5/10 permanece como evidência histórica, não como aprovação.
+
+### Evidências frescas do rework
+
+- `rtk cargo test --test indicator_icon_customization --test indicator_png_flow --test png_icon_assets --bin statlet` — 100 testes focais aprovados em 4 suítes.
+- `rtk cargo test` — 246 testes aprovados em 27 suítes.
+- `rtk cargo clippy --all-targets -- -D warnings` — sem achados.
+- `rtk cargo fmt --check` — aprovado.
+- `rtk git diff --check` — aprovado.
+- `rtk bash -n scripts/*.sh tests/package_contract.sh` — aprovado.
+- `rtk bash tests/package_contract.sh` — build release, bundle arm64/macOS 14+, assinatura ad hoc hardened runtime, ZIP, checksum, privacy manifest e notices aprovados.

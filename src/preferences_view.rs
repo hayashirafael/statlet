@@ -19,6 +19,7 @@ pub struct PreferencesControlsPresentation {
     can_undo_indicator_reset: bool,
     preferences_save_status: PreferencesSaveStatus,
     indicator_icon_errors: [Option<String>; 2],
+    indicator_icon_pending: [bool; 2],
 }
 
 impl PreferencesControlsPresentation {
@@ -34,6 +35,10 @@ impl PreferencesControlsPresentation {
                 state
                     .indicator_icon_error(MetricKind::Ram)
                     .map(str::to_owned),
+            ],
+            indicator_icon_pending: [
+                state.indicator_icon_pending(MetricKind::Cpu),
+                state.indicator_icon_pending(MetricKind::Ram),
             ],
         }
     }
@@ -55,26 +60,46 @@ pub enum IdentifierDetailPresentation {
 pub struct MetricIdentifierControlPresentation {
     pub detail: IdentifierDetailPresentation,
     pub error: Option<String>,
+    pub processing: bool,
 }
 
 impl MetricIdentifierControlPresentation {
     pub fn new(preferences: &MetricIdentifierPreferences, error: Option<&str>) -> Self {
-        let detail = match preferences.mode {
-            MetricIdentifierMode::Text => IdentifierDetailPresentation::Hidden,
-            MetricIdentifierMode::SystemSymbol => IdentifierDetailPresentation::SystemSymbol {
-                selected_name: preferences.system_symbol.as_str().to_owned(),
-            },
-            MetricIdentifierMode::Png => IdentifierDetailPresentation::Png {
+        Self::with_processing(preferences, error, false)
+    }
+
+    pub fn with_processing(
+        preferences: &MetricIdentifierPreferences,
+        error: Option<&str>,
+        processing: bool,
+    ) -> Self {
+        let detail = if processing {
+            IdentifierDetailPresentation::Png {
                 source_name: preferences
                     .png
                     .as_ref()
                     .map(|metadata| metadata.source_name().to_owned()),
-                can_remove: preferences.png.is_some(),
-            },
+                can_remove: false,
+            }
+        } else {
+            match preferences.mode {
+                MetricIdentifierMode::Text => IdentifierDetailPresentation::Hidden,
+                MetricIdentifierMode::SystemSymbol => IdentifierDetailPresentation::SystemSymbol {
+                    selected_name: preferences.system_symbol.as_str().to_owned(),
+                },
+                MetricIdentifierMode::Png => IdentifierDetailPresentation::Png {
+                    source_name: preferences
+                        .png
+                        .as_ref()
+                        .map(|metadata| metadata.source_name().to_owned()),
+                    can_remove: preferences.png.is_some(),
+                },
+            }
         };
         Self {
             detail,
             error: error.map(str::to_owned),
+            processing,
         }
     }
 }

@@ -396,6 +396,7 @@ pub struct RenderOutput {
     pub image: Retained<NSImage>,
     pub layout: LayoutDiagnostics,
     pub font: FontResolution,
+    pub identifier_resolved: [bool; 2],
 }
 
 pub struct PreviewImages {
@@ -601,13 +602,6 @@ impl Renderer {
         });
         let appearance_name = appearance.name().to_string();
         let paint_key = paint_key(scene, layout_key.clone(), appearance_name.clone());
-        if let Some(image) = self.cache.reused_image(slot, &paint_key) {
-            return RenderOutput {
-                image,
-                layout: layout.diagnostics,
-                font,
-            };
-        }
         let top_identifier_image = self.resolve_identifier_image(
             scene.top_identifier.as_ref(),
             typography,
@@ -618,6 +612,18 @@ impl Renderer {
             typography,
             &appearance_name,
         );
+        let identifier_resolved = [
+            scene.top_identifier.is_none() || top_identifier_image.is_some(),
+            scene.bottom_identifier.is_none() || bottom_identifier_image.is_some(),
+        ];
+        if let Some(image) = self.cache.reused_image(slot, &paint_key) {
+            return RenderOutput {
+                image,
+                layout: layout.diagnostics,
+                font,
+                identifier_resolved,
+            };
+        }
         let image = draw_image(
             scene,
             IdentifierImages {
@@ -639,6 +645,7 @@ impl Renderer {
             image,
             layout: layout.diagnostics,
             font,
+            identifier_resolved,
         }
     }
 
@@ -1142,6 +1149,7 @@ fn find_button(view: &NSView) -> Option<Retained<NSStatusBarButton>> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use tempfile::tempdir;
 
     use statlet::indicator::{
         has_low_text_contrast, measure_stable_layout, IndicatorRun, IndicatorScene,
@@ -1155,6 +1163,31 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct TestEntry(u8);
+
+    #[test]
+    fn missing_png_is_reported_as_unresolved_for_preview_accessibility() {
+        let Some(marker) = MainThreadMarker::new() else {
+            eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
+            return;
+        };
+        let directory = tempdir().unwrap();
+        let mut renderer = Renderer::with_main_thread_marker(marker);
+        renderer.icon_asset_store = IconAssetStore::new(directory.path().to_path_buf());
+        let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
+        let mut scene = scene_with_lines(&["42%"], &["R ", "68%"]);
+        scene.top_identifier = Some(MetricIdentifierVisual::Png {
+            metric: MetricKind::Cpu,
+            metadata: PngIconMetadata::new("missing.png", 12, 12, 400).unwrap(),
+            fallback_color: SegmentColor::Semantic(SemanticColor::Neutral),
+            fallback_text: "C ".into(),
+        });
+        let aqua =
+            NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameAqua }).unwrap();
+
+        let output = renderer.render(RenderSlot::PreviewLight, &scene, &typography, &aqua);
+
+        assert_eq!(output.identifier_resolved, [false, true]);
+    }
 
     #[test]
     fn rerender_replaces_one_entry_per_surface_instead_of_accumulating() {
@@ -1479,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn every_curated_identifier_symbol_resolves_on_the_minimum_macos_runtime() {
+    fn every_macos_14_allowlisted_symbol_also_resolves_on_the_current_host() {
         let Some(_marker) = MainThreadMarker::new() else {
             eprintln!("SKIP: AppKit symbol validation requires a main-thread test marker");
             return;
@@ -1489,7 +1522,7 @@ mod tests {
             let name = SystemSymbolName::new(name).unwrap();
             assert!(
                 create_system_symbol_image(&name, &color, 12.0, FontWeight::Medium).is_some(),
-                "curated SF Symbol {} must resolve on macOS 14+",
+                "macOS 14 allowlisted SF Symbol {} must resolve on the current host",
                 name.as_str()
             );
         }

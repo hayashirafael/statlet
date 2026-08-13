@@ -1,14 +1,16 @@
 use std::fs;
+use std::process::Command;
 
 use statlet::core::{AppEffect, AppEvent, IndicatorPreferenceChange, Preferences, StatletCore};
 use statlet::core::{MetricContent, MetricSeverity, StatusContent};
 use statlet::indicator::{
-    compose_indicator, preview_accessibility_summary, MetricIdentifierVisual, SegmentColor,
+    compose_indicator, preview_accessibility_summary, preview_accessibility_summary_with_fallbacks,
+    preview_visible_summary, resolve_identifier_fallbacks, MetricIdentifierVisual, SegmentColor,
     SemanticColor,
 };
 use statlet::indicator_preferences::{
     IndicatorLabel, IndicatorPreferences, MetricIdentifierMode, MetricKind, PngIconMetadata,
-    SystemSymbolName,
+    SystemSymbolName, MACOS_14_SF_SYMBOL_CATALOG_YEAR,
 };
 use statlet::preferences::PreferencesStore;
 use statlet::preferences_view::{
@@ -44,6 +46,64 @@ fn system_symbols_are_limited_to_the_macos_14_curated_catalog() {
     assert!(SystemSymbolName::new("arbitrary.unverified.symbol").is_err());
     assert!(SystemSymbolName::new("").is_err());
     assert!(SystemSymbolName::curated_names().contains(&"gauge.with.dots.needle.33percent"));
+
+    let options = SystemSymbolName::curated_options();
+    assert!(options
+        .iter()
+        .all(|option| option.introduced_year() <= MACOS_14_SF_SYMBOL_CATALOG_YEAR));
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| option.name())
+            .collect::<Vec<_>>(),
+        SystemSymbolName::curated_names()
+    );
+    assert!(options
+        .iter()
+        .all(|option| !option.label_pt_br().contains('.')));
+    assert_eq!(
+        options
+            .iter()
+            .find(|option| option.name() == "memorychip")
+            .unwrap()
+            .label_pt_br(),
+        "Chip de memória"
+    );
+}
+
+#[test]
+fn curated_symbol_years_match_apples_installed_availability_metadata() {
+    let output = Command::new("plutil")
+        .args([
+            "-convert",
+            "json",
+            "-o",
+            "-",
+            "/System/Library/CoreServices/CoreGlyphs.bundle/Contents/Resources/name_availability.plist",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let symbols = metadata["symbols"].as_object().unwrap();
+
+    for option in SystemSymbolName::curated_options() {
+        let installed_year = symbols[option.name()]
+            .as_str()
+            .unwrap()
+            .split('.')
+            .next()
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        assert_eq!(
+            installed_year,
+            option.introduced_year(),
+            "{}",
+            option.name()
+        );
+        assert!(installed_year <= MACOS_14_SF_SYMBOL_CATALOG_YEAR);
+    }
 }
 
 #[test]
@@ -317,6 +377,23 @@ fn identifier_control_presentation_exposes_only_the_selected_mode_details() {
 }
 
 #[test]
+fn png_processing_feedback_is_visible_without_committing_png_mode_early() {
+    let defaults = IndicatorPreferences::default();
+
+    let presentation =
+        MetricIdentifierControlPresentation::with_processing(&defaults.identifiers.cpu, None, true);
+
+    assert!(presentation.processing);
+    assert_eq!(
+        presentation.detail,
+        IdentifierDetailPresentation::Png {
+            source_name: None,
+            can_remove: false,
+        }
+    );
+}
+
+#[test]
 fn preview_accessibility_names_the_system_symbol_and_keeps_value_color_order() {
     let mut preferences = IndicatorPreferences::default();
     preferences.identifiers.cpu.mode = MetricIdentifierMode::SystemSymbol;
@@ -338,8 +415,47 @@ fn preview_accessibility_names_the_system_symbol_and_keeps_value_color_order() {
             &colors,
             statlet::indicator_preferences::IndicatorAppearance::Light,
         ),
-        "Prévia clara: CPU 42%, ícone do macOS cpu na cor #111111 e valor #222222; RAM 68%, rótulo #333333 e valor #444444; identificadores visíveis; badge ausente."
+        "Prévia clara: CPU 42%, ícone do macOS Processador na cor #111111 e valor #222222; RAM 68%, rótulo #333333 e valor #444444; identificadores visíveis; badge ausente."
     );
+}
+
+#[test]
+fn missing_png_is_resolved_to_text_before_visible_and_accessible_preview_descriptions() {
+    let mut preferences = IndicatorPreferences::default();
+    preferences.identifiers.ram.mode = MetricIdentifierMode::Png;
+    preferences.identifiers.ram.png =
+        Some(PngIconMetadata::new("ram-art.png", 24, 18, 900).unwrap());
+    let requested = compose_indicator(
+        &status(),
+        &preferences,
+        statlet::indicator_preferences::IndicatorAppearance::Dark,
+    );
+
+    let (resolved, fallbacks) = resolve_identifier_fallbacks(&requested, [true, false]);
+    let colors = [
+        [0x11 as f64 / 255.0; 3],
+        [0x22 as f64 / 255.0; 3],
+        [0x33 as f64 / 255.0; 3],
+        [0x44 as f64 / 255.0; 3],
+    ];
+    let accessible = preview_accessibility_summary_with_fallbacks(
+        &resolved,
+        &colors,
+        statlet::indicator_preferences::IndicatorAppearance::Dark,
+        fallbacks,
+    );
+    let visible = preview_visible_summary(
+        &resolved,
+        statlet::indicator_preferences::IndicatorAppearance::Dark,
+        fallbacks,
+    );
+
+    assert!(resolved.bottom_identifier.is_none());
+    assert_eq!(resolved.bottom[0].text, "R ");
+    assert!(accessible.contains("fallback textual"));
+    assert!(!accessible.contains("ram-art.png"));
+    assert!(visible.contains("texto alternativo"));
+    assert!(visible.chars().count() <= 72);
 }
 
 fn status() -> StatusContent {
