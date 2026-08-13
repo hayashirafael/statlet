@@ -1,4 +1,21 @@
-use statlet::core::{AppEffect, AppEvent, Preferences, StatletCore, WarningThreshold, WindowKind};
+use statlet::core::{
+    AppEffect, AppEvent, IndicatorPreferenceChange, Preferences, PreferencesSaveResult,
+    PreferencesSaveStatus, StatletCore, WarningThreshold, WindowKind,
+};
+use statlet::indicator_preferences::{MetricKind, MetricsRefreshInterval, SrgbColor};
+
+fn change_color(hex: &str) -> IndicatorPreferenceChange {
+    IndicatorPreferenceChange::SetMetricSharedColor {
+        metric: MetricKind::Cpu,
+        color: SrgbColor::parse_hex(hex).unwrap(),
+    }
+}
+
+fn change_interval(seconds: u8) -> IndicatorPreferenceChange {
+    IndicatorPreferenceChange::SetRefreshInterval(
+        MetricsRefreshInterval::try_from(seconds).unwrap(),
+    )
+}
 
 #[test]
 fn defaults_keep_disk_sampling_inactive() {
@@ -26,7 +43,13 @@ fn menu_actions_route_to_reusable_window_kinds() {
             vec![AppEffect::ShowWindow(WindowKind::History)]
         );
     }
-    assert_eq!(app.handle(AppEvent::Quit), vec![AppEffect::Quit]);
+    assert_eq!(
+        app.handle(AppEvent::Quit),
+        vec![
+            AppEffect::FlushPreferences(app.state().preferences.clone()),
+            AppEffect::Quit,
+        ]
+    );
 }
 
 #[test]
@@ -43,7 +66,7 @@ fn enabling_the_integration_saves_preferences_and_starts_sampling() {
     assert_eq!(
         effects,
         vec![
-            AppEffect::SavePreferences(expected),
+            AppEffect::QueuePreferencesSave(expected.clone()),
             AppEffect::SetDiskSamplingEnabled(true),
             AppEffect::RequestNotificationAuthorization,
             AppEffect::CheckMoleCompatibility,
@@ -63,7 +86,10 @@ fn changing_the_threshold_saves_the_validated_preference() {
         ..Preferences::default()
     };
     assert_eq!(app.state().preferences, expected);
-    assert_eq!(effects, vec![AppEffect::SavePreferences(expected)]);
+    assert_eq!(
+        effects,
+        vec![AppEffect::QueuePreferencesSave(expected.clone())]
+    );
 }
 
 #[test]
@@ -71,9 +97,10 @@ fn startup_preferences_control_disk_sampling_without_rewriting_the_file() {
     let preferences = Preferences {
         mole_integration_enabled: true,
         warning_threshold: WarningThreshold::try_from(95).unwrap(),
+        ..Preferences::default()
     };
 
-    let (app, effects) = StatletCore::with_preferences(preferences);
+    let (app, effects) = StatletCore::with_preferences(preferences.clone());
 
     assert_eq!(app.state().preferences, preferences);
     assert_eq!(
@@ -100,7 +127,7 @@ fn disabled_startup_and_enabled_to_disabled_transition_stop_disk_sampling() {
     assert_eq!(
         effects,
         vec![
-            AppEffect::SavePreferences(Preferences::default()),
+            AppEffect::QueuePreferencesSave(Preferences::default()),
             AppEffect::SetDiskSamplingEnabled(false),
         ]
     );
@@ -115,4 +142,39 @@ fn warning_threshold_accepts_only_five_point_steps_from_70_to_95() {
     for invalid in [0, 69, 71, 94, 96, 100] {
         assert!(WarningThreshold::try_from(invalid).is_err());
     }
+}
+
+#[test]
+fn save_failure_keeps_session_state_and_retry_uses_the_latest_document() {
+    let mut app = StatletCore::new();
+    app.handle(AppEvent::UpdateIndicator(change_color("#AF52DE")));
+
+    app.handle(AppEvent::PreferencesSaveFinished(
+        PreferencesSaveResult::Failed,
+    ));
+
+    assert_eq!(
+        app.state().preferences_save_status,
+        PreferencesSaveStatus::Failed
+    );
+
+    app.handle(AppEvent::UpdateIndicator(change_interval(9)));
+    assert_eq!(
+        app.state().preferences_save_status,
+        PreferencesSaveStatus::Failed
+    );
+
+    assert_eq!(
+        app.handle(AppEvent::RetrySavePreferences),
+        vec![AppEffect::FlushPreferences(app.state().preferences.clone())]
+    );
+
+    app.handle(AppEvent::PreferencesSaveFinished(
+        PreferencesSaveResult::Saved,
+    ));
+
+    assert_eq!(
+        app.state().preferences_save_status,
+        PreferencesSaveStatus::Saved
+    );
 }

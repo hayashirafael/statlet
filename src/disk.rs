@@ -98,4 +98,8 @@ impl DiskSamplingSchedule {
         self.next_due = Some(now.saturating_add(SAMPLE_INTERVAL));
         true
     }
+
+    pub fn remaining(&self, now: Duration) -> Option<Duration> {
+        self.next_due.map(|next_due| next_due.saturating_sub(now))
+    }
 }

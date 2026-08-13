@@ -1,6 +1,13 @@
 pub mod core;
 pub mod disk;
 pub mod history;
+pub mod icon_assets;
+pub mod indicator;
+pub mod indicator_preferences;
 pub mod metrics;
+pub mod metrics_schedule;
 pub mod mole;
 pub mod preferences;
+pub mod preferences_view;
+pub mod runtime_schedule;
+pub mod system_usage;

@@ -30,6 +30,7 @@ fn active_disk_episode_records_start_and_recovery_once() {
     assert_eq!(
         app.handle(AppEvent::DiskObserved(started)),
         vec![
+            AppEffect::RequestIndicatorRedraw,
             AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
             AppEffect::DiskPressureAlert(started),
         ]
@@ -39,9 +40,10 @@ fn active_disk_episode_records_start_and_recovery_once() {
         .is_empty());
     assert_eq!(
         app.handle(AppEvent::DiskObserved(observation(89, 7))),
-        vec![AppEffect::RecordHistory(
-            HistoryEventKind::DiskPressureRecovered
-        )]
+        vec![
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::RecordHistory(HistoryEventKind::DiskPressureRecovered),
+        ]
     );
     assert!(app
         .handle(AppEvent::DiskObserved(observation(88, 8)))
@@ -54,21 +56,28 @@ fn integration_blocks_are_recorded_once_until_mole_recovers() {
 
     assert_eq!(
         app.handle(AppEvent::MoleStatusObserved(MoleStatus::Missing)),
-        vec![AppEffect::RecordHistory(HistoryEventKind::MoleMissing)]
+        vec![
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::RecordHistory(HistoryEventKind::MoleMissing),
+        ]
     );
     assert!(app
         .handle(AppEvent::MoleStatusObserved(MoleStatus::Missing))
         .is_empty());
-    assert!(app
-        .handle(AppEvent::MoleStatusObserved(MoleStatus::Compatible(
+    assert_eq!(
+        app.handle(AppEvent::MoleStatusObserved(MoleStatus::Compatible(
             MoleVersion::new(1, 49, 2)
-        )))
-        .is_empty());
+        ))),
+        vec![AppEffect::RequestIndicatorRedraw]
+    );
     assert_eq!(
         app.handle(AppEvent::MoleStatusObserved(MoleStatus::Incompatible(
             MoleVersion::new(2, 0, 0)
         ))),
-        vec![AppEffect::RecordHistory(HistoryEventKind::MoleIncompatible)]
+        vec![
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::RecordHistory(HistoryEventKind::MoleIncompatible),
+        ]
     );
 }
 

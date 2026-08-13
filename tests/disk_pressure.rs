@@ -48,6 +48,7 @@ fn exact_threshold_requires_five_continuous_minutes_before_one_alert() {
     assert_eq!(
         app.handle(AppEvent::DiskObserved(active_observation)),
         vec![
+            AppEffect::RequestIndicatorRedraw,
             AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
             AppEffect::DiskPressureAlert(active_observation),
         ]
@@ -92,6 +93,7 @@ fn below_threshold_during_debounce_restarts_the_five_minute_window() {
     assert_eq!(
         app.handle(AppEvent::DiskObserved(restarted_episode)),
         vec![
+            AppEffect::RequestIndicatorRedraw,
             AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
             AppEffect::DiskPressureAlert(restarted_episode),
         ]
@@ -107,9 +109,10 @@ fn below_threshold_after_alert_clears_the_badge_and_rearms() {
 
     assert_eq!(
         app.handle(AppEvent::DiskObserved(observation(89, 6))),
-        vec![AppEffect::RecordHistory(
-            HistoryEventKind::DiskPressureRecovered
-        )]
+        vec![
+            AppEffect::RequestIndicatorRedraw,
+            AppEffect::RecordHistory(HistoryEventKind::DiskPressureRecovered),
+        ]
     );
     assert_eq!(app.state().status.disk_badge, None);
 
@@ -122,10 +125,35 @@ fn below_threshold_after_alert_clears_the_badge_and_rearms() {
     assert_eq!(
         app.handle(AppEvent::DiskObserved(second_episode)),
         vec![
+            AppEffect::RequestIndicatorRedraw,
             AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
             AppEffect::DiskPressureAlert(second_episode),
         ]
     );
+}
+
+#[test]
+fn unchanged_status_does_not_redraw_when_disk_episode_starts_behind_mole_error() {
+    let mut app = enabled_core();
+    app.handle(AppEvent::MoleStatusObserved(
+        statlet::mole::MoleStatus::Missing,
+    ));
+
+    for minute in 0..5 {
+        assert!(app
+            .handle(AppEvent::DiskObserved(observation(90, minute)))
+            .is_empty());
+    }
+
+    let active_observation = observation(90, 5);
+    assert_eq!(
+        app.handle(AppEvent::DiskObserved(active_observation)),
+        vec![
+            AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
+            AppEffect::DiskPressureAlert(active_observation),
+        ]
+    );
+    assert_eq!(app.state().status.disk_badge, Some(DiskBadge::Error));
 }
 
 #[test]
@@ -164,6 +192,7 @@ fn an_unobserved_sleep_gap_restarts_debounce_instead_of_counting_as_pressure() {
     assert_eq!(
         app.handle(AppEvent::DiskObserved(after_five_observed_minutes)),
         vec![
+            AppEffect::RequestIndicatorRedraw,
             AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
             AppEffect::DiskPressureAlert(after_five_observed_minutes),
         ]

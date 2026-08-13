@@ -43,3 +43,12 @@ fn a_backward_wall_clock_change_reschedules_immediately_without_stalling() {
     assert!(!schedule.take_due(seconds(109)));
     assert!(schedule.take_due(seconds(110)));
 }
+
+#[test]
+fn disabled_disk_has_no_deadline_and_enabled_disk_reports_remaining_time() {
+    let mut schedule = DiskSamplingSchedule::new();
+
+    assert_eq!(schedule.remaining(seconds(0)), None);
+    schedule.set_enabled(true, seconds(0));
+    assert_eq!(schedule.remaining(seconds(0)), Some(Duration::ZERO));
+}

@@ -2,6 +2,8 @@
 
 Checklist da v1 para os comportamentos que dependem de AppKit, configurações do macOS ou hardware real. Os contratos automatizáveis permanecem na suíte de testes.
 
+Este documento preserva a evidência da v1.0.0. A personalização posterior do indicador possui um checklist separado, em [`indicator-customization.md`](indicator-customization.md); itens manuais desse novo fluxo não herdam o estado concluído da validação v1.
+
 ## Cobertura automatizada
 
 - [x] Launch direto pede ao core uma janela útil de Preferências.
@@ -36,5 +38,7 @@ Checklist da v1 para os comportamentos que dependem de AppKit, configurações d
 - [ ] Suspender o Mac durante debounce e durante episódio ativo; após wake, confirmar ausência de alerta falso ou duplicado.
 
 Os itens abertos acima registram o limite real do ambiente de release — macOS 26.5.2, um único display interno e sem sessão de validação assistida por VoiceOver — e não são alegações de execução. Os contratos automatizados cobrem as transições de estado; hardware e tecnologias assistivas ainda pedem uma rodada manual dedicada.
+
+Na validação da personalização de 12 de agosto de 2026, o Statlet não foi aberto nem ativado para inspeção visual porque não havia autorização de foreground. Light/Dark, controles nativos, tecnologias assistivas, notch, Retina, troca de display e sleep/wake permanecem explicitamente não executados no checklist específico; o soak autorizado inicia somente o executável do bundle em background, sem interação de UI, e não conta como validação visual ou acessível.
 
 As verificações seguem as orientações da Apple para [acessibilidade](https://developer.apple.com/design/human-interface-guidelines/accessibility/), [cores semânticas](https://developer.apple.com/design/human-interface-guidelines/color/) e [interação por teclado no macOS](https://developer.apple.com/design/human-interface-guidelines/designing-for-macos/).

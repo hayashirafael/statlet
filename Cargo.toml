@@ -10,9 +10,10 @@ repository = "https://github.com/hayashirafael/statlet"
 [dependencies]
 block2 = "0.6.2"
 libc = "0.2"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSAccessibility", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSControl", "NSStatusBarButton", "NSFont", "NSFontDescriptor", "NSAttributedString", "NSText", "NSTextField", "NSButton", "NSPopUpButton", "NSMenu", "NSResponder", "NSColor", "NSImage", "NSStringDrawing", "NSGraphics", "NSGraphicsContext", "NSCell", "NSParagraphStyle", "NSAlert", "NSScrollView", "NSClipView"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSDictionary", "NSAttributedString", "NSBundle", "NSURL", "NSError", "NSValue", "NSFileManager", "NSDate", "NSDateFormatter", "NSFormatter"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-core-foundation", "NSAccessibility", "NSAccessibilityConstants", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSControl", "NSStatusBarButton", "NSFont", "NSFontDescriptor", "NSFontManager", "NSAttributedString", "NSText", "NSTextField", "NSTextFieldCell", "NSSearchField", "NSButton", "NSPopUpButton", "NSSegmentedControl", "NSSlider", "NSStepper", "NSStackView", "NSMenu", "NSResponder", "NSColor", "NSColorSpace", "NSColorWell", "NSImage", "NSImageView", "NSStringDrawing", "NSGraphics", "NSGraphicsContext", "NSCell", "NSActionCell", "NSParagraphStyle", "NSAlert", "NSAppearance", "NSScrollView", "NSClipView", "NSTableView", "NSTableColumn", "NSTableHeaderCell", "NSBezierPath", "NSUserInterfaceItemIdentification", "NSLayoutConstraint", "NSLayoutAnchor", "NSEvent", "NSWorkspace", "NSTrackingArea", "NSOpenPanel", "NSSavePanel", "NSPanel"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSArray", "NSIndexSet", "NSDictionary", "NSAttributedString", "NSBundle", "NSURL", "NSError", "NSValue", "NSFileManager", "NSDate", "NSDateFormatter", "NSFormatter", "NSNotification", "NSKeyValueObserving"] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["block2", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

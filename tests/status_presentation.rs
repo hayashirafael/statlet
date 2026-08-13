@@ -1,7 +1,7 @@
 use statlet::core::{AppEvent, MemoryPressure, MetricSeverity, StatletCore, SystemSnapshot};
 
 #[test]
-fn metrics_sample_becomes_the_compact_accessible_status() {
+fn status_content_preserves_rounded_metrics_and_complete_accessibility() {
     let mut app = StatletCore::new();
 
     app.handle(AppEvent::MetricsSample(SystemSnapshot {
@@ -11,12 +11,12 @@ fn metrics_sample_becomes_the_compact_accessible_status() {
     }));
     let state = app.state();
 
-    assert_eq!(state.status.top.label, "C");
-    assert_eq!(state.status.top.value, " 39%");
-    assert_eq!(state.status.top.severity, MetricSeverity::Good);
-    assert_eq!(state.status.bottom.label, "R");
-    assert_eq!(state.status.bottom.value, " 73%");
-    assert_eq!(state.status.bottom.severity, MetricSeverity::Good);
+    assert_eq!(state.status.cpu.label, "C");
+    assert_eq!(state.status.cpu.percent, 39);
+    assert_eq!(state.status.cpu.severity, MetricSeverity::Good);
+    assert_eq!(state.status.ram.label, "R");
+    assert_eq!(state.status.ram.percent, 73);
+    assert_eq!(state.status.ram.severity, MetricSeverity::Good);
     assert_eq!(
         state.status.accessibility_label,
         "CPU 39%, RAM 73%, pressão de memória normal"
@@ -40,7 +40,7 @@ fn cpu_thresholds_change_only_the_value_severity() {
             memory_pressure: MemoryPressure::Normal,
         }));
         let state = app.state();
-        assert_eq!(state.status.top.severity, expected);
+        assert_eq!(state.status.cpu.severity, expected);
     }
 }
 
@@ -60,22 +60,6 @@ fn ram_color_follows_pressure_instead_of_percentage() {
             memory_pressure,
         }));
         let state = app.state();
-        assert_eq!(state.status.bottom.severity, expected);
-    }
-}
-
-#[test]
-fn percentage_fields_keep_the_same_width() {
-    let mut app = StatletCore::new();
-
-    for percent in [0.0, 9.0, 10.0, 99.0, 100.0] {
-        app.handle(AppEvent::MetricsSample(SystemSnapshot {
-            cpu_percent: percent,
-            ram_percent: percent,
-            memory_pressure: MemoryPressure::Normal,
-        }));
-        let state = app.state();
-        assert_eq!(state.status.top.value.chars().count(), 4);
-        assert_eq!(state.status.bottom.value.chars().count(), 4);
+        assert_eq!(state.status.ram.severity, expected);
     }
 }

@@ -1,8 +1,16 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::disk::DiskObservation;
 use crate::history::HistoryEventKind;
+use crate::indicator_preferences::{
+    AppearanceColors, FontFamilyPreference, FontSize, FontWeight, IndicatorAppearance,
+    IndicatorLabel, IndicatorPreferenceGroup, IndicatorPreferences, LabelColorMode, LabelSpacing,
+    MetricColorMode, MetricColorPreferences, MetricIdentifierMode, MetricIdentifierPreferences,
+    MetricKind, MetricsRefreshInterval, PngIconMetadata, SrgbColor, SystemSymbolName,
+};
 use crate::mole::MoleStatus;
+use crate::system_usage::SystemUsageSection;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryPressure {
@@ -42,16 +50,16 @@ pub enum MetricSeverity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MetricPresentation {
+pub struct MetricContent {
     pub label: &'static str,
-    pub value: String,
+    pub percent: u8,
     pub severity: MetricSeverity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StatusPresentation {
-    pub top: MetricPresentation,
-    pub bottom: MetricPresentation,
+pub struct StatusContent {
+    pub cpu: MetricContent,
+    pub ram: MetricContent,
     pub disk_badge: Option<DiskBadge>,
     pub accessibility_label: String,
 }
@@ -64,19 +72,45 @@ pub enum DiskBadge {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppState {
-    pub status: StatusPresentation,
+    pub status: StatusContent,
     pub preferences: Preferences,
     pub latest_disk_observation: Option<DiskObservation>,
     pub mole_status: MoleStatus,
+    pub can_undo_indicator_reset: bool,
+    pub preferences_save_status: PreferencesSaveStatus,
+    indicator_icon_errors: [Option<String>; 2],
+    indicator_icon_error_owners: [Option<IndicatorIconErrorOwner>; 2],
+    indicator_icon_pending: [bool; 2],
+    pub system_usage_section: SystemUsageSection,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndicatorIconErrorOwner {
+    Independent,
+    PreferencesDurability,
+}
+
+impl AppState {
+    pub fn indicator_icon_error(&self, metric: MetricKind) -> Option<&str> {
+        self.indicator_icon_errors[metric_index(metric)].as_deref()
+    }
+
+    pub const fn indicator_icon_pending(&self, metric: MetricKind) -> bool {
+        self.indicator_icon_pending[metric_index(metric)]
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum AppEvent {
     ApplicationLaunched,
-    ApplicationReopened { has_visible_windows: bool },
+    ApplicationReopened {
+        has_visible_windows: bool,
+    },
     MetricsSample(SystemSnapshot),
     OpenPreferences,
     OpenHistory,
+    OpenSystemUsage,
+    SelectSystemUsageSection(SystemUsageSection),
     Quit,
     SetMoleIntegrationEnabled(bool),
     SetWarningThreshold(WarningThreshold),
@@ -87,6 +121,118 @@ pub enum AppEvent {
     MoleStatusObserved(MoleStatus),
     OpenMoleInTerminal,
     ClearHistoryConfirmed,
+    ChooseMetricPng {
+        metric: MetricKind,
+        source: PathBuf,
+    },
+    CancelMetricPngImport(MetricKind),
+    MetricPngImportFinished {
+        metric: MetricKind,
+        result: MetricPngImportResult,
+    },
+    RemoveMetricPng(MetricKind),
+    MetricPngRemovalFinished {
+        metric: MetricKind,
+        result: MetricPngRemovalResult,
+    },
+    MetricPngPersistenceFailed {
+        metric: MetricKind,
+        previous: MetricIdentifierPreferences,
+        message: String,
+    },
+    MetricPngTransactionCleanupFailed {
+        metric: MetricKind,
+        message: String,
+    },
+    MetricPngDurabilityWarning {
+        metric: MetricKind,
+        message: String,
+    },
+    UpdateIndicator(IndicatorPreferenceChange),
+    ResetIndicatorGroup(IndicatorPreferenceGroup),
+    ResetIndicatorConfirmed,
+    UndoIndicatorReset,
+    PreferencesWindowClosed,
+    RetrySavePreferences,
+    PreferencesSaveFinished(PreferencesSaveResult),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreferencesSaveStatus {
+    Saved,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreferencesSaveResult {
+    Saved,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MetricPngImportResult {
+    Imported(PngIconMetadata),
+    Failed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MetricPngRemovalResult {
+    Removed,
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetricPngAssetMutation {
+    Replace,
+    Remove,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndicatorPreferenceChange {
+    SetMetricIdentifierMode {
+        metric: MetricKind,
+        mode: MetricIdentifierMode,
+    },
+    SetMetricSystemSymbol {
+        metric: MetricKind,
+        symbol: SystemSymbolName,
+    },
+    SetMetricPngMetadata {
+        metric: MetricKind,
+        png: Option<PngIconMetadata>,
+    },
+    SetMetricColorMode {
+        metric: MetricKind,
+        mode: MetricColorMode,
+    },
+    SetMetricSharedColor {
+        metric: MetricKind,
+        color: SrgbColor,
+    },
+    SetMetricVariantsEnabled {
+        metric: MetricKind,
+        enabled: bool,
+    },
+    SetMetricAppearanceColor {
+        metric: MetricKind,
+        appearance: IndicatorAppearance,
+        color: SrgbColor,
+    },
+    SetLabelsVisible(bool),
+    SetCpuLabel(IndicatorLabel),
+    SetRamLabel(IndicatorLabel),
+    SetLabelSpacing(LabelSpacing),
+    SetLabelColorMode(LabelColorMode),
+    SetLabelSharedColor(SrgbColor),
+    SetLabelVariantsEnabled(bool),
+    SetLabelAppearanceColor {
+        appearance: IndicatorAppearance,
+        color: SrgbColor,
+    },
+    SetFontFamily(FontFamilyPreference),
+    SetFontWeight(FontWeight),
+    SetRefreshInterval(MetricsRefreshInterval),
+    SetFontSize(FontSize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,12 +240,17 @@ pub enum WindowKind {
     Preferences,
     History,
     FreeSpace,
+    SystemUsage,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppEffect {
+    RequestIndicatorRedraw,
+    SetMetricsSamplingInterval(MetricsRefreshInterval),
     ShowWindow(WindowKind),
-    SavePreferences(Preferences),
+    QueuePreferencesSave(Preferences),
+    FlushPreferences(Preferences),
+    ReleasePreferencesWindow,
     SetDiskSamplingEnabled(bool),
     DiskPressureAlert(DiskObservation),
     RequestNotificationAuthorization,
@@ -107,13 +258,26 @@ pub enum AppEffect {
     LaunchMoleInTerminal,
     RecordHistory(HistoryEventKind),
     ClearHistory,
+    ImportMetricPng {
+        metric: MetricKind,
+        source: PathBuf,
+    },
+    CancelMetricPngImport(MetricKind),
+    RemoveMetricPngAsset(MetricKind),
+    PersistMetricPngChange {
+        metric: MetricKind,
+        mutation: MetricPngAssetMutation,
+        previous: MetricIdentifierPreferences,
+        preferences: Preferences,
+    },
     Quit,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Preferences {
     pub mole_integration_enabled: bool,
     pub warning_threshold: WarningThreshold,
+    pub indicator: IndicatorPreferences,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +316,7 @@ pub struct StatletCore {
     disk_episode: DiskEpisode,
     last_mole_block: Option<HistoryEventKind>,
     monitoring_failure_active: bool,
+    indicator_reset_undo: Option<IndicatorPreferences>,
 }
 
 impl StatletCore {
@@ -172,11 +337,18 @@ impl StatletCore {
                 preferences,
                 latest_disk_observation: None,
                 mole_status: MoleStatus::Unknown,
+                can_undo_indicator_reset: false,
+                preferences_save_status: PreferencesSaveStatus::Saved,
+                indicator_icon_errors: [None, None],
+                indicator_icon_error_owners: [None, None],
+                indicator_icon_pending: [false; 2],
+                system_usage_section: SystemUsageSection::Ram,
             },
             system_snapshot,
             disk_episode: DiskEpisode::default(),
             last_mole_block: None,
             monitoring_failure_active: false,
+            indicator_reset_undo: None,
         };
         let mut effects = vec![AppEffect::SetDiskSamplingEnabled(disk_sampling_enabled)];
         if disk_sampling_enabled {
@@ -209,34 +381,51 @@ impl StatletCore {
                 vec![AppEffect::ShowWindow(WindowKind::Preferences)]
             }
             AppEvent::OpenHistory => vec![AppEffect::ShowWindow(WindowKind::History)],
+            AppEvent::OpenSystemUsage => {
+                vec![AppEffect::ShowWindow(WindowKind::SystemUsage)]
+            }
+            AppEvent::SelectSystemUsageSection(section) => {
+                self.state.system_usage_section = section;
+                Vec::new()
+            }
             AppEvent::ReviewSpace | AppEvent::NotificationActivated => {
-                let mut effects = Vec::with_capacity(2);
+                let mut effects = Vec::with_capacity(3);
                 if self.state.preferences.mole_integration_enabled {
                     self.state.mole_status = MoleStatus::Unknown;
-                    self.refresh_status();
+                    if self.refresh_status() {
+                        effects.push(AppEffect::RequestIndicatorRedraw);
+                    }
                     effects.push(AppEffect::CheckMoleCompatibility);
                 }
                 effects.push(AppEffect::ShowWindow(WindowKind::FreeSpace));
                 effects
             }
-            AppEvent::Quit => vec![AppEffect::Quit],
+            AppEvent::Quit => vec![
+                AppEffect::FlushPreferences(self.state.preferences.clone()),
+                AppEffect::Quit,
+            ],
             AppEvent::SetMoleIntegrationEnabled(enabled) => {
                 if self.state.preferences.mole_integration_enabled == enabled {
                     return Vec::new();
                 }
                 self.state.preferences.mole_integration_enabled = enabled;
-                if !enabled {
+                let disk_badge_changed = if !enabled {
                     self.disk_episode = DiskEpisode::default();
                     self.state.latest_disk_observation = None;
                     self.state.mole_status = MoleStatus::Unknown;
                     self.last_mole_block = None;
                     self.monitoring_failure_active = false;
-                    self.refresh_status();
-                }
+                    self.refresh_status()
+                } else {
+                    false
+                };
                 let mut effects = vec![
-                    AppEffect::SavePreferences(self.state.preferences),
+                    AppEffect::QueuePreferencesSave(self.state.preferences.clone()),
                     AppEffect::SetDiskSamplingEnabled(enabled),
                 ];
+                if disk_badge_changed {
+                    effects.insert(0, AppEffect::RequestIndicatorRedraw);
+                }
                 if enabled {
                     effects.push(AppEffect::RequestNotificationAuthorization);
                     effects.push(AppEffect::CheckMoleCompatibility);
@@ -248,7 +437,9 @@ impl StatletCore {
                     return Vec::new();
                 }
                 self.state.preferences.warning_threshold = threshold;
-                vec![AppEffect::SavePreferences(self.state.preferences)]
+                vec![AppEffect::QueuePreferencesSave(
+                    self.state.preferences.clone(),
+                )]
             }
             AppEvent::DiskObserved(observation) => {
                 if !self.state.preferences.mole_integration_enabled {
@@ -259,8 +450,8 @@ impl StatletCore {
                 let transition = self
                     .disk_episode
                     .observe(observation, self.state.preferences.warning_threshold);
-                self.refresh_status();
-                match transition {
+                let status_changed = self.refresh_status();
+                let mut effects = match transition {
                     DiskEpisodeTransition::Started => vec![
                         AppEffect::RecordHistory(HistoryEventKind::DiskPressureStarted),
                         AppEffect::DiskPressureAlert(observation),
@@ -269,7 +460,11 @@ impl StatletCore {
                         HistoryEventKind::DiskPressureRecovered,
                     )],
                     DiskEpisodeTransition::None => Vec::new(),
+                };
+                if status_changed {
+                    effects.insert(0, AppEffect::RequestIndicatorRedraw);
                 }
+                effects
             }
             AppEvent::DiskMonitoringFailed => {
                 if !self.state.preferences.mole_integration_enabled
@@ -285,7 +480,7 @@ impl StatletCore {
                     return Vec::new();
                 }
                 self.state.mole_status = status;
-                self.refresh_status();
+                let disk_badge_changed = self.refresh_status();
                 let block = match status {
                     MoleStatus::Missing => Some(HistoryEventKind::MoleMissing),
                     MoleStatus::Unavailable => Some(HistoryEventKind::MoleUnavailable),
@@ -296,13 +491,17 @@ impl StatletCore {
                     }
                     MoleStatus::Unknown => None,
                 };
-                match block {
+                let mut effects = match block {
                     Some(block) if Some(block) != self.last_mole_block => {
                         self.last_mole_block = Some(block);
                         vec![AppEffect::RecordHistory(block)]
                     }
                     _ => Vec::new(),
+                };
+                if disk_badge_changed {
+                    effects.insert(0, AppEffect::RequestIndicatorRedraw);
                 }
+                effects
             }
             AppEvent::OpenMoleInTerminal => {
                 if self.state.preferences.mole_integration_enabled
@@ -314,10 +513,287 @@ impl StatletCore {
                 }
             }
             AppEvent::ClearHistoryConfirmed => vec![AppEffect::ClearHistory],
+            AppEvent::ChooseMetricPng { metric, source } => {
+                self.clear_indicator_icon_error(metric);
+                let mut effects = self.cancel_pending_png_imports([metric]);
+                self.state.indicator_icon_pending[metric_index(metric)] = true;
+                effects.push(AppEffect::ImportMetricPng { metric, source });
+                effects
+            }
+            AppEvent::CancelMetricPngImport(metric) => self.cancel_pending_png_imports([metric]),
+            AppEvent::MetricPngImportFinished { metric, result } => match result {
+                MetricPngImportResult::Imported(metadata) => {
+                    self.state.indicator_icon_pending[metric_index(metric)] = false;
+                    let previous_interval = self.state.preferences.indicator.refresh_interval;
+                    let previous =
+                        metric_identifier(&mut self.state.preferences.indicator, metric).clone();
+                    let identifier =
+                        metric_identifier(&mut self.state.preferences.indicator, metric);
+                    identifier.mode = MetricIdentifierMode::Png;
+                    identifier.png = Some(metadata);
+                    self.clear_indicator_icon_error(metric);
+                    let mut effects = Vec::with_capacity(3);
+                    let current_interval = self.state.preferences.indicator.refresh_interval;
+                    if current_interval != previous_interval {
+                        effects.push(AppEffect::SetMetricsSamplingInterval(current_interval));
+                    }
+                    effects.push(AppEffect::RequestIndicatorRedraw);
+                    effects.push(AppEffect::PersistMetricPngChange {
+                        metric,
+                        mutation: MetricPngAssetMutation::Replace,
+                        previous,
+                        preferences: self.state.preferences.clone(),
+                    });
+                    effects
+                }
+                MetricPngImportResult::Failed(message) => {
+                    self.state.indicator_icon_pending[metric_index(metric)] = false;
+                    self.set_indicator_icon_error(
+                        metric,
+                        message,
+                        IndicatorIconErrorOwner::Independent,
+                    );
+                    Vec::new()
+                }
+            },
+            AppEvent::RemoveMetricPng(metric) => {
+                if metric_identifier(&mut self.state.preferences.indicator, metric)
+                    .png
+                    .is_none()
+                {
+                    Vec::new()
+                } else {
+                    self.clear_indicator_icon_error(metric);
+                    vec![AppEffect::RemoveMetricPngAsset(metric)]
+                }
+            }
+            AppEvent::MetricPngRemovalFinished { metric, result } => match result {
+                MetricPngRemovalResult::Removed => {
+                    let previous_interval = self.state.preferences.indicator.refresh_interval;
+                    let previous =
+                        metric_identifier(&mut self.state.preferences.indicator, metric).clone();
+                    let identifier =
+                        metric_identifier(&mut self.state.preferences.indicator, metric);
+                    let changed =
+                        identifier.mode != MetricIdentifierMode::Text || identifier.png.is_some();
+                    identifier.mode = MetricIdentifierMode::Text;
+                    identifier.png = None;
+                    self.clear_indicator_icon_error(metric);
+                    if changed {
+                        let mut effects = Vec::with_capacity(3);
+                        let current_interval = self.state.preferences.indicator.refresh_interval;
+                        if current_interval != previous_interval {
+                            effects.push(AppEffect::SetMetricsSamplingInterval(current_interval));
+                        }
+                        effects.push(AppEffect::RequestIndicatorRedraw);
+                        effects.push(AppEffect::PersistMetricPngChange {
+                            metric,
+                            mutation: MetricPngAssetMutation::Remove,
+                            previous,
+                            preferences: self.state.preferences.clone(),
+                        });
+                        effects
+                    } else {
+                        Vec::new()
+                    }
+                }
+                MetricPngRemovalResult::Failed(message) => {
+                    self.set_indicator_icon_error(
+                        metric,
+                        message,
+                        IndicatorIconErrorOwner::Independent,
+                    );
+                    Vec::new()
+                }
+            },
+            AppEvent::MetricPngPersistenceFailed {
+                metric,
+                previous,
+                message,
+            } => {
+                self.state.indicator_icon_pending[metric_index(metric)] = false;
+                *metric_identifier(&mut self.state.preferences.indicator, metric) = previous;
+                self.state.preferences_save_status = PreferencesSaveStatus::Failed;
+                self.set_indicator_icon_error(
+                    metric,
+                    message,
+                    IndicatorIconErrorOwner::Independent,
+                );
+                vec![AppEffect::RequestIndicatorRedraw]
+            }
+            AppEvent::MetricPngTransactionCleanupFailed { metric, message } => {
+                self.set_indicator_icon_error(
+                    metric,
+                    message,
+                    IndicatorIconErrorOwner::Independent,
+                );
+                Vec::new()
+            }
+            AppEvent::MetricPngDurabilityWarning { metric, message } => {
+                self.set_indicator_icon_error(
+                    metric,
+                    message,
+                    IndicatorIconErrorOwner::PreferencesDurability,
+                );
+                Vec::new()
+            }
+            AppEvent::UpdateIndicator(change) => {
+                let previous_interval = self.state.preferences.indicator.refresh_interval;
+                let explicit_identifier_mode_metric = match &change {
+                    IndicatorPreferenceChange::SetMetricIdentifierMode { metric, .. } => {
+                        Some(*metric)
+                    }
+                    _ => None,
+                };
+                let identifier_metric = match &change {
+                    IndicatorPreferenceChange::SetMetricIdentifierMode { metric, .. }
+                    | IndicatorPreferenceChange::SetMetricSystemSymbol { metric, .. }
+                    | IndicatorPreferenceChange::SetMetricPngMetadata { metric, .. } => {
+                        Some(*metric)
+                    }
+                    _ => None,
+                };
+                if !change.apply(&mut self.state.preferences.indicator) {
+                    return explicit_identifier_mode_metric
+                        .map(|metric| self.cancel_pending_png_imports([metric]))
+                        .unwrap_or_default();
+                }
+                if let Some(metric) = identifier_metric {
+                    self.clear_indicator_icon_error(metric);
+                }
+                let mut effects = self.indicator_effects(previous_interval);
+                if let Some(metric) = identifier_metric
+                    .filter(|metric| self.state.indicator_icon_pending[metric_index(*metric)])
+                {
+                    self.state.indicator_icon_pending[metric_index(metric)] = false;
+                    effects.insert(0, AppEffect::CancelMetricPngImport(metric));
+                }
+                effects
+            }
+            AppEvent::ResetIndicatorGroup(group) => {
+                let previous = self.state.preferences.indicator.clone();
+                self.state.preferences.indicator.reset(group);
+                let mut effects = if group == IndicatorPreferenceGroup::CpuAndRam {
+                    self.cancel_pending_png_imports([MetricKind::Cpu, MetricKind::Ram])
+                } else {
+                    Vec::new()
+                };
+                if self.state.preferences.indicator == previous {
+                    return effects;
+                }
+                effects.extend(self.indicator_effects(previous.refresh_interval));
+                effects
+            }
+            AppEvent::ResetIndicatorConfirmed => {
+                let previous = self.state.preferences.indicator.clone();
+                self.indicator_reset_undo = Some(previous.clone());
+                self.state.can_undo_indicator_reset = true;
+                self.state.preferences.indicator = IndicatorPreferences::default();
+                let mut effects =
+                    self.cancel_pending_png_imports([MetricKind::Cpu, MetricKind::Ram]);
+                if self.state.preferences.indicator == previous {
+                    return effects;
+                }
+                effects.extend(self.indicator_effects(previous.refresh_interval));
+                effects
+            }
+            AppEvent::UndoIndicatorReset => {
+                let Some(previous) = self.indicator_reset_undo.take() else {
+                    return Vec::new();
+                };
+                self.state.can_undo_indicator_reset = false;
+                let current_interval = self.state.preferences.indicator.refresh_interval;
+                if self.state.preferences.indicator == previous {
+                    return Vec::new();
+                }
+                self.state.preferences.indicator = previous;
+                self.indicator_effects(current_interval)
+            }
+            AppEvent::PreferencesWindowClosed => {
+                self.indicator_reset_undo = None;
+                self.state.can_undo_indicator_reset = false;
+                vec![
+                    AppEffect::FlushPreferences(self.state.preferences.clone()),
+                    AppEffect::ReleasePreferencesWindow,
+                ]
+            }
+            AppEvent::RetrySavePreferences => {
+                vec![AppEffect::FlushPreferences(self.state.preferences.clone())]
+            }
+            AppEvent::PreferencesSaveFinished(result) => {
+                self.state.preferences_save_status = match result {
+                    PreferencesSaveResult::Saved => {
+                        self.clear_resolved_durability_warnings();
+                        PreferencesSaveStatus::Saved
+                    }
+                    PreferencesSaveResult::Failed => PreferencesSaveStatus::Failed,
+                };
+                Vec::new()
+            }
         }
     }
 
-    fn refresh_status(&mut self) {
+    fn clear_indicator_icon_error(&mut self, metric: MetricKind) {
+        let index = metric_index(metric);
+        self.state.indicator_icon_errors[index] = None;
+        self.state.indicator_icon_error_owners[index] = None;
+    }
+
+    fn set_indicator_icon_error(
+        &mut self,
+        metric: MetricKind,
+        message: String,
+        owner: IndicatorIconErrorOwner,
+    ) {
+        let index = metric_index(metric);
+        self.state.indicator_icon_errors[index] = Some(message);
+        self.state.indicator_icon_error_owners[index] = Some(owner);
+    }
+
+    fn clear_resolved_durability_warnings(&mut self) {
+        for index in 0..self.state.indicator_icon_errors.len() {
+            if self.state.indicator_icon_error_owners[index]
+                == Some(IndicatorIconErrorOwner::PreferencesDurability)
+            {
+                self.state.indicator_icon_errors[index] = None;
+                self.state.indicator_icon_error_owners[index] = None;
+            }
+        }
+    }
+
+    fn cancel_pending_png_imports(
+        &mut self,
+        metrics: impl IntoIterator<Item = MetricKind>,
+    ) -> Vec<AppEffect> {
+        metrics
+            .into_iter()
+            .filter_map(|metric| {
+                let pending = &mut self.state.indicator_icon_pending[metric_index(metric)];
+                if *pending {
+                    *pending = false;
+                    Some(AppEffect::CancelMetricPngImport(metric))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn indicator_effects(&self, previous_interval: MetricsRefreshInterval) -> Vec<AppEffect> {
+        let mut effects = Vec::with_capacity(3);
+        let current_interval = self.state.preferences.indicator.refresh_interval;
+        if current_interval != previous_interval {
+            effects.push(AppEffect::SetMetricsSamplingInterval(current_interval));
+        }
+        effects.push(AppEffect::RequestIndicatorRedraw);
+        effects.push(AppEffect::QueuePreferencesSave(
+            self.state.preferences.clone(),
+        ));
+        effects
+    }
+
+    fn refresh_status(&mut self) -> bool {
+        let previous_status = self.state.status.clone();
         let disk_badge = if self.state.preferences.mole_integration_enabled
             && self.state.mole_status.is_error()
         {
@@ -326,7 +802,138 @@ impl StatletCore {
             self.disk_episode.is_active().then_some(DiskBadge::Warning)
         };
         self.state.status = present(self.system_snapshot, disk_badge);
+        self.state.status != previous_status
     }
+}
+
+impl IndicatorPreferenceChange {
+    fn apply(self, indicator: &mut IndicatorPreferences) -> bool {
+        match self {
+            Self::SetMetricIdentifierMode { metric, mode } => {
+                replace_if_changed(&mut metric_identifier(indicator, metric).mode, mode)
+            }
+            Self::SetMetricSystemSymbol { metric, symbol } => replace_if_changed(
+                &mut metric_identifier(indicator, metric).system_symbol,
+                symbol,
+            ),
+            Self::SetMetricPngMetadata { metric, png } => {
+                replace_if_changed(&mut metric_identifier(indicator, metric).png, png)
+            }
+            Self::SetMetricColorMode { metric, mode } => {
+                replace_if_changed(&mut metric_colors(indicator, metric).mode, mode)
+            }
+            Self::SetMetricSharedColor { metric, color } => {
+                replace_if_changed(&mut metric_colors(indicator, metric).fixed.shared, color)
+            }
+            Self::SetMetricVariantsEnabled { metric, enabled } => {
+                let fixed = &mut metric_colors(indicator, metric).fixed;
+                let before = *fixed;
+                fixed.set_variants_enabled(enabled);
+                *fixed != before
+            }
+            Self::SetMetricAppearanceColor {
+                metric,
+                appearance,
+                color,
+            } => {
+                let fixed = &mut metric_colors(indicator, metric).fixed;
+                set_appearance_color(fixed.shared, &mut fixed.variants, appearance, color)
+            }
+            Self::SetLabelsVisible(visible) => {
+                replace_if_changed(&mut indicator.labels.visible, visible)
+            }
+            Self::SetCpuLabel(label) => replace_if_changed(&mut indicator.labels.cpu, label),
+            Self::SetRamLabel(label) => replace_if_changed(&mut indicator.labels.ram, label),
+            Self::SetLabelSpacing(spacing) => {
+                replace_if_changed(&mut indicator.labels.spacing, spacing)
+            }
+            Self::SetLabelColorMode(mode) => {
+                replace_if_changed(&mut indicator.labels.color_mode, mode)
+            }
+            Self::SetLabelSharedColor(color) => {
+                replace_if_changed(&mut indicator.labels.fixed.shared, color)
+            }
+            Self::SetLabelVariantsEnabled(enabled) => {
+                let fixed = &mut indicator.labels.fixed;
+                let before = *fixed;
+                fixed.set_variants_enabled(enabled);
+                *fixed != before
+            }
+            Self::SetLabelAppearanceColor { appearance, color } => {
+                let fixed = &mut indicator.labels.fixed;
+                set_appearance_color(fixed.shared, &mut fixed.variants, appearance, color)
+            }
+            Self::SetFontFamily(family) => {
+                replace_if_changed(&mut indicator.typography.family, family)
+            }
+            Self::SetFontWeight(weight) => {
+                replace_if_changed(&mut indicator.typography.weight, weight)
+            }
+            Self::SetRefreshInterval(interval) => {
+                replace_if_changed(&mut indicator.refresh_interval, interval)
+            }
+            Self::SetFontSize(size) => replace_if_changed(&mut indicator.typography.size, size),
+        }
+    }
+}
+
+fn metric_identifier(
+    indicator: &mut IndicatorPreferences,
+    metric: MetricKind,
+) -> &mut MetricIdentifierPreferences {
+    match metric {
+        MetricKind::Cpu => &mut indicator.identifiers.cpu,
+        MetricKind::Ram => &mut indicator.identifiers.ram,
+    }
+}
+
+const fn metric_index(metric: MetricKind) -> usize {
+    match metric {
+        MetricKind::Cpu => 0,
+        MetricKind::Ram => 1,
+    }
+}
+
+fn metric_colors(
+    indicator: &mut IndicatorPreferences,
+    metric: MetricKind,
+) -> &mut MetricColorPreferences {
+    match metric {
+        MetricKind::Cpu => &mut indicator.cpu_color,
+        MetricKind::Ram => &mut indicator.ram_color,
+    }
+}
+
+fn replace_if_changed<T: PartialEq>(target: &mut T, value: T) -> bool {
+    if *target == value {
+        return false;
+    }
+    *target = value;
+    true
+}
+
+fn set_appearance_color(
+    shared: SrgbColor,
+    variants: &mut Option<AppearanceColors>,
+    appearance: IndicatorAppearance,
+    color: SrgbColor,
+) -> bool {
+    if variants.is_none() && color == shared {
+        return false;
+    }
+    let variants = variants.get_or_insert(AppearanceColors {
+        light: shared,
+        dark: shared,
+    });
+    let target = match appearance {
+        IndicatorAppearance::Light => &mut variants.light,
+        IndicatorAppearance::Dark => &mut variants.dark,
+    };
+    if *target == color {
+        return false;
+    }
+    *target = color;
+    true
 }
 
 impl Default for StatletCore {
@@ -416,7 +1023,7 @@ impl DiskEpisode {
     }
 }
 
-fn present(snapshot: SystemSnapshot, disk_badge: Option<DiskBadge>) -> StatusPresentation {
+fn present(snapshot: SystemSnapshot, disk_badge: Option<DiskBadge>) -> StatusContent {
     let cpu = rounded_percent(snapshot.cpu_percent);
     let ram = rounded_percent(snapshot.ram_percent);
     let (memory_severity, pressure_description) =
@@ -426,15 +1033,15 @@ fn present(snapshot: SystemSnapshot, disk_badge: Option<DiskBadge>) -> StatusPre
         Some(DiskBadge::Error) => ", Mole indisponível",
         None => "",
     };
-    StatusPresentation {
-        top: MetricPresentation {
+    StatusContent {
+        cpu: MetricContent {
             label: "C",
-            value: format!("{cpu:>3}%"),
+            percent: cpu,
             severity: cpu_severity(snapshot.cpu_percent),
         },
-        bottom: MetricPresentation {
+        ram: MetricContent {
             label: "R",
-            value: format!("{ram:>3}%"),
+            percent: ram,
             severity: memory_severity,
         },
         disk_badge,
