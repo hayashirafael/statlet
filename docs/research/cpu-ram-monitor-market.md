@@ -1,7 +1,7 @@
 # Pesquisa de produto: CPU e RAM no Statlet
 
-Data da pesquisa: 13 de agosto de 2026  
-Escopo: apps macOS de menu bar, monitores nativos de desktop e monitores de terminal que exibem CPU/RAM.  
+Data da pesquisa: 13 de agosto de 2026
+Escopo: apps macOS de menu bar, monitores nativos de desktop e monitores de terminal que exibem CPU/RAM.
 Método: documentação, código-fonte e canais oficiais. As comparações transversais e propostas são explicitamente tratadas como inferências/recomendações; fatos de produto são acompanhados por fontes. Não houve teste hands-on dos apps proprietários nem benchmark dos concorrentes.
 
 ## Conclusão executiva
