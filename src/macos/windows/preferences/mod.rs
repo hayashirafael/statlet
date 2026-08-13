@@ -99,6 +99,18 @@ fn select_visible_area(
     select_area(area);
 }
 
+fn deactivate_inactive_color_wells<T>(
+    color_wells: &[T],
+    mut is_inactive: impl FnMut(&T) -> bool,
+    mut deactivate: impl FnMut(&T),
+) {
+    for color_well in color_wells {
+        if is_inactive(color_well) {
+            deactivate(color_well);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreferencesRegion {
     IndicatorGroups,
@@ -434,11 +446,6 @@ impl PreferencesControlTarget {
         let state = self.ivars().state.borrow().select(area);
         self.ivars().state.replace(state);
         let visible = state.visible();
-        if visible != PreferencesArea::Colors {
-            for well in &self.ivars().color_wells {
-                well.deactivate();
-            }
-        }
         self.ivars().indicator_area_views.set_visible_area(visible);
         self.ivars()
             .indicator
@@ -446,6 +453,11 @@ impl PreferencesControlTarget {
         self.ivars()
             .disk_and_mole
             .setHidden(visible != PreferencesArea::DiskAndMole);
+        deactivate_inactive_color_wells(
+            &self.ivars().color_wells,
+            |well| well.isHiddenOrHasHiddenAncestor(),
+            |well| well.deactivate(),
+        );
         if let Some(sidebar) = self.ivars().sidebar.borrow().as_deref() {
             unsafe {
                 if let Some(index) = visible.indicator_index() {
@@ -1194,11 +1206,26 @@ mod tests {
 
     use super::super::common::should_intercept_indicator_undo;
     use super::{
-        disk_threshold_slider_contract, font_size_slider_contract, get_or_create_window,
-        label_spacing_slider_contract, select_visible_area, warning_threshold_from_slider_value,
-        PreferencesArea, PreferencesAreaState, PreferencesFooterPresentation, PreferencesRegion,
-        PreferencesShellContract, RegionPlacement,
+        deactivate_inactive_color_wells, disk_threshold_slider_contract, font_size_slider_contract,
+        get_or_create_window, label_spacing_slider_contract, select_visible_area,
+        warning_threshold_from_slider_value, PreferencesArea, PreferencesAreaState,
+        PreferencesFooterPresentation, PreferencesRegion, PreferencesShellContract,
+        RegionPlacement,
     };
+
+    #[test]
+    fn selecting_labels_deactivates_hidden_color_wells_without_disconnecting_visible_label_wells() {
+        let hidden_or_has_hidden_ancestor = [true, true, false];
+        let mut deactivated = Vec::new();
+
+        deactivate_inactive_color_wells(
+            &hidden_or_has_hidden_ancestor,
+            |hidden| *hidden,
+            |hidden| deactivated.push(*hidden),
+        );
+
+        assert_eq!(deactivated, [true, true]);
+    }
 
     #[test]
     fn discrete_slider_contracts_match_the_approved_domain_ranges() {
