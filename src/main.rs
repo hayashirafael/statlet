@@ -921,18 +921,20 @@ fn persist_metric_png_change<T: MetricPngTransaction>(
             let mut effects = core.handle(AppEvent::PreferencesSaveFinished(
                 PreferencesSaveResult::Failed,
             ));
-            let mut warnings = vec![format!(
-                "As preferências e o PNG foram aplicados, mas a confirmação de durabilidade falhou: {error}"
-            )];
-            if let Some(cleanup_error) = cleanup_error {
-                warnings.push(format!(
-                    "a limpeza segura da transação também falhou: {cleanup_error}"
-                ));
-            }
-            effects.extend(core.handle(AppEvent::MetricPngTransactionCleanupFailed {
+            effects.extend(core.handle(AppEvent::MetricPngDurabilityWarning {
                 metric,
-                message: warnings.join("; "),
+                message: format!(
+                    "As preferências e o PNG foram aplicados, mas a confirmação de durabilidade falhou: {error}"
+                ),
             }));
+            if let Some(cleanup_error) = cleanup_error {
+                effects.extend(core.handle(AppEvent::MetricPngTransactionCleanupFailed {
+                    metric,
+                    message: format!(
+                        "O PNG foi aplicado, mas a limpeza segura da transação falhou: {cleanup_error}"
+                    ),
+                }));
+            }
             effects
         }
         Err(error) => {
@@ -1116,6 +1118,7 @@ impl RuntimeSamplers {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::io::Cursor;
     use std::sync::mpsc;
@@ -1263,6 +1266,11 @@ mod tests {
         inner: PreferencesStore,
     }
 
+    struct PostRenameOnceStore {
+        inner: PreferencesStore,
+        fail_after_next_save: Cell<bool>,
+    }
+
     impl super::PreferencesPersistence for PostRenameFaultStore {
         fn save(&self, preferences: Preferences) -> Result<(), super::PreferencesPersistenceError> {
             self.inner
@@ -1272,6 +1280,22 @@ mod tests {
                 commit_state: PreferencesCommitState::Committed,
                 message: "fault injected after preferences rename".into(),
             })
+        }
+    }
+
+    impl super::PreferencesPersistence for PostRenameOnceStore {
+        fn save(&self, preferences: Preferences) -> Result<(), super::PreferencesPersistenceError> {
+            self.inner
+                .save(preferences)
+                .map_err(super::PreferencesPersistenceError::from)?;
+            if self.fail_after_next_save.replace(false) {
+                Err(super::PreferencesPersistenceError {
+                    commit_state: PreferencesCommitState::Committed,
+                    message: "fault injected after preferences rename".into(),
+                })
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1356,6 +1380,101 @@ mod tests {
             .unwrap()
             .contains("fault injected after preferences rename"));
         assert_eq!(schedule.pending_save(), Some(&preferences));
+    }
+
+    #[test]
+    fn successful_retry_clears_only_the_resolved_png_durability_warning() {
+        let directory = tempdir().unwrap();
+        let store = PostRenameOnceStore {
+            inner: PreferencesStore::new(directory.path().join("preferences.json")),
+            fail_after_next_save: Cell::new(true),
+        };
+        let mut core = StatletCore::new();
+        let previous = core.state().preferences.indicator.identifiers.cpu.clone();
+        let metadata =
+            statlet::indicator_preferences::PngIconMetadata::new("custom-cpu.png", 24, 12, 812)
+                .unwrap();
+        let preferences = core
+            .handle(AppEvent::MetricPngImportFinished {
+                metric: MetricKind::Cpu,
+                result: statlet::core::MetricPngImportResult::Imported(metadata),
+            })
+            .into_iter()
+            .find_map(|effect| match effect {
+                AppEffect::PersistMetricPngChange { preferences, .. } => Some(preferences),
+                _ => None,
+            })
+            .unwrap();
+        let mut schedule = statlet::runtime_schedule::RuntimeSchedule::new();
+
+        super::persist_metric_png_change(
+            &store,
+            &mut schedule,
+            Duration::ZERO,
+            &mut core,
+            MetricKind::Cpu,
+            previous,
+            preferences.clone(),
+            FaultInjectedTransaction {
+                commit_error: None,
+                rollback_error: None,
+            },
+        );
+        assert!(core
+            .state()
+            .indicator_icon_error(MetricKind::Cpu)
+            .unwrap()
+            .contains("confirmação de durabilidade"));
+
+        assert_eq!(
+            core.handle(AppEvent::RetrySavePreferences),
+            vec![AppEffect::FlushPreferences(preferences.clone())]
+        );
+        let succeeded = save_preferences(&store, preferences.clone(), &mut core);
+        schedule.finish_save(&preferences, succeeded);
+
+        assert!(succeeded);
+        assert_eq!(
+            core.state().preferences_save_status,
+            PreferencesSaveStatus::Saved
+        );
+        assert_eq!(schedule.pending_save(), None);
+        assert_eq!(core.state().indicator_icon_error(MetricKind::Cpu), None);
+    }
+
+    #[test]
+    fn successful_retry_preserves_an_independent_png_cleanup_error() {
+        let directory = tempdir().unwrap();
+        let store = PostRenameOnceStore {
+            inner: PreferencesStore::new(directory.path().join("preferences.json")),
+            fail_after_next_save: Cell::new(true),
+        };
+        let mut core = StatletCore::new();
+        let previous = core.state().preferences.indicator.identifiers.ram.clone();
+        let preferences = core.state().preferences.clone();
+        let mut schedule = statlet::runtime_schedule::RuntimeSchedule::new();
+
+        super::persist_metric_png_change(
+            &store,
+            &mut schedule,
+            Duration::ZERO,
+            &mut core,
+            MetricKind::Ram,
+            previous,
+            preferences.clone(),
+            FaultInjectedTransaction {
+                commit_error: Some("fault injected during backup cleanup".into()),
+                rollback_error: None,
+            },
+        );
+        let succeeded = save_preferences(&store, preferences.clone(), &mut core);
+        schedule.finish_save(&preferences, succeeded);
+
+        let error = core.state().indicator_icon_error(MetricKind::Ram).unwrap();
+        assert!(succeeded);
+        assert_eq!(schedule.pending_save(), None);
+        assert!(error.contains("fault injected during backup cleanup"));
+        assert!(!error.contains("confirmação de durabilidade"));
     }
 
     impl super::MetricPngTransaction for FaultInjectedTransaction {

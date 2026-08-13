@@ -136,3 +136,31 @@ Os dois P2 identificados sobre o checkpoint `7443bf6` foram reproduzidos e corri
 - Não houve alteração de layout, assets ou artefatos do QA visual. A avaliação visual vigente de 9,3/10 continua aplicável ao mesmo layout.
 - `.superpowers/sdd/2026-08-13-icon-option/visual-qa.md` e `.superpowers/sdd/2026-08-13-icon-option/visual-qa/` permaneceram não rastreados e intocados.
 - Nenhum app foi aberto ou ativado; produção, dados reais, push e PR ficaram fora do escopo.
+
+## Retry final de durabilidade — Task `task_b46986708be9`
+
+O alerta criado por uma falha pós-rename agora tem ownership explícito no reducer. Erros de ícone independentes continuam usando o mesmo seam público `indicator_icon_error()`, mas são marcados internamente como `Independent`; o alerta temporário do save é marcado como `PreferencesDurability`. Quando `PreferencesSaveFinished(Saved)` confirma o retry do documento completo, o reducer limpa somente erros cujo owner ainda é o aviso de durabilidade. Uma falha posterior de cleanup substitui o alerta por um erro independente e permanece visível após o retry.
+
+### Ciclo RED → GREEN
+
+- RED: `successful_retry_clears_only_the_resolved_png_durability_warning` terminou com o alerta ainda presente depois de `PreferencesSaveStatus::Saved` e `pending_save` vazio.
+- RED: `successful_retry_preserves_an_independent_png_cleanup_error` manteve a mensagem combinada obsoleta de durabilidade depois do retry, em vez de preservar somente o erro independente de cleanup.
+- GREEN: o evento focal `MetricPngDurabilityWarning` registra a origem transitória, `PreferencesSaveFinished(Saved)` remove somente esse owner, e `MetricPngTransactionCleanupFailed` continua independente. Os dois testes passaram no mesmo fluxo `MetricPngImportFinished → persist_metric_png_change → RetrySavePreferences → save_preferences`.
+
+### Evidências frescas
+
+- `rtk cargo test --bin statlet successful_retry -- --nocapture` — 2 testes focais aprovados após RED de 0/2.
+- `rtk cargo test --bin statlet` — 74 testes aprovados.
+- `rtk cargo test --test indicator_png_flow --test preferences_flow --test preferences_store` — 28 testes aprovados em 3 suítes.
+- `rtk cargo test` — 263 testes aprovados em 27 suítes.
+- `rtk cargo clippy --all-targets -- -D warnings` — sem achados.
+- `rtk cargo fmt --check` — aprovado.
+- `rtk git diff --check` — aprovado.
+- `rtk bash -n scripts/*.sh tests/package_contract.sh` — aprovado.
+- `rtk bash tests/package_contract.sh` — contrato completo do bundle aprovado para arm64/macOS 14+, assinatura ad hoc hardened runtime, privacy manifest, notices, ZIP e checksum.
+
+### Limites e preservação
+
+- Não houve mudança visual; a avaliação vigente de 9,3/10 permanece aplicável.
+- Os artefatos não rastreados `visual-qa.md` e `visual-qa/` foram preservados e não entrarão no commit.
+- Nenhum app foi aberto ou ativado; não houve push, PR nem alteração de produção ou dados reais.

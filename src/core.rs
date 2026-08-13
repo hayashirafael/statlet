@@ -78,7 +78,14 @@ pub struct AppState {
     pub can_undo_indicator_reset: bool,
     pub preferences_save_status: PreferencesSaveStatus,
     indicator_icon_errors: [Option<String>; 2],
+    indicator_icon_error_owners: [Option<IndicatorIconErrorOwner>; 2],
     indicator_icon_pending: [bool; 2],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndicatorIconErrorOwner {
+    Independent,
+    PreferencesDurability,
 }
 
 impl AppState {
@@ -130,6 +137,10 @@ pub enum AppEvent {
         message: String,
     },
     MetricPngTransactionCleanupFailed {
+        metric: MetricKind,
+        message: String,
+    },
+    MetricPngDurabilityWarning {
         metric: MetricKind,
         message: String,
     },
@@ -324,6 +335,7 @@ impl StatletCore {
                 can_undo_indicator_reset: false,
                 preferences_save_status: PreferencesSaveStatus::Saved,
                 indicator_icon_errors: [None, None],
+                indicator_icon_error_owners: [None, None],
                 indicator_icon_pending: [false; 2],
             },
             system_snapshot,
@@ -489,7 +501,7 @@ impl StatletCore {
             }
             AppEvent::ClearHistoryConfirmed => vec![AppEffect::ClearHistory],
             AppEvent::ChooseMetricPng { metric, source } => {
-                self.state.indicator_icon_errors[metric_index(metric)] = None;
+                self.clear_indicator_icon_error(metric);
                 let mut effects = self.cancel_pending_png_imports([metric]);
                 self.state.indicator_icon_pending[metric_index(metric)] = true;
                 effects.push(AppEffect::ImportMetricPng { metric, source });
@@ -506,7 +518,7 @@ impl StatletCore {
                         metric_identifier(&mut self.state.preferences.indicator, metric);
                     identifier.mode = MetricIdentifierMode::Png;
                     identifier.png = Some(metadata);
-                    self.state.indicator_icon_errors[metric_index(metric)] = None;
+                    self.clear_indicator_icon_error(metric);
                     let mut effects = Vec::with_capacity(3);
                     let current_interval = self.state.preferences.indicator.refresh_interval;
                     if current_interval != previous_interval {
@@ -523,7 +535,11 @@ impl StatletCore {
                 }
                 MetricPngImportResult::Failed(message) => {
                     self.state.indicator_icon_pending[metric_index(metric)] = false;
-                    self.state.indicator_icon_errors[metric_index(metric)] = Some(message);
+                    self.set_indicator_icon_error(
+                        metric,
+                        message,
+                        IndicatorIconErrorOwner::Independent,
+                    );
                     Vec::new()
                 }
             },
@@ -534,7 +550,7 @@ impl StatletCore {
                 {
                     Vec::new()
                 } else {
-                    self.state.indicator_icon_errors[metric_index(metric)] = None;
+                    self.clear_indicator_icon_error(metric);
                     vec![AppEffect::RemoveMetricPngAsset(metric)]
                 }
             }
@@ -549,7 +565,7 @@ impl StatletCore {
                         identifier.mode != MetricIdentifierMode::Text || identifier.png.is_some();
                     identifier.mode = MetricIdentifierMode::Text;
                     identifier.png = None;
-                    self.state.indicator_icon_errors[metric_index(metric)] = None;
+                    self.clear_indicator_icon_error(metric);
                     if changed {
                         let mut effects = Vec::with_capacity(3);
                         let current_interval = self.state.preferences.indicator.refresh_interval;
@@ -569,7 +585,11 @@ impl StatletCore {
                     }
                 }
                 MetricPngRemovalResult::Failed(message) => {
-                    self.state.indicator_icon_errors[metric_index(metric)] = Some(message);
+                    self.set_indicator_icon_error(
+                        metric,
+                        message,
+                        IndicatorIconErrorOwner::Independent,
+                    );
                     Vec::new()
                 }
             },
@@ -581,11 +601,27 @@ impl StatletCore {
                 self.state.indicator_icon_pending[metric_index(metric)] = false;
                 *metric_identifier(&mut self.state.preferences.indicator, metric) = previous;
                 self.state.preferences_save_status = PreferencesSaveStatus::Failed;
-                self.state.indicator_icon_errors[metric_index(metric)] = Some(message);
+                self.set_indicator_icon_error(
+                    metric,
+                    message,
+                    IndicatorIconErrorOwner::Independent,
+                );
                 vec![AppEffect::RequestIndicatorRedraw]
             }
             AppEvent::MetricPngTransactionCleanupFailed { metric, message } => {
-                self.state.indicator_icon_errors[metric_index(metric)] = Some(message);
+                self.set_indicator_icon_error(
+                    metric,
+                    message,
+                    IndicatorIconErrorOwner::Independent,
+                );
+                Vec::new()
+            }
+            AppEvent::MetricPngDurabilityWarning { metric, message } => {
+                self.set_indicator_icon_error(
+                    metric,
+                    message,
+                    IndicatorIconErrorOwner::PreferencesDurability,
+                );
                 Vec::new()
             }
             AppEvent::UpdateIndicator(change) => {
@@ -610,7 +646,7 @@ impl StatletCore {
                         .unwrap_or_default();
                 }
                 if let Some(metric) = identifier_metric {
-                    self.state.indicator_icon_errors[metric_index(metric)] = None;
+                    self.clear_indicator_icon_error(metric);
                 }
                 let mut effects = self.indicator_effects(previous_interval);
                 if let Some(metric) = identifier_metric
@@ -673,10 +709,41 @@ impl StatletCore {
             }
             AppEvent::PreferencesSaveFinished(result) => {
                 self.state.preferences_save_status = match result {
-                    PreferencesSaveResult::Saved => PreferencesSaveStatus::Saved,
+                    PreferencesSaveResult::Saved => {
+                        self.clear_resolved_durability_warnings();
+                        PreferencesSaveStatus::Saved
+                    }
                     PreferencesSaveResult::Failed => PreferencesSaveStatus::Failed,
                 };
                 Vec::new()
+            }
+        }
+    }
+
+    fn clear_indicator_icon_error(&mut self, metric: MetricKind) {
+        let index = metric_index(metric);
+        self.state.indicator_icon_errors[index] = None;
+        self.state.indicator_icon_error_owners[index] = None;
+    }
+
+    fn set_indicator_icon_error(
+        &mut self,
+        metric: MetricKind,
+        message: String,
+        owner: IndicatorIconErrorOwner,
+    ) {
+        let index = metric_index(metric);
+        self.state.indicator_icon_errors[index] = Some(message);
+        self.state.indicator_icon_error_owners[index] = Some(owner);
+    }
+
+    fn clear_resolved_durability_warnings(&mut self) {
+        for index in 0..self.state.indicator_icon_errors.len() {
+            if self.state.indicator_icon_error_owners[index]
+                == Some(IndicatorIconErrorOwner::PreferencesDurability)
+            {
+                self.state.indicator_icon_errors[index] = None;
+                self.state.indicator_icon_error_owners[index] = None;
             }
         }
     }
