@@ -39,6 +39,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use macos::environment::{PreviewAppearanceName, VisualEnvironment, VisualEnvironmentObserver};
+use macos::gpu::MacGpuSampler;
 use macos::notifications::NotificationManager;
 use macos::renderer::{resolved_scene_srgb_colors, PreviewImages, RenderSlot, Renderer};
 use macos::sampler::MacSampler;
@@ -47,6 +48,11 @@ use macos::windows::{
     PreviewContrastWarnings, PreviewSummaries, WindowManager,
 };
 use macos::RuntimeEvent;
+use statlet::stats::{
+    ProcessSampleCancellation, ProcessSampleCompletion, SystemUsageModel,
+    SystemUsageRenderCoalescer, SystemUsageSamplingCoordinator, SystemUsageSamplingPorts,
+    SystemUsageSection,
+};
 
 fn main() {
     let mut event_loop = EventLoopBuilder::<RuntimeEvent>::with_user_event().build();
@@ -59,9 +65,12 @@ fn main() {
     let preferences_id: MenuId = preferences_item.id().clone();
     let history_item = MenuItem::new("Histórico…", true, None);
     let history_id: MenuId = history_item.id().clone();
+    let system_usage_item = MenuItem::new("Uso do sistema…", true, None);
+    let system_usage_id: MenuId = system_usage_item.id().clone();
     let quit = MenuItem::new("Sair", true, None);
     let quit_id: MenuId = quit.id().clone();
     let menu = Menu::new();
+    menu.append(&system_usage_item).expect("build menu");
     menu.append(&review_space_item).expect("build menu");
     menu.append(&preferences_item).expect("build menu");
     menu.append(&history_item).expect("build menu");
@@ -71,6 +80,8 @@ fn main() {
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let runtime_event = if event.id == review_space_id {
             Some(RuntimeEvent::App(AppEvent::ReviewSpace))
+        } else if event.id == system_usage_id {
+            Some(RuntimeEvent::App(AppEvent::OpenSystemUsage))
         } else if event.id == preferences_id {
             Some(RuntimeEvent::App(AppEvent::OpenPreferences))
         } else if event.id == history_id {
@@ -181,6 +192,32 @@ fn main() {
                     .apply_detection(generation, detection)
                     .map(|status| core.handle(AppEvent::MoleStatusObserved(status)))
                     .unwrap_or_default(),
+                RuntimeEvent::ProcessesSampled {
+                    generation,
+                    visibility_generation,
+                    outcome,
+                } => {
+                    let live_visible = runtime.system_usage_visible();
+                    let live_visibility_generation = runtime.system_usage_visibility_generation();
+                    let interaction_active = runtime.system_usage_process_interaction_active();
+                    runtime.samplers.record_processes(
+                        generation,
+                        visibility_generation,
+                        live_visibility_generation,
+                        outcome,
+                        live_visible,
+                        interaction_active,
+                    );
+                    Vec::new()
+                }
+                RuntimeEvent::SystemUsageVisibilityChanged(visible) => {
+                    runtime.samplers.set_system_usage_visible(visible);
+                    Vec::new()
+                }
+                RuntimeEvent::SystemUsageSectionSelectedByUser(section) => {
+                    runtime.request_system_usage_summary_focus(section);
+                    core.handle(AppEvent::SelectSystemUsageSection(section))
+                }
             };
             if runtime.apply_effects(&effects, &mut core, &mut renderer, button.as_deref()) {
                 *control_flow = ControlFlow::Exit;
@@ -297,6 +334,7 @@ struct RuntimeAdapters {
     event_proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
     png_import_generations: [u64; 2],
     prepared_png_imports: [Option<PreparedPngAsset>; 2],
+    system_usage_rendering: SystemUsageRenderCoalescer,
 }
 
 impl RuntimeAdapters {
@@ -315,13 +353,14 @@ impl RuntimeAdapters {
             history_store,
             history,
             windows: None,
-            samplers: RuntimeSamplers::new(metrics_interval),
+            samplers: RuntimeSamplers::new(metrics_interval, Some(proxy.clone())),
             mole: RuntimeMole::new(proxy.clone()),
             notifications: None,
             visual_environment_observer: None,
             visual_environment: VisualEnvironmentState::default(),
             schedule: RuntimeSchedule::new(),
             review_space_item,
+            system_usage_rendering: SystemUsageRenderCoalescer::new(),
             event_proxy: proxy,
             png_import_generations: [0; 2],
             prepared_png_imports: [None, None],
@@ -410,7 +449,15 @@ impl RuntimeAdapters {
         button: Option<&objc2_app_kit::NSStatusBarButton>,
     ) -> bool {
         let now = self.samplers.clock.now();
-        let poll = self.samplers.poll_due(core);
+        let system_usage_visible = self.system_usage_visible();
+        let process_interaction_active = self.system_usage_process_interaction_active();
+        let system_usage_visibility_generation = self.system_usage_visibility_generation();
+        let poll = self.samplers.poll_due(
+            core,
+            system_usage_visible,
+            process_interaction_active,
+            system_usage_visibility_generation,
+        );
         if poll.metrics_ticked {
             self.schedule
                 .request_redraw_now(now, RedrawRequest::paint());
@@ -448,6 +495,41 @@ impl RuntimeAdapters {
         }
     }
 
+    fn update_system_usage_window(&mut self, section: SystemUsageSection) {
+        if let Some(windows) = &self.windows {
+            if windows.system_usage_visible() {
+                let view_model = self.samplers.system_usage_view_model(section);
+                if self.system_usage_rendering.take_changed(&view_model) {
+                    windows.update_system_usage(&view_model);
+                }
+            }
+        }
+    }
+
+    fn system_usage_visible(&self) -> bool {
+        self.windows
+            .as_ref()
+            .is_some_and(WindowManager::system_usage_visible)
+    }
+
+    fn system_usage_process_interaction_active(&self) -> bool {
+        self.windows
+            .as_ref()
+            .is_some_and(WindowManager::system_usage_process_interaction_active)
+    }
+
+    fn system_usage_visibility_generation(&self) -> u64 {
+        self.windows
+            .as_ref()
+            .map_or(0, WindowManager::system_usage_visibility_generation)
+    }
+
+    fn request_system_usage_summary_focus(&self, section: SystemUsageSection) {
+        if let Some(windows) = &self.windows {
+            windows.request_system_usage_summary_focus(section);
+        }
+    }
+
     fn apply_effects(
         &mut self,
         effects: &[AppEffect],
@@ -471,6 +553,9 @@ impl RuntimeAdapters {
                     }
                     if kind == statlet::core::WindowKind::Preferences {
                         self.request_redraw(RedrawRequest::paint());
+                    }
+                    if kind == statlet::core::WindowKind::SystemUsage {
+                        self.system_usage_rendering.reset();
                     }
                 }
                 AppEffect::QueuePreferencesSave(preferences) => {
@@ -638,6 +723,7 @@ impl RuntimeAdapters {
         if let Some(windows) = &self.windows {
             windows.update_state(core.state());
         }
+        self.update_system_usage_window(core.state().system_usage_section);
         should_quit
     }
 
@@ -1061,6 +1147,10 @@ struct RuntimeSamplers {
     disk: StartupVolumeSampler,
     disk_schedule: DiskSamplingSchedule,
     clock: ContinuousClock,
+    gpu: MacGpuSampler,
+    system_usage: SystemUsageModel,
+    system_usage_sampling: SystemUsageSamplingCoordinator,
+    process_proxy: Option<tao::event_loop::EventLoopProxy<RuntimeEvent>>,
 }
 
 struct RuntimePoll {
@@ -1069,7 +1159,10 @@ struct RuntimePoll {
 }
 
 impl RuntimeSamplers {
-    fn new(metrics_interval: MetricsRefreshInterval) -> Self {
+    fn new(
+        metrics_interval: MetricsRefreshInterval,
+        process_proxy: Option<tao::event_loop::EventLoopProxy<RuntimeEvent>>,
+    ) -> Self {
         let mut metrics = MacSampler::new();
         metrics.prime_cpu();
         let clock = ContinuousClock::new().expect("initialize the macOS continuous clock");
@@ -1079,6 +1172,10 @@ impl RuntimeSamplers {
             disk: StartupVolumeSampler::new(),
             disk_schedule: DiskSamplingSchedule::new(),
             clock,
+            gpu: MacGpuSampler::new(),
+            system_usage: SystemUsageModel::new(),
+            system_usage_sampling: SystemUsageSamplingCoordinator::new(),
+            process_proxy,
         }
     }
 
@@ -1086,12 +1183,42 @@ impl RuntimeSamplers {
         self.disk_schedule.set_enabled(enabled, self.clock.now());
     }
 
-    fn poll_due(&mut self, core: &mut StatletCore) -> RuntimePoll {
+    fn set_system_usage_visible(&mut self, visible: bool) {
         let now = self.clock.now();
+        self.system_usage.set_visible(visible);
+        self.system_usage_sampling.set_visible(now, visible);
+    }
+
+    fn poll_due(
+        &mut self,
+        core: &mut StatletCore,
+        system_usage_visible: bool,
+        process_interaction_active: bool,
+        system_usage_visibility_generation: u64,
+    ) -> RuntimePoll {
+        let now = self.clock.now();
+        self.system_usage.set_visible(system_usage_visible);
+        self.system_usage
+            .apply_deferred_processes(now, process_interaction_active);
         let metrics_ticked = self.metrics_schedule.take_due(now);
         if metrics_ticked {
-            if let Some(snapshot) = self.metrics.sample() {
-                core.handle(AppEvent::MetricsSample(snapshot));
+            match self.metrics.sample() {
+                Some(snapshot) => {
+                    core.handle(AppEvent::MetricsSample(snapshot.compact));
+                    self.system_usage.record_memory(now, Ok(snapshot.memory));
+                }
+                None => self.system_usage.record_memory(now, Err(())),
+            }
+            let mut ports = RuntimeSystemUsagePorts {
+                gpu: &mut self.gpu,
+                process_proxy: self.process_proxy.as_ref(),
+                visibility_generation: system_usage_visibility_generation,
+            };
+            if let Some(gpu) =
+                self.system_usage_sampling
+                    .collect_if_visible(now, system_usage_visible, &mut ports)
+            {
+                self.system_usage.record_gpu(now, gpu);
             }
         }
         let effects = if self.disk_schedule.take_due(now) {
@@ -1113,6 +1240,82 @@ impl RuntimeSamplers {
 
     fn reschedule_metrics(&mut self, interval: MetricsRefreshInterval) {
         self.metrics_schedule.reschedule(self.clock.now(), interval);
+    }
+
+    fn system_usage_view_model(
+        &self,
+        section: SystemUsageSection,
+    ) -> statlet::stats::SystemUsageViewModel {
+        self.system_usage.view_model(section)
+    }
+
+    fn record_processes(
+        &mut self,
+        generation: u64,
+        request_visibility_generation: u64,
+        live_visibility_generation: u64,
+        outcome: statlet::stats::ProcessSampleOutcome,
+        live_visible: bool,
+        interaction_active: bool,
+    ) {
+        let now = self.clock.now();
+        self.system_usage.set_visible(live_visible);
+        self.system_usage_sampling.record_processes_if_current(
+            ProcessSampleCompletion {
+                observed_at: now,
+                live_visible,
+                interaction_active,
+                request_visibility_generation,
+                live_visibility_generation,
+                generation,
+                outcome,
+            },
+            &mut self.system_usage,
+        );
+    }
+}
+
+struct RuntimeSystemUsagePorts<'a> {
+    gpu: &'a mut MacGpuSampler,
+    process_proxy: Option<&'a tao::event_loop::EventLoopProxy<RuntimeEvent>>,
+    visibility_generation: u64,
+}
+
+impl SystemUsageSamplingPorts for RuntimeSystemUsagePorts<'_> {
+    fn sample_gpu(&mut self) -> statlet::stats::GpuSampleOutcome {
+        self.gpu.sample()
+    }
+
+    fn request_process_sample(
+        &mut self,
+        generation: u64,
+        cancellation: ProcessSampleCancellation,
+    ) -> bool {
+        let Some(process_proxy) = self.process_proxy else {
+            return false;
+        };
+        let proxy = process_proxy.clone();
+        let visibility_generation = self.visibility_generation;
+        thread::Builder::new()
+            .name("statlet-process-sample".to_owned())
+            .spawn(move || {
+                let outcome = MacSampler::sample_processes(&cancellation);
+                let _ = proxy.send_event(RuntimeEvent::ProcessesSampled {
+                    generation,
+                    visibility_generation,
+                    outcome,
+                });
+            })
+            .map(|_| true)
+            .unwrap_or_else(|_| {
+                process_proxy
+                    .send_event(RuntimeEvent::ProcessesSampled {
+                        generation,
+                        visibility_generation,
+                        outcome: statlet::stats::ProcessSampleOutcome::Failed,
+                    })
+                    .is_ok()
+            })
     }
 }
 
@@ -1741,7 +1944,8 @@ mod tests {
 
     #[test]
     fn runtime_constructor_uses_the_loaded_metrics_interval() {
-        let mut samplers = RuntimeSamplers::new(MetricsRefreshInterval::try_from(60).unwrap());
+        let mut samplers =
+            RuntimeSamplers::new(MetricsRefreshInterval::try_from(60).unwrap(), None);
         let now = samplers.clock.now();
 
         assert!(samplers.metrics_schedule.take_due(now));
@@ -1753,7 +1957,7 @@ mod tests {
 
     #[test]
     fn runtime_reschedules_metrics_without_moving_the_disk_deadline() {
-        let mut samplers = RuntimeSamplers::new(MetricsRefreshInterval::try_from(2).unwrap());
+        let mut samplers = RuntimeSamplers::new(MetricsRefreshInterval::try_from(2).unwrap(), None);
         let before_reschedule = samplers.clock.now();
         samplers.disk_schedule.set_enabled(true, before_reschedule);
         assert!(samplers.disk_schedule.take_due(before_reschedule));

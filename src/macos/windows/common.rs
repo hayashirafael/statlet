@@ -1,22 +1,30 @@
 use std::cell::Cell;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSBackingStoreType, NSButton,
-    NSControlStateValueOn, NSEvent, NSEventModifierFlags, NSPopUpButton, NSTextField, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSControlStateValueOn, NSEvent, NSEventModifierFlags, NSPopUpButton, NSSegmentedControl,
+    NSTextField, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
+    NSSize,
 };
 use statlet::core::{AppEvent, WarningThreshold};
+use statlet::stats::SystemUsageSection;
 use tao::event_loop::EventLoopProxy;
 
 use super::super::RuntimeEvent;
 
 pub(super) struct ControlTargetIvars {
     proxy: EventLoopProxy<RuntimeEvent>,
+    system_usage_visible: Arc<AtomicBool>,
+    system_usage_generation: Arc<AtomicU64>,
 }
 
 define_class!(
@@ -26,6 +34,28 @@ define_class!(
     pub(super) struct ControlTarget;
 
     unsafe impl NSObjectProtocol for ControlTarget {}
+
+    unsafe impl NSWindowDelegate for ControlTarget {
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn system_usage_became_key(&self, _notification: &NSNotification) {
+            self.update_system_usage_visibility(true);
+        }
+
+        #[unsafe(method(windowWillClose:))]
+        fn system_usage_will_close(&self, _notification: &NSNotification) {
+            self.update_system_usage_visibility(false);
+        }
+
+        #[unsafe(method(windowDidMiniaturize:))]
+        fn system_usage_did_miniaturize(&self, _notification: &NSNotification) {
+            self.update_system_usage_visibility(false);
+        }
+
+        #[unsafe(method(windowDidDeminiaturize:))]
+        fn system_usage_did_deminiaturize(&self, _notification: &NSNotification) {
+            self.update_system_usage_visibility(true);
+        }
+    }
 
     impl ControlTarget {
         #[unsafe(method(toggleMoleIntegration:))]
@@ -54,6 +84,33 @@ define_class!(
                 .ivars()
                 .proxy
                 .send_event(RuntimeEvent::App(AppEvent::SetWarningThreshold(threshold)));
+        }
+
+        #[unsafe(method(changeSystemUsageSection:))]
+        fn change_system_usage_section(&self, sender: &NSSegmentedControl) {
+            let section = if sender.selectedSegment() == 1 {
+                SystemUsageSection::Gpu
+            } else {
+                SystemUsageSection::Ram
+            };
+            let _ = self
+                .ivars()
+                .proxy
+                .send_event(RuntimeEvent::SystemUsageSectionSelectedByUser(section));
+        }
+
+        #[unsafe(method(selectSystemUsageRam:))]
+        fn select_system_usage_ram(&self, _sender: &NSButton) {
+            let _ = self.ivars().proxy.send_event(
+                RuntimeEvent::SystemUsageSectionSelectedByUser(SystemUsageSection::Ram),
+            );
+        }
+
+        #[unsafe(method(selectSystemUsageGpu:))]
+        fn select_system_usage_gpu(&self, _sender: &NSButton) {
+            let _ = self.ivars().proxy.send_event(
+                RuntimeEvent::SystemUsageSectionSelectedByUser(SystemUsageSection::Gpu),
+            );
         }
 
         #[unsafe(method(openMoleInTerminal:))]
@@ -116,8 +173,14 @@ impl ControlTarget {
     pub(super) fn new(
         mtm: MainThreadMarker,
         proxy: EventLoopProxy<RuntimeEvent>,
+        system_usage_visible: Arc<AtomicBool>,
+        system_usage_generation: Arc<AtomicU64>,
     ) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(ControlTargetIvars { proxy });
+        let this = Self::alloc(mtm).set_ivars(ControlTargetIvars {
+            proxy,
+            system_usage_visible,
+            system_usage_generation,
+        });
         unsafe { msg_send![super(this), init] }
     }
 
@@ -127,6 +190,23 @@ impl ControlTarget {
 
     fn send_app_event(&self, event: AppEvent) {
         let _ = self.ivars().proxy.send_event(RuntimeEvent::App(event));
+    }
+
+    pub(super) fn update_system_usage_visibility(&self, visible: bool) {
+        let changed = self
+            .ivars()
+            .system_usage_visible
+            .swap(visible, Ordering::AcqRel)
+            != visible;
+        if changed {
+            self.ivars()
+                .system_usage_generation
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        let _ = self
+            .ivars()
+            .proxy
+            .send_event(RuntimeEvent::SystemUsageVisibilityChanged(visible));
     }
 }
 

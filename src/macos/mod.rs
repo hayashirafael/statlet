@@ -2,9 +2,11 @@ use statlet::core::AppEvent;
 use statlet::icon_assets::PreparedPngAsset;
 use statlet::indicator_preferences::MetricKind;
 use statlet::mole::MoleDetection;
+use statlet::stats::{ProcessSampleOutcome, SystemUsageSection};
 
 pub mod environment;
 pub mod fonts;
+pub mod gpu;
 pub mod notifications;
 pub mod renderer;
 pub mod sampler;
@@ -25,4 +27,11 @@ pub enum RuntimeEvent {
         generation: u64,
         detection: MoleDetection,
     },
+    ProcessesSampled {
+        generation: u64,
+        visibility_generation: u64,
+        outcome: ProcessSampleOutcome,
+    },
+    SystemUsageVisibilityChanged(bool),
+    SystemUsageSectionSelectedByUser(SystemUsageSection),
 }

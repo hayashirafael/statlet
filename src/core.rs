@@ -10,6 +10,7 @@ use crate::indicator_preferences::{
     MetricKind, MetricsRefreshInterval, PngIconMetadata, SrgbColor, SystemSymbolName,
 };
 use crate::mole::MoleStatus;
+use crate::stats::SystemUsageSection;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryPressure {
@@ -80,6 +81,7 @@ pub struct AppState {
     indicator_icon_errors: [Option<String>; 2],
     indicator_icon_error_owners: [Option<IndicatorIconErrorOwner>; 2],
     indicator_icon_pending: [bool; 2],
+    pub system_usage_section: SystemUsageSection,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +109,8 @@ pub enum AppEvent {
     MetricsSample(SystemSnapshot),
     OpenPreferences,
     OpenHistory,
+    OpenSystemUsage,
+    SelectSystemUsageSection(SystemUsageSection),
     Quit,
     SetMoleIntegrationEnabled(bool),
     SetWarningThreshold(WarningThreshold),
@@ -236,6 +240,7 @@ pub enum WindowKind {
     Preferences,
     History,
     FreeSpace,
+    SystemUsage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -337,6 +342,7 @@ impl StatletCore {
                 indicator_icon_errors: [None, None],
                 indicator_icon_error_owners: [None, None],
                 indicator_icon_pending: [false; 2],
+                system_usage_section: SystemUsageSection::Ram,
             },
             system_snapshot,
             disk_episode: DiskEpisode::default(),
@@ -375,6 +381,13 @@ impl StatletCore {
                 vec![AppEffect::ShowWindow(WindowKind::Preferences)]
             }
             AppEvent::OpenHistory => vec![AppEffect::ShowWindow(WindowKind::History)],
+            AppEvent::OpenSystemUsage => {
+                vec![AppEffect::ShowWindow(WindowKind::SystemUsage)]
+            }
+            AppEvent::SelectSystemUsageSection(section) => {
+                self.state.system_usage_section = section;
+                Vec::new()
+            }
             AppEvent::ReviewSpace | AppEvent::NotificationActivated => {
                 let mut effects = Vec::with_capacity(3);
                 if self.state.preferences.mole_integration_enabled {
