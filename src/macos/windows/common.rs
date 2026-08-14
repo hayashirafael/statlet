@@ -287,7 +287,7 @@ pub(super) fn should_intercept_indicator_undo(
 }
 
 fn indicator_reset_confirmation() -> &'static str {
-    "CPU/RAM, rótulos, tipografia e intervalo serão restaurados aos padrões. Disco e Mole não serão alterados."
+    "As cores de CPU/RAM, os identificadores e os PNGs associados, os rótulos, a tipografia e o intervalo serão restaurados aos padrões. Disco e Mole não serão alterados."
 }
 
 pub(super) fn create_window(
@@ -337,7 +337,14 @@ mod tests {
     fn global_reset_confirmation_summarizes_every_indicator_group_and_safety_boundary() {
         let summary = indicator_reset_confirmation();
 
-        for group in ["CPU/RAM", "rótulos", "tipografia", "intervalo"] {
+        for group in [
+            "cores de CPU/RAM",
+            "identificadores",
+            "PNGs",
+            "rótulos",
+            "tipografia",
+            "intervalo",
+        ] {
             assert!(summary.contains(group), "missing {group} in {summary}");
         }
         assert!(summary.contains("Disco e Mole não serão alterados"));

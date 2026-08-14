@@ -16,6 +16,7 @@ use objc2_foundation::{
 use statlet::core::{AppEvent, IndicatorPreferenceChange};
 use statlet::indicator_preferences::FontFamilyPreference;
 use statlet::preferences_view::{filter_font_families, FontPickerInteraction, FontRow};
+use statlet::runtime_profile::RuntimePresentation;
 use tao::event_loop::EventLoopProxy;
 
 use super::super::common::create_window;
@@ -216,8 +217,16 @@ pub struct FontPicker {
 }
 
 impl FontPicker {
-    pub fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Self {
-        let sheet = create_window(mtm, "Escolher fonte", NSSize::new(520.0, 430.0));
+    pub fn new(
+        mtm: MainThreadMarker,
+        proxy: EventLoopProxy<RuntimeEvent>,
+        presentation: RuntimePresentation,
+    ) -> Self {
+        let sheet = create_window(
+            mtm,
+            &presentation.window_title("Escolher fonte"),
+            NSSize::new(520.0, 430.0),
+        );
         let content = sheet.contentView().expect("font picker content view");
 
         let search = NSSearchField::initWithFrame(

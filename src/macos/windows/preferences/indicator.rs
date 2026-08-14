@@ -1,19 +1,19 @@
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAccessibility, NSButton, NSColor, NSColorWell, NSControlStateValueOn,
+    NSAccessibility, NSButton, NSColor, NSColorWell, NSControl, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSFont, NSImage, NSImageView, NSModalResponseOK, NSOpenPanel,
     NSPopUpButton, NSSegmentSwitchTracking, NSSegmentedControl, NSSlider, NSStackView, NSStepper,
     NSTextField, NSTextFieldDelegate, NSView,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint,
-    NSRect, NSSize,
+    ns_string, MainThreadMarker, NSArray, NSNotification, NSNumber, NSNumberFormatter,
+    NSNumberFormatterStyle, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 use statlet::core::{AppEvent, IndicatorPreferenceChange};
 use statlet::icon_assets::IconAssetStore;
@@ -24,21 +24,25 @@ use statlet::indicator_preferences::{
 };
 use statlet::preferences_view::{
     ColorEditorState, IdentifierDetailPresentation, IndicatorControlsLayout,
-    IndicatorControlsVisibility, IntervalDraft, MetricIdentifierControlPresentation,
+    IndicatorControlsVisibility, IntervalDraft, IntervalFieldFormat, LabelEditingFocusTarget,
+    LabelEditingPresentation, MetricIdentifierControlPresentation, PreferencesArea,
+    TypographyWarningKind,
 };
+use statlet::runtime_profile::RuntimePresentation;
 use tao::event_loop::EventLoopProxy;
 
 use super::color_editor::{ColorBinding, ColorEditor};
 use super::font_picker::FontPicker;
 use super::{
     configure_discrete_slider, font_size_slider_contract, label_spacing_slider_contract,
-    IndicatorFontFallback, IndicatorLayoutDiagnostics, PreferencesArea,
+    IndicatorFontFallback, IndicatorLayoutDiagnostics,
 };
 use crate::macos::fonts::FontCatalog;
 use crate::macos::RuntimeEvent;
 
 struct IndicatorControlsTargetIvars {
     proxy: EventLoopProxy<RuntimeEvent>,
+    presentation: RuntimePresentation,
     applying: Cell<bool>,
     selected_family: RefCell<FontFamilyPreference>,
     selected_font_size: Cell<FontSize>,
@@ -65,6 +69,33 @@ struct IndicatorControlsTargetIvars {
 struct FontResources {
     picker: FontPicker,
     catalog: FontCatalog,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PngPanelPresentation {
+    title: Option<String>,
+    prompt: String,
+    message: String,
+}
+
+fn png_panel_presentation(
+    metric: MetricKind,
+    presentation: &RuntimePresentation,
+) -> PngPanelPresentation {
+    const PROMPT: &str = "Escolher PNG";
+    const MESSAGE: &str =
+        "Escolha um PNG com transparência. O Statlet reduzirá e otimizará uma cópia.";
+    let production_title = match metric {
+        MetricKind::Cpu => "Escolher PNG da CPU",
+        MetricKind::Ram => "Escolher PNG da RAM",
+    };
+    PngPanelPresentation {
+        title: presentation
+            .dev_marker()
+            .map(|_| presentation.window_title(production_title)),
+        prompt: PROMPT.to_owned(),
+        message: presentation.status_metadata(MESSAGE),
+    }
 }
 
 fn get_or_create_font_resources<T>(slot: &mut Option<T>, create: impl FnOnce() -> T) -> &mut T {
@@ -117,6 +148,11 @@ define_class!(
         #[unsafe(method(resetCpuAndRam:))]
         fn reset_cpu_and_ram(&self, _sender: &NSButton) {
             self.reset_group(IndicatorPreferenceGroup::CpuAndRam);
+        }
+
+        #[unsafe(method(resetIdentifiers:))]
+        fn reset_identifiers(&self, _sender: &NSButton) {
+            self.reset_group(IndicatorPreferenceGroup::Identifiers);
         }
 
         #[unsafe(method(changeRamColorMode:))]
@@ -217,7 +253,7 @@ define_class!(
             let proxy = self.ivars().proxy.clone();
             let mut slot = self.ivars().font_resources.borrow_mut();
             let resources = get_or_create_font_resources(&mut slot, || FontResources {
-                picker: FontPicker::new(marker, proxy),
+                picker: FontPicker::new(marker, proxy, self.ivars().presentation.clone()),
                 catalog: FontCatalog::new(marker),
             });
             resources.catalog.refresh();
@@ -302,6 +338,33 @@ define_class!(
                 self.commit_label(&field, MetricKind::Ram, false);
             }
         }
+
+        #[unsafe(method(control:didFailToFormatString:errorDescription:))]
+        fn control_did_fail_to_format_string(
+            &self,
+            control: &NSControl,
+            string: &NSString,
+            _error: Option<&NSString>,
+        ) -> bool {
+            if std::ptr::eq(control, &**self.ivars().interval_field) {
+                self.commit_refresh_interval_text(&string.to_string());
+                IntervalFieldFormat::seconds().accepts_invalid_commit_for_domain_validation()
+            } else {
+                false
+            }
+        }
+
+        #[unsafe(method(control:didFailToValidatePartialString:errorDescription:))]
+        fn control_did_fail_to_validate_partial_string(
+            &self,
+            control: &NSControl,
+            string: &NSString,
+            _error: Option<&NSString>,
+        ) {
+            if std::ptr::eq(control, &**self.ivars().interval_field) {
+                self.commit_refresh_interval_text(&string.to_string());
+            }
+        }
     }
 
     unsafe impl NSTextFieldDelegate for IndicatorControlsTarget {}
@@ -375,16 +438,18 @@ impl IndicatorControlsTarget {
         };
         let marker = MainThreadMarker::new().expect("PNG picker actions run on main thread");
         let panel = NSOpenPanel::openPanel(marker);
+        let panel_presentation = png_panel_presentation(metric, &self.ivars().presentation);
         panel.setCanChooseDirectories(false);
         panel.setCanChooseFiles(true);
         panel.setAllowsMultipleSelection(false);
         panel.setResolvesAliases(true);
         #[allow(deprecated)]
         panel.setAllowedFileTypes(Some(&NSArray::from_slice(&[ns_string!("png")])));
-        panel.setPrompt(Some(ns_string!("Escolher PNG")));
-        panel.setMessage(Some(ns_string!(
-            "Escolha um PNG com transparência. O Statlet reduzirá e otimizará uma cópia."
-        )));
+        if let Some(title) = panel_presentation.title.as_deref() {
+            panel.setTitle(Some(&NSString::from_str(title)));
+        }
+        panel.setPrompt(Some(&NSString::from_str(&panel_presentation.prompt)));
+        panel.setMessage(Some(&NSString::from_str(&panel_presentation.message)));
 
         let proxy = self.ivars().proxy.clone();
         let panel_for_completion = panel.clone();
@@ -477,7 +542,10 @@ impl IndicatorControlsTarget {
                     self.send(IndicatorPreferenceChange::SetRefreshInterval(interval));
                 }
             }
-            Err(error) => set_inline_error(&self.ivars().interval_error, Some(error.message())),
+            Err(error) => {
+                let message = error.message();
+                set_inline_error(&self.ivars().interval_error, Some(&message));
+            }
         }
     }
 
@@ -559,6 +627,7 @@ struct IndicatorLayoutViews {
     identifiers_heading: Retained<NSTextField>,
     cpu_identifier: MetricIdentifierControls,
     ram_identifier: MetricIdentifierControls,
+    reset_identifiers: Retained<NSButton>,
     labels_heading: Retained<NSTextField>,
     labels_visible: Retained<NSButton>,
     cpu_label_text: Retained<NSTextField>,
@@ -603,6 +672,21 @@ struct MetricIdentifierControls {
     remove: Retained<NSButton>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct ThumbnailAssetPlan {
+    store: IconAssetStore,
+}
+
+impl ThumbnailAssetPlan {
+    pub(super) fn new(store: IconAssetStore) -> Self {
+        Self { store }
+    }
+
+    fn path_for(&self, metric: MetricKind, should_load: bool) -> Option<PathBuf> {
+        should_load.then(|| self.store.path_for(metric))
+    }
+}
+
 impl MetricIdentifierControls {
     fn retained(&self) -> Self {
         Self {
@@ -621,6 +705,7 @@ impl MetricIdentifierControls {
         &self,
         row: statlet::preferences_view::RowSlot,
         detail: statlet::preferences_view::VerticalSlot,
+        error: Option<statlet::preferences_view::VerticalSlot>,
         content_height: f64,
     ) {
         set_slot_frame(
@@ -639,7 +724,24 @@ impl MetricIdentifierControls {
         set_slot_frame(&self.symbol, 100.0, y, detail.height());
         set_slot_frame(&self.choose_png, 100.0, y, detail.height());
         set_slot_frame(&self.thumbnail, 228.0, y, detail.height());
-        set_slot_frame(&self.status, 266.0, y, detail.height());
+        if let Some(error) = error {
+            let message = statlet::preferences_view::MessageLayout::identifier_transaction_error();
+            self.status.setFrame(NSRect::new(
+                NSPoint::new(message.x(), error.origin_y(content_height)),
+                NSSize::new(message.width(), error.height()),
+            ));
+            self.status
+                .setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByWordWrapping);
+            self.status.setMaximumNumberOfLines(message.maximum_lines());
+        } else {
+            self.status.setFrame(NSRect::new(
+                NSPoint::new(266.0, y),
+                NSSize::new(194.0, detail.height()),
+            ));
+            self.status
+                .setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingMiddle);
+            self.status.setMaximumNumberOfLines(1);
+        }
         set_slot_frame(&self.remove, 468.0, y, detail.height());
     }
 
@@ -660,7 +762,7 @@ impl MetricIdentifierControls {
         preferences: &statlet::indicator_preferences::MetricIdentifierPreferences,
         error: Option<&str>,
         processing: bool,
-        store: &IconAssetStore,
+        thumbnail_assets: &ThumbnailAssetPlan,
     ) {
         restore_identifier_segment(&self.mode, preferences.mode);
         if let Some(index) = SystemSymbolName::curated_options()
@@ -713,15 +815,17 @@ impl MetricIdentifierControls {
                     .setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(
                         status.unwrap_or("Nenhum PNG escolhido."),
                     )));
-                if can_remove && !presentation.processing {
-                    if let Some(path) = store.path_for(self.metric).to_str() {
-                        if let Some(image) = NSImage::initWithContentsOfFile(
-                            NSImage::alloc(),
-                            &objc2_foundation::NSString::from_str(path),
-                        ) {
-                            self.thumbnail.setImage(Some(&image));
-                            self.thumbnail.setHidden(false);
-                        }
+                if let Some(path) = thumbnail_assets
+                    .path_for(self.metric, can_remove && !presentation.processing)
+                    .as_deref()
+                    .and_then(Path::to_str)
+                {
+                    if let Some(image) = NSImage::initWithContentsOfFile(
+                        NSImage::alloc(),
+                        &objc2_foundation::NSString::from_str(path),
+                    ) {
+                        self.thumbnail.setImage(Some(&image));
+                        self.thumbnail.setHidden(false);
                     }
                 }
             }
@@ -853,13 +957,23 @@ impl IndicatorLayoutViews {
         self.cpu_identifier.set_frames(
             layout.cpu_identifier_row(),
             layout.cpu_identifier_detail(),
+            layout.cpu_identifier_error(),
             content_height,
         );
         self.ram_identifier.set_frames(
             layout.ram_identifier_row(),
             layout.ram_identifier_detail(),
+            layout.ram_identifier_error(),
             content_height,
         );
+        let identifiers_reset = layout.identifiers_reset();
+        self.reset_identifiers.setFrame(NSRect::new(
+            NSPoint::new(
+                identifiers_reset.x(),
+                identifiers_reset.origin_y(content_height),
+            ),
+            NSSize::new(identifiers_reset.width(), identifiers_reset.height()),
+        ));
 
         let labels_heading = layout.labels_heading();
         set_slot_frame(
@@ -868,17 +982,16 @@ impl IndicatorLayoutViews {
             labels_heading.origin_y(content_height),
             labels_heading.height(),
         );
+        let labels_reset = layout.labels_reset();
+        self.reset_labels.setFrame(NSRect::new(
+            NSPoint::new(labels_reset.x(), labels_reset.origin_y(content_height)),
+            NSSize::new(labels_reset.width(), labels_reset.height()),
+        ));
         let labels_visibility = layout.labels_visibility_row();
         let labels_visibility_y = labels_visibility.origin_y(content_height);
         set_slot_frame(
             &self.labels_visible,
             labels_visibility.label_x(),
-            labels_visibility_y,
-            labels_visibility.height(),
-        );
-        set_slot_frame(
-            &self.reset_labels,
-            390.0,
             labels_visibility_y,
             labels_visibility.height(),
         );
@@ -1059,23 +1172,9 @@ impl IndicatorLayoutViews {
         );
 
         let colors_start = layout.colors_heading().top();
-        let colors_end = layout
-            .ram_editor()
-            .unwrap_or(layout.ram_row().vertical())
-            .bottom();
-        let labels_start = layout.identifiers_heading().top();
-        let labels_end = layout
-            .labels_editor()
-            .unwrap_or(layout.labels_mode_row().vertical())
-            .bottom();
         let typography_start = layout.typography_heading().top();
-        let typography_end = layout.layout_warning().bottom();
         let refresh_start = layout.update_heading().top();
-        let refresh_end = layout.interval_error().bottom();
-        let page_height = (colors_end - colors_start)
-            .max(labels_end - labels_start)
-            .max(typography_end - typography_start)
-            .max(refresh_end - refresh_start);
+        let page_height = layout.page_height();
 
         shift_views_y(
             &[
@@ -1107,6 +1206,7 @@ impl IndicatorLayoutViews {
                 self.ram_identifier.views()[4],
                 self.ram_identifier.views()[5],
                 self.ram_identifier.views()[6],
+                &self.reset_identifiers,
                 &self.labels_heading,
                 &self.labels_visible,
                 &self.cpu_label_text,
@@ -1120,7 +1220,8 @@ impl IndicatorLayoutViews {
                 &self.reset_labels,
                 &self.labels_editor,
             ],
-            page_height - content_height + labels_start,
+            layout.labels_page_origin_y(layout.identifiers_heading())
+                - layout.identifiers_heading().origin_y(content_height),
         );
         shift_views_y(
             &[
@@ -1167,7 +1268,8 @@ pub(super) struct IndicatorControls {
     ram_mode: Retained<NSSegmentedControl>,
     cpu_identifier: MetricIdentifierControls,
     ram_identifier: MetricIdentifierControls,
-    icon_asset_store: IconAssetStore,
+    thumbnail_assets: ThumbnailAssetPlan,
+    reset_identifiers: Retained<NSButton>,
     labels_visible: Retained<NSButton>,
     label_spacing: Retained<NSSlider>,
     labels_mode: Retained<NSSegmentedControl>,
@@ -1186,7 +1288,12 @@ pub(super) struct IndicatorControls {
 }
 
 impl IndicatorControls {
-    pub(super) fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<RuntimeEvent>) -> Self {
+    pub(super) fn new(
+        mtm: MainThreadMarker,
+        proxy: EventLoopProxy<RuntimeEvent>,
+        presentation: RuntimePresentation,
+        thumbnail_assets: ThumbnailAssetPlan,
+    ) -> Self {
         let view = NSStackView::initWithFrame(
             NSStackView::alloc(mtm),
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 0.0)),
@@ -1240,6 +1347,13 @@ impl IndicatorControls {
         let identifiers_heading = heading(mtm, "Identificadores", 0.0);
         let cpu_identifier = metric_identifier_controls(mtm, MetricKind::Cpu);
         let ram_identifier = metric_identifier_controls(mtm, MetricKind::Ram);
+        let reset_identifiers = reset_button(
+            mtm,
+            "Restaurar identificadores",
+            NSRect::new(NSPoint::new(350.0, 0.0), NSSize::new(200.0, 28.0)),
+        );
+        reset_identifiers
+            .setAccessibilityIdentifier(Some(ns_string!("indicator.identifiers.reset")));
         let labels_heading = heading(mtm, "Rótulos", 0.0);
         let labels_visible = unsafe {
             NSButton::checkboxWithTitle_target_action(
@@ -1353,7 +1467,15 @@ impl IndicatorControls {
             NSSize::new(150.0, 28.0),
         ));
         let font_fallback_warning = warning_label(mtm, 0.0);
+        font_fallback_warning.setAccessibilityIdentifier(Some(
+            &objc2_foundation::NSString::from_str(
+                TypographyWarningKind::FontFallback.accessibility_identifier(),
+            ),
+        ));
         let layout_warning = warning_label(mtm, 0.0);
+        layout_warning.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(
+            TypographyWarningKind::Layout.accessibility_identifier(),
+        )));
 
         let update_heading = heading(mtm, "Atualização", 0.0);
         let interval_label = text_label(mtm, "Intervalo", 0.0);
@@ -1364,12 +1486,19 @@ impl IndicatorControls {
         interval_field.setStringValue(ns_string!("2"));
         interval_field.setAccessibilityLabel(Some(ns_string!("Intervalo de atualização")));
         interval_field.setAccessibilityIdentifier(Some(ns_string!("indicator.refresh.interval")));
+        let interval_format = IntervalFieldFormat::seconds();
+        interval_field.setAccessibilityHelp(Some(&objc2_foundation::NSString::from_str(&format!(
+            "Inteiro de {} a {} segundos",
+            interval_format.minimum(),
+            interval_format.maximum()
+        ))));
+        configure_interval_field(&interval_field, interval_format);
         let interval_stepper = NSStepper::initWithFrame(
             NSStepper::alloc(mtm),
             NSRect::new(NSPoint::new(164.0, 0.0), NSSize::new(20.0, 28.0)),
         );
-        interval_stepper.setMinValue(1.0);
-        interval_stepper.setMaxValue(60.0);
+        interval_stepper.setMinValue(interval_format.minimum().into());
+        interval_stepper.setMaxValue(interval_format.maximum().into());
         interval_stepper.setIncrement(1.0);
         interval_stepper.setValueWraps(false);
         interval_stepper
@@ -1395,6 +1524,7 @@ impl IndicatorControls {
             mtm,
             IndicatorControlsTargetIvars {
                 proxy: proxy.clone(),
+                presentation,
                 applying: Cell::new(false),
                 selected_family: RefCell::new(defaults.typography.family.clone()),
                 selected_font_size: Cell::new(defaults.typography.size),
@@ -1425,6 +1555,7 @@ impl IndicatorControls {
             &ram_mode,
             &cpu_identifier,
             &ram_identifier,
+            &reset_identifiers,
             &labels_visible,
             &cpu_label_field,
             &ram_label_field,
@@ -1468,6 +1599,7 @@ impl IndicatorControls {
         {
             labels_page.addSubview(child);
         }
+        labels_page.addSubview(&reset_identifiers);
         for child in [
             &*labels_heading as &NSView,
             &*labels_visible,
@@ -1546,6 +1678,7 @@ impl IndicatorControls {
             identifiers_heading: identifiers_heading.clone(),
             cpu_identifier: cpu_identifier.retained(),
             ram_identifier: ram_identifier.retained(),
+            reset_identifiers: reset_identifiers.clone(),
             labels_heading: labels_heading.clone(),
             labels_visible: labels_visible.clone(),
             cpu_label_text: cpu_label_text.clone(),
@@ -1589,8 +1722,8 @@ impl IndicatorControls {
             ram_mode,
             cpu_identifier,
             ram_identifier,
-            icon_asset_store: IconAssetStore::for_current_user()
-                .expect("resolve the current user's indicator icon directory"),
+            thumbnail_assets,
+            reset_identifiers,
             labels_visible,
             label_spacing,
             labels_mode,
@@ -1643,13 +1776,13 @@ impl IndicatorControls {
             &preferences.identifiers.cpu,
             cpu_icon_error,
             cpu_icon_pending,
-            &self.icon_asset_store,
+            &self.thumbnail_assets,
         );
         self.ram_identifier.apply(
             &preferences.identifiers.ram,
             ram_icon_error,
             ram_icon_pending,
-            &self.icon_asset_store,
+            &self.thumbnail_assets,
         );
         self.cpu_mode
             .setSelectedSegment(match preferences.cpu_color.mode {
@@ -1694,6 +1827,36 @@ impl IndicatorControls {
             .setStringValue(&objc2_foundation::NSString::from_str(
                 preferences.labels.ram.as_str(),
             ));
+        let label_editing = LabelEditingPresentation::new(
+            preferences.identifiers.cpu.mode,
+            preferences.identifiers.ram.mode,
+        );
+        self.layout_views
+            .cpu_label_field
+            .setEnabled(label_editing.cpu_enabled());
+        self.layout_views.cpu_label_field.setAccessibilityHelp(
+            label_editing
+                .cpu_help()
+                .map(objc2_foundation::NSString::from_str)
+                .as_deref(),
+        );
+        self.layout_views
+            .ram_label_field
+            .setEnabled(label_editing.ram_enabled());
+        self.layout_views.ram_label_field.setAccessibilityHelp(
+            label_editing
+                .ram_help()
+                .map(objc2_foundation::NSString::from_str)
+                .as_deref(),
+        );
+        self.label_spacing
+            .setEnabled(label_editing.spacing_enabled());
+        self.label_spacing.setAccessibilityHelp(
+            label_editing
+                .spacing_help()
+                .map(objc2_foundation::NSString::from_str)
+                .as_deref(),
+        );
         self.label_spacing.setIntegerValue(
             isize::try_from(preferences.labels.spacing.spaces())
                 .expect("label spacing fits NSInteger"),
@@ -1726,10 +1889,8 @@ impl IndicatorControls {
             .setStringValue(&objc2_foundation::NSString::from_str(interval.text()));
         self.interval_stepper
             .setIntegerValue(interval.valid_interval().seconds().into());
-        set_inline_error(
-            &self.layout_views.interval_error,
-            interval.error().map(|error| error.message()),
-        );
+        let interval_error = interval.error().map(|error| error.message());
+        set_inline_error(&self.layout_views.interval_error, interval_error.as_deref());
         drop(interval);
 
         let cpu_state = ColorEditorState::from_preferences(preferences.cpu_color.fixed);
@@ -1758,6 +1919,8 @@ impl IndicatorControls {
             cpu_editor: cpu_fixed,
             ram_editor: ram_fixed,
             labels_editor: labels_fixed,
+            cpu_identifier_error: cpu_icon_error.is_some(),
+            ram_identifier_error: ram_icon_error.is_some(),
         };
         if self.layout_visibility.get() != Some(visibility) {
             self.apply_layout(visibility);
@@ -1815,14 +1978,14 @@ impl IndicatorControls {
                 MetricIdentifierMode::Text => self
                     .ram_identifier
                     .mode
-                    .setNextKeyView(Some(&self.labels_visible)),
+                    .setNextKeyView(Some(&self.reset_identifiers)),
                 MetricIdentifierMode::SystemSymbol => {
                     self.ram_identifier
                         .mode
                         .setNextKeyView(Some(&self.ram_identifier.symbol));
                     self.ram_identifier
                         .symbol
-                        .setNextKeyView(Some(&self.labels_visible));
+                        .setNextKeyView(Some(&self.reset_identifiers));
                 }
                 MetricIdentifierMode::Png => {
                     self.ram_identifier
@@ -1834,23 +1997,30 @@ impl IndicatorControls {
                             .setNextKeyView(Some(&self.ram_identifier.remove));
                         self.ram_identifier
                             .remove
-                            .setNextKeyView(Some(&self.labels_visible));
+                            .setNextKeyView(Some(&self.reset_identifiers));
                     } else {
                         self.ram_identifier
                             .choose_png
-                            .setNextKeyView(Some(&self.labels_visible));
+                            .setNextKeyView(Some(&self.reset_identifiers));
                     }
                 }
             }
+            self.reset_identifiers
+                .setNextKeyView(Some(&self.labels_visible));
+            let label_control = |target| -> &NSView {
+                match target {
+                    LabelEditingFocusTarget::CpuLabel => &self.layout_views.cpu_label_field,
+                    LabelEditingFocusTarget::RamLabel => &self.layout_views.ram_label_field,
+                    LabelEditingFocusTarget::Spacing => &self.label_spacing,
+                    LabelEditingFocusTarget::LabelColorMode => &self.labels_mode,
+                }
+            };
+            let label_focus_order = label_editing.focus_order();
             self.labels_visible
-                .setNextKeyView(Some(&self.layout_views.cpu_label_field));
-            self.layout_views
-                .cpu_label_field
-                .setNextKeyView(Some(&self.layout_views.ram_label_field));
-            self.layout_views
-                .ram_label_field
-                .setNextKeyView(Some(&self.label_spacing));
-            self.label_spacing.setNextKeyView(Some(&self.labels_mode));
+                .setNextKeyView(Some(label_control(label_focus_order[0])));
+            for link in label_focus_order.windows(2) {
+                label_control(link[0]).setNextKeyView(Some(label_control(link[1])));
+            }
             if labels_fixed {
                 self.labels_editor.configure_key_order(
                     &self.labels_mode,
@@ -1935,8 +2105,9 @@ impl IndicatorControls {
                 fallback.resolved_family
             )
         });
-        set_warning_text(
+        set_typography_warning(
             &self.layout_views.font_fallback_warning,
+            TypographyWarningKind::FontFallback,
             fallback_message.as_deref(),
         );
 
@@ -1957,7 +2128,11 @@ impl IndicatorControls {
             (false, true) => Some("Esta tipografia pode ocupar largura excessiva na menu bar."),
             (false, false) => None,
         };
-        set_warning_text(&self.layout_views.layout_warning, message);
+        set_typography_warning(
+            &self.layout_views.layout_warning,
+            TypographyWarningKind::Layout,
+            message,
+        );
     }
 
     fn apply_typography(&self, typography: &TypographyPreferences) {
@@ -2125,15 +2300,34 @@ fn segmented(
 
 fn heading(mtm: MainThreadMarker, title: &str, y: f64) -> Retained<NSTextField> {
     let field = NSTextField::labelWithString(&objc2_foundation::NSString::from_str(title), mtm);
-    field.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(92.0, 24.0)));
     field.setFont(Some(&NSFont::boldSystemFontOfSize(15.0)));
+    field.sizeToFit();
+    field.setFrame(NSRect::new(
+        NSPoint::new(0.0, y),
+        NSSize::new(fitted_heading_width(field.frame().size.width), 24.0),
+    ));
     field
+}
+
+fn fitted_heading_width(intrinsic_width: f64) -> f64 {
+    intrinsic_width.clamp(92.0, 378.0)
 }
 
 fn text_label(mtm: MainThreadMarker, title: &str, y: f64) -> Retained<NSTextField> {
     let field = NSTextField::labelWithString(&objc2_foundation::NSString::from_str(title), mtm);
     field.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(92.0, 24.0)));
     field
+}
+
+fn configure_interval_field(field: &NSTextField, format: IntervalFieldFormat) {
+    let formatter = NSNumberFormatter::init(NSNumberFormatter::alloc());
+    formatter.setNumberStyle(NSNumberFormatterStyle::DecimalStyle);
+    formatter.setAllowsFloats(format.allows_floats());
+    formatter.setUsesGroupingSeparator(format.uses_grouping_separator());
+    formatter.setMinimum(Some(&NSNumber::numberWithInteger(format.minimum().into())));
+    formatter.setMaximum(Some(&NSNumber::numberWithInteger(format.maximum().into())));
+    formatter.setPartialStringValidationEnabled(format.validates_partial_input());
+    field.setFormatter(Some(&formatter));
 }
 
 fn warning_label(mtm: MainThreadMarker, y: f64) -> Retained<NSTextField> {
@@ -2168,6 +2362,7 @@ fn configure_actions(
     ram_mode: &NSSegmentedControl,
     cpu_identifier: &MetricIdentifierControls,
     ram_identifier: &MetricIdentifierControls,
+    reset_identifiers: &NSButton,
     labels_visible: &NSButton,
     cpu_label_field: &NSTextField,
     ram_label_field: &NSTextField,
@@ -2227,6 +2422,10 @@ fn configure_actions(
             (
                 &*ram_identifier.remove as &objc2_app_kit::NSControl,
                 sel!(removeRamPng:),
+            ),
+            (
+                &**reset_identifiers as &objc2_app_kit::NSControl,
+                sel!(resetIdentifiers:),
             ),
             (
                 &**labels_visible as &objc2_app_kit::NSControl,
@@ -2309,20 +2508,32 @@ fn set_slider_value_text(slider: &NSSlider, value_label: &NSTextField, value: &s
 
 fn set_inline_error(field: &NSTextField, message: Option<&str>) {
     set_warning_text(field, message);
-    field.setAccessibilityLabel(message.map(objc2_foundation::NSString::from_str).as_deref());
+}
+
+fn set_typography_warning(field: &NSTextField, kind: TypographyWarningKind, message: Option<&str>) {
+    set_warning_text(field, kind.accessibility_label(message));
 }
 
 fn set_warning_text(field: &NSTextField, message: Option<&str>) {
     field.setStringValue(&objc2_foundation::NSString::from_str(message.unwrap_or("")));
+    field.setAccessibilityLabel(message.map(objc2_foundation::NSString::from_str).as_deref());
     field.setHidden(message.is_none());
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::path::PathBuf;
 
-    use super::{get_or_create_font_resources, IndicatorAreaVisibility};
-    use crate::macos::windows::preferences::PreferencesArea;
+    use statlet::icon_assets::IconAssetStore;
+    use statlet::indicator_preferences::MetricKind;
+    use statlet::preferences_view::PreferencesArea;
+    use statlet::runtime_profile::{BundleProfileMetadata, RuntimeProfile};
+
+    use super::{
+        fitted_heading_width, get_or_create_font_resources, png_panel_presentation,
+        IndicatorAreaVisibility,
+    };
 
     #[test]
     fn each_indicator_sidebar_destination_exposes_only_its_retained_controls() {
@@ -2379,5 +2590,67 @@ mod tests {
 
         assert_eq!((first, second), (7, 7));
         assert_eq!(creations.get(), 1);
+    }
+
+    #[test]
+    fn injected_store_drives_the_preferences_thumbnail_plan() {
+        let store = IconAssetStore::new(PathBuf::from(
+            "/Users/example/Library/Application Support/Statlet/Dev/task-a-0123456789ab/indicator-icons",
+        ));
+
+        let plan = super::ThumbnailAssetPlan::new(store);
+
+        assert_eq!(
+            plan.path_for(MetricKind::Cpu, true),
+            Some(PathBuf::from(
+                "/Users/example/Library/Application Support/Statlet/Dev/task-a-0123456789ab/indicator-icons/cpu.png"
+            ))
+        );
+        assert_eq!(plan.path_for(MetricKind::Cpu, false), None);
+    }
+
+    #[test]
+    fn production_png_panel_copy_remains_byte_for_byte_unchanged() {
+        let panel = png_panel_presentation(MetricKind::Cpu, &Default::default());
+
+        assert_eq!(panel.title, None);
+        assert_eq!(panel.prompt, "Escolher PNG");
+        assert_eq!(
+            panel.message,
+            "Escolha um PNG com transparência. O Statlet reduzirá e otimizará uma cópia."
+        );
+    }
+
+    #[test]
+    fn development_png_panel_identifies_the_profile_in_title_and_message() {
+        let profile = RuntimeProfile::resolve(BundleProfileMetadata {
+            bundle_identifier: Some(
+                "io.github.hayashirafael.Statlet.dev.task-a-0123456789ab".into(),
+            ),
+            runtime_profile: Some("development".into()),
+            dev_instance_id: Some("task-a-0123456789ab".into()),
+            dev_display_name: Some("Task A".into()),
+            dev_short_marker: Some("0123".into()),
+        })
+        .unwrap();
+
+        let panel = png_panel_presentation(MetricKind::Ram, &profile.presentation());
+
+        assert_eq!(
+            panel.title.as_deref(),
+            Some("Escolher PNG da RAM — Dev 0123: Task A")
+        );
+        assert_eq!(panel.prompt, "Escolher PNG");
+        assert_eq!(
+            panel.message,
+            "Statlet Dev — Task A (task-a-0123456789ab): Escolha um PNG com transparência. O Statlet reduzirá e otimizará uma cópia."
+        );
+    }
+
+    #[test]
+    fn heading_width_fits_its_intrinsic_content_without_reaching_neighbor_actions() {
+        assert_eq!(fitted_heading_width(60.0), 92.0);
+        assert_eq!(fitted_heading_width(120.0), 120.0);
+        assert_eq!(fitted_heading_width(420.0), 378.0);
     }
 }

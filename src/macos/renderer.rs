@@ -28,6 +28,7 @@ use statlet::indicator::{
 use statlet::indicator_preferences::{
     FontWeight, MetricKind, PngIconMetadata, TypographyPreferences,
 };
+use statlet::runtime_profile::RuntimePresentation;
 
 use super::fonts::{FontCatalog, FontResolution};
 
@@ -84,6 +85,7 @@ struct LayoutKey {
     weight: FontWeight,
     cpu_prefix: Option<String>,
     ram_prefix: Option<String>,
+    dev_marker: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,9 +132,14 @@ impl StatusRenderTarget for NSStatusBarButton {
     }
 }
 
-fn apply_status_metadata(target: &impl StatusMetadataTarget, scene: &IndicatorScene) {
-    target.set_accessibility_label(&scene.accessibility_label);
-    target.set_tooltip(&scene.accessibility_label);
+fn apply_status_metadata(
+    target: &impl StatusMetadataTarget,
+    scene: &IndicatorScene,
+    presentation: &RuntimePresentation,
+) {
+    let metadata = presentation.status_metadata(&scene.accessibility_label);
+    target.set_accessibility_label(&metadata);
+    target.set_tooltip(&metadata);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,6 +163,7 @@ struct PaintKey {
     top: Vec<RunIdentity>,
     bottom: Vec<RunIdentity>,
     badge: Option<RunIdentity>,
+    dev_marker: Option<RunIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -193,6 +201,15 @@ fn paint_decision(cached: Option<&PaintKey>, requested: &PaintKey) -> PaintDecis
 }
 
 fn paint_key(scene: &IndicatorScene, layout: LayoutKey, appearance: String) -> PaintKey {
+    let dev_marker = layout.dev_marker.as_ref().map(|text| {
+        run_identity(
+            &IndicatorRun {
+                text: text.clone(),
+                color: SegmentColor::Semantic(SemanticColor::Neutral),
+            },
+            &appearance,
+        )
+    });
     PaintKey {
         layout,
         top_identifier: scene
@@ -209,6 +226,7 @@ fn paint_key(scene: &IndicatorScene, layout: LayoutKey, appearance: String) -> P
             .disk_badge
             .as_ref()
             .map(|run| run_identity(run, &appearance)),
+        dev_marker,
     }
 }
 
@@ -234,8 +252,24 @@ impl PaintKey {
                 .iter()
                 .chain(&self.bottom)
                 .chain(self.badge.iter())
+                .chain(self.dev_marker.iter())
                 .any(|run| matches!(run.paint, PaintIdentity::Semantic { .. }))
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StatusMarkerPlan {
+    text: Option<String>,
+    extra_width: f64,
+}
+
+fn status_marker_plan(
+    presentation: &RuntimePresentation,
+    measure: impl FnOnce(&str) -> f64,
+) -> StatusMarkerPlan {
+    let text = presentation.dev_marker().map(|marker| format!(" {marker}"));
+    let extra_width = text.as_deref().map_or(0.0, measure);
+    StatusMarkerPlan { text, extra_width }
 }
 
 fn identifier_identity(
@@ -586,6 +620,7 @@ pub struct Renderer {
     cache: SurfaceCache<Retained<NSImage>>,
     identifier_images: IdentifierImageCache<Retained<NSImage>>,
     icon_asset_store: IconAssetStore,
+    presentation: RuntimePresentation,
     default_width: f64,
     font_resolutions: usize,
     measurers: usize,
@@ -593,12 +628,16 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new() -> Self {
+    pub fn new(icon_asset_store: IconAssetStore, presentation: RuntimePresentation) -> Self {
         let marker = MainThreadMarker::new().expect("Renderer must be created on the main thread");
-        Self::with_main_thread_marker(marker)
+        Self::with_main_thread_marker(marker, icon_asset_store, presentation)
     }
 
-    pub fn with_main_thread_marker(marker: MainThreadMarker) -> Self {
+    pub fn with_main_thread_marker(
+        marker: MainThreadMarker,
+        icon_asset_store: IconAssetStore,
+        presentation: RuntimePresentation,
+    ) -> Self {
         let font_catalog = FontCatalog::new(marker);
         let default_typography =
             statlet::indicator_preferences::IndicatorPreferences::default().typography;
@@ -620,8 +659,8 @@ impl Renderer {
             attributes: AttributeCache::default(),
             cache: SurfaceCache::default(),
             identifier_images: IdentifierImageCache::default(),
-            icon_asset_store: IconAssetStore::for_current_user()
-                .expect("resolve the current user's indicator icon directory"),
+            icon_asset_store,
+            presentation,
             default_width,
             font_resolutions: 1,
             measurers: 1,
@@ -641,12 +680,21 @@ impl Renderer {
         let measurer = resolved.measurer;
         let cpu_prefix = metric_prefix(&scene.top, scene.top_identifier.as_ref());
         let ram_prefix = metric_prefix(&scene.bottom, scene.bottom_identifier.as_ref());
+        let marker_plan = if slot == RenderSlot::Status {
+            status_marker_plan(&self.presentation, |text| measurer.width(text))
+        } else {
+            StatusMarkerPlan {
+                text: None,
+                extra_width: 0.0,
+            }
+        };
         let layout_key = LayoutKey {
             resolved_family: font.resolved_family.clone(),
             size: typography.size.points(),
             weight: typography.weight,
             cpu_prefix,
             ram_prefix,
+            dev_marker: marker_plan.text.clone(),
         };
         let layout = self.cache.resolve_layout(slot, &layout_key, || {
             measure_stable_layout_with_prefixes(
@@ -689,8 +737,11 @@ impl Renderer {
             &font.font,
             &measurer,
             layout,
-            appearance,
             &mut self.attributes,
+            ImageRenderEnvironment {
+                appearance,
+                marker: marker_plan,
+            },
         );
         self.images += 1;
 
@@ -714,7 +765,7 @@ impl Renderer {
     ) -> LayoutDiagnostics {
         let output = self.render(RenderSlot::Status, scene, typography, appearance);
         target.set_status_image(&output.image);
-        apply_status_metadata(target, scene);
+        apply_status_metadata(target, scene, &self.presentation);
         output.layout
     }
 
@@ -836,21 +887,29 @@ struct IdentifierImages<'a> {
     bottom: Option<&'a NSImage>,
 }
 
+struct ImageRenderEnvironment<'a> {
+    appearance: &'a NSAppearance,
+    marker: StatusMarkerPlan,
+}
+
 fn draw_image(
     scene: &IndicatorScene,
     identifier_images: IdentifierImages<'_>,
     font: &NSFont,
     measurer: &FontTextMeasurer,
     layout: StableLayout,
-    appearance: &NSAppearance,
     attributes: &mut AttributeCache,
+    environment: ImageRenderEnvironment<'_>,
 ) -> Retained<NSImage> {
+    let appearance = environment.appearance;
+    let marker = environment.marker;
     let rendered = RefCell::new(None);
     let attributes = RefCell::new(attributes);
     let appearance_name = appearance.name().to_string();
     let draw = StackBlock::new(|| {
         let badge = scene.disk_badge.as_ref().map(|run| run.text.as_str());
-        let width = layout.width_for_badge(badge).ceil();
+        let content_width = layout.width_for_badge(badge);
+        let width = (content_width + marker.extra_width).ceil();
         let image = NSImage::initWithSize(
             NSImage::alloc(),
             NSSize {
@@ -895,6 +954,21 @@ fn draw_image(
                         x: layout.base_width(),
                         y: margin + cap_height + LINE_GAP - descent,
                     });
+            }
+            if let Some(marker) = &marker.text {
+                attributed_scene_run(
+                    text.font,
+                    &IndicatorRun {
+                        text: marker.clone(),
+                        color: SegmentColor::Semantic(SemanticColor::Neutral),
+                    },
+                    text.attributes,
+                    text.appearance_name,
+                )
+                .drawAtPoint(NSPoint {
+                    x: content_width,
+                    y: (HEIGHT - cap_height) / 2.0 - descent,
+                });
             }
             image.unlockFocus();
         }
@@ -942,7 +1016,13 @@ fn draw_metric_line(
         };
         let prefix_width = context.measurer.width(fallback_text);
         if let Some(image) = identifier_image {
-            draw_metric_identifier(image, y, prefix_width, context);
+            draw_metric_identifier(
+                image,
+                y,
+                prefix_width,
+                matches!(identifier, MetricIdentifierVisual::SystemSymbol { .. }),
+                context,
+            );
         } else {
             attributed_scene_run(
                 context.font,
@@ -1010,19 +1090,64 @@ fn draw_metric_identifier(
     image: &NSImage,
     y: f64,
     prefix_width: f64,
+    is_system_symbol: bool,
     context: &DrawTextContext<'_>,
 ) {
     let spacing = context.measurer.width(" ");
-    let available_width = (prefix_width - spacing).max(1.0);
     let available_height = context.font.capHeight().max(1.0);
     let source = image.size();
-    let scale =
-        (available_width / source.width.max(1.0)).min(available_height / source.height.max(1.0));
-    let size = NSSize::new(source.width * scale, source.height * scale);
+    let rect = identifier_draw_rect(
+        source.width,
+        source.height,
+        prefix_width,
+        available_height,
+        spacing,
+        y,
+        is_system_symbol,
+    );
     image.drawInRect(NSRect::new(
-        NSPoint::new((available_width - size.width) / 2.0, y),
-        size,
+        NSPoint::new(rect.x, rect.y),
+        NSSize::new(rect.width, rect.height),
     ));
+}
+
+struct IdentifierDrawRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+fn identifier_draw_rect(
+    source_width: f64,
+    source_height: f64,
+    prefix_width: f64,
+    line_height: f64,
+    spacing: f64,
+    y: f64,
+    is_system_symbol: bool,
+) -> IdentifierDrawRect {
+    let (drawing_width, horizontal_width) = if is_system_symbol {
+        (line_height.max(1.0), prefix_width)
+    } else {
+        let width = (prefix_width - spacing).max(1.0);
+        (width, width)
+    };
+    let drawing_height = line_height.max(1.0);
+    let scale =
+        (drawing_width / source_width.max(1.0)).min(drawing_height / source_height.max(1.0));
+    let width = source_width * scale;
+    let height = source_height * scale;
+    IdentifierDrawRect {
+        x: (horizontal_width - width) / 2.0,
+        y: y + if is_system_symbol {
+            (drawing_height - height) / 2.0
+        } else {
+            0.0
+        },
+        width,
+        height,
+    }
 }
 
 fn create_system_symbol_image(
@@ -1204,6 +1329,32 @@ mod tests {
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use tempfile::tempdir;
 
+    fn production_renderer(marker: MainThreadMarker) -> Renderer {
+        Renderer::with_main_thread_marker(
+            marker,
+            IconAssetStore::new(std::path::PathBuf::from(
+                "/nonexistent/statlet-renderer-test-icons",
+            )),
+            RuntimePresentation::default(),
+        )
+    }
+
+    fn development_presentation() -> RuntimePresentation {
+        statlet::runtime_profile::RuntimeProfile::resolve(
+            statlet::runtime_profile::BundleProfileMetadata {
+                bundle_identifier: Some(
+                    "io.github.hayashirafael.Statlet.dev.task-a-0123456789ab".into(),
+                ),
+                runtime_profile: Some("development".into()),
+                dev_instance_id: Some("task-a-0123456789ab".into()),
+                dev_display_name: Some("Task A".into()),
+                dev_short_marker: Some("0123".into()),
+            },
+        )
+        .unwrap()
+        .presentation()
+    }
+
     use statlet::indicator::{
         has_low_text_contrast, measure_stable_layout, IndicatorRun, IndicatorScene,
         MetricIdentifierVisual, PreviewBackground, SegmentColor, SemanticColor, TextMeasurer,
@@ -1281,8 +1432,11 @@ mod tests {
             return;
         };
         let directory = tempdir().unwrap();
-        let mut renderer = Renderer::with_main_thread_marker(marker);
-        renderer.icon_asset_store = IconAssetStore::new(directory.path().to_path_buf());
+        let mut renderer = Renderer::with_main_thread_marker(
+            marker,
+            IconAssetStore::new(directory.path().to_path_buf()),
+            RuntimePresentation::default(),
+        );
         let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
         let mut scene = scene_with_lines(&["42%"], &["R ", "68%"]);
         scene.top_identifier = Some(MetricIdentifierVisual::Png {
@@ -1306,8 +1460,11 @@ mod tests {
             return;
         };
         let directory = tempdir().unwrap();
-        let mut renderer = Renderer::with_main_thread_marker(marker);
-        renderer.icon_asset_store = IconAssetStore::new(directory.path().to_path_buf());
+        let mut renderer = Renderer::with_main_thread_marker(
+            marker,
+            IconAssetStore::new(directory.path().to_path_buf()),
+            RuntimePresentation::default(),
+        );
         let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
         let mut scene = scene_with_lines(&["42%"], &["R ", "68%"]);
         scene.top_identifier = Some(MetricIdentifierVisual::Png {
@@ -1331,7 +1488,7 @@ mod tests {
             .write_to(&mut bytes, ImageFormat::Png)
             .unwrap();
         let bytes = bytes.into_inner();
-        fs::write(renderer.icon_asset_store.path_for(MetricKind::Cpu), &bytes).unwrap();
+        fs::write(directory.path().join("cpu.png"), &bytes).unwrap();
 
         renderer.invalidate_semantic_colors();
         let redraw = renderer.render(RenderSlot::Status, &scene, &typography, &dark);
@@ -1404,6 +1561,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn system_symbol_draw_rect_uses_a_line_height_square_box() {
+        let rect = identifier_draw_rect(12.0, 12.0, 12.0, 10.0, 4.0, 2.0, true);
+
+        assert_eq!(rect.x, 1.0);
+        assert_eq!(rect.y, 2.0);
+        assert_eq!(rect.width, 10.0);
+        assert_eq!(rect.height, 10.0);
+    }
+
+    #[test]
+    fn png_draw_rect_keeps_the_legacy_prefix_width_limit() {
+        let rect = identifier_draw_rect(12.0, 12.0, 11.0, 10.0, 4.0, 2.0, false);
+
+        assert_eq!(rect.x, 0.0);
+        assert_eq!(rect.y, 2.0);
+        assert_eq!(rect.width, 7.0);
+        assert_eq!(rect.height, 7.0);
+    }
+
     fn layout_key(family: &str, labels_visible: bool) -> LayoutKey {
         LayoutKey {
             resolved_family: family.to_owned(),
@@ -1411,6 +1588,7 @@ mod tests {
             weight: FontWeight::Medium,
             cpu_prefix: labels_visible.then(|| "C ".to_owned()),
             ram_prefix: labels_visible.then(|| "R ".to_owned()),
+            dev_marker: None,
         }
     }
 
@@ -1561,7 +1739,7 @@ mod tests {
 
         let target = FakeStatusTarget::default();
 
-        apply_status_metadata(&target, &scene);
+        apply_status_metadata(&target, &scene, &RuntimePresentation::default());
 
         assert_eq!(
             target.accessibility_label.borrow().as_deref(),
@@ -1571,6 +1749,111 @@ mod tests {
             target.tooltip.borrow().as_deref(),
             Some(scene.accessibility_label.as_str())
         );
+    }
+
+    #[test]
+    fn development_status_metadata_identifies_the_bundle_in_tooltip_and_accessibility() {
+        let scene = scene_with_lines(&["42%"], &["68%"]);
+        let presentation = development_presentation();
+        let target = FakeStatusTarget::default();
+
+        apply_status_metadata(&target, &scene, &presentation);
+
+        let expected = format!(
+            "Statlet Dev — Task A (task-a-0123456789ab): {}",
+            scene.accessibility_label
+        );
+        assert_eq!(
+            target.accessibility_label.borrow().as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(target.tooltip.borrow().as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn development_marker_has_its_own_status_image_column_beside_the_disk_badge() {
+        let production =
+            status_marker_plan(&RuntimePresentation::default(), |text| text.len() as f64);
+        let development = status_marker_plan(&development_presentation(), |text| text.len() as f64);
+
+        assert_eq!(production.text, None);
+        assert_eq!(production.extra_width, 0.0);
+        assert_eq!(development.text.as_deref(), Some(" D:0123"));
+        assert_eq!(development.extra_width, 7.0);
+    }
+
+    #[test]
+    fn development_marker_participates_in_semantic_paint_and_surface_cache_identity() {
+        let scene = scene_with_lines(&["C 42%"], &["R 68%"]);
+        let mut marked_layout = layout_key("Menlo", true);
+        marked_layout.dev_marker = Some(" D:0123".to_owned());
+        let paint_keys = [
+            "NSAppearanceNameAqua",
+            "NSAppearanceNameDarkAqua",
+            "NSAppearanceNameAccessibilityHighContrastAqua",
+            "NSAppearanceNameAccessibilityHighContrastDarkAqua",
+        ]
+        .map(|appearance| paint_key(&scene, marked_layout.clone(), appearance.to_owned()));
+        let aqua = &paint_keys[0];
+
+        assert_eq!(
+            aqua.dev_marker.as_ref().map(|marker| marker.text.as_str()),
+            Some(" D:0123")
+        );
+        assert!(paint_keys.iter().all(PaintKey::uses_semantic_color));
+        for (index, key) in paint_keys.iter().enumerate() {
+            assert!(paint_keys.iter().skip(index + 1).all(|other| other != key));
+        }
+
+        let layout = measure_stable_layout(&CountingMeasurer::new(), true, 40.0);
+        let mut cache = SurfaceCache::default();
+        cache.replace(
+            RenderSlot::Status,
+            marked_layout,
+            layout,
+            aqua.clone(),
+            TestEntry(7),
+        );
+        for requested in &paint_keys[1..] {
+            assert_eq!(cache.reused_image(RenderSlot::Status, requested), None);
+        }
+    }
+
+    #[test]
+    fn development_marker_renders_in_standard_and_high_contrast_appearances() {
+        let Some(marker) = MainThreadMarker::new() else {
+            eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
+            return;
+        };
+        let icon_root = tempdir().unwrap();
+        let mut production = Renderer::with_main_thread_marker(
+            marker,
+            IconAssetStore::new(icon_root.path().join("production")),
+            RuntimePresentation::default(),
+        );
+        let mut development = Renderer::with_main_thread_marker(
+            marker,
+            IconAssetStore::new(icon_root.path().join("development")),
+            development_presentation(),
+        );
+        let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
+        let scene = scene_with_lines(&["C 42%"], &["R 68%"]);
+        let appearances = [
+            unsafe { objc2_app_kit::NSAppearanceNameAqua },
+            unsafe { objc2_app_kit::NSAppearanceNameDarkAqua },
+            unsafe { objc2_app_kit::NSAppearanceNameAccessibilityHighContrastAqua },
+            unsafe { objc2_app_kit::NSAppearanceNameAccessibilityHighContrastDarkAqua },
+        ];
+
+        for name in appearances {
+            let appearance = NSAppearance::appearanceNamed(name).unwrap();
+            let production_output =
+                production.render(RenderSlot::Status, &scene, &typography, &appearance);
+            let development_output =
+                development.render(RenderSlot::Status, &scene, &typography, &appearance);
+
+            assert!(development_output.image.size().width > production_output.image.size().width);
+        }
     }
 
     #[derive(Default)]
@@ -1602,7 +1885,7 @@ mod tests {
             eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
             return;
         };
-        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let mut renderer = production_renderer(marker);
         let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
         let scene = scene_with_color(SegmentColor::Semantic(SemanticColor::Warning));
         let aqua =
@@ -1624,7 +1907,7 @@ mod tests {
             eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
             return;
         };
-        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let mut renderer = production_renderer(marker);
         let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
         let scene = IndicatorScene {
             top: vec![IndicatorRun {
@@ -1689,7 +1972,7 @@ mod tests {
             eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
             return;
         };
-        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let mut renderer = production_renderer(marker);
         let mut typography =
             statlet::indicator_preferences::IndicatorPreferences::default().typography;
         typography.size = statlet::indicator_preferences::FontSize::try_from(13).unwrap();
@@ -1722,7 +2005,7 @@ mod tests {
             eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
             return;
         };
-        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let mut renderer = production_renderer(marker);
         let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
         let fixed = SegmentColor::Srgb(SrgbColor::parse_hex("#AF52DE").unwrap());
         let scene = scene_with_color(fixed);
@@ -1751,7 +2034,7 @@ mod tests {
             eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
             return;
         };
-        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let mut renderer = production_renderer(marker);
         let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
         let scene = scene_with_color(SegmentColor::Semantic(SemanticColor::Warning));
         let aqua =
@@ -1778,7 +2061,7 @@ mod tests {
             eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
             return;
         };
-        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let mut renderer = production_renderer(marker);
         let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
         let aqua =
             NSAppearance::appearanceNamed(unsafe { objc2_app_kit::NSAppearanceNameAqua }).unwrap();
@@ -1803,7 +2086,7 @@ mod tests {
             eprintln!("SKIP: AppKit rendering requires a main-thread test marker");
             return;
         };
-        let mut renderer = Renderer::with_main_thread_marker(marker);
+        let mut renderer = production_renderer(marker);
         let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
         let scene = scene_with_lines(&["C 42%"], &["R 68%"]);
         let aqua =

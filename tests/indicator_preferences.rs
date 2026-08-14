@@ -1,6 +1,6 @@
 use statlet::indicator_preferences::{
     FontFamilyPreference, FontSize, IndicatorAppearance, IndicatorPreferenceGroup,
-    IndicatorPreferences, LabelColorMode, MetricsRefreshInterval, SrgbColor,
+    IndicatorPreferences, LabelColorMode, MetricIdentifierMode, MetricsRefreshInterval, SrgbColor,
 };
 
 #[test]
@@ -32,6 +32,12 @@ fn bounded_values_accept_only_the_approved_ranges() {
     assert!(MetricsRefreshInterval::try_from(0).is_err());
     assert_eq!(MetricsRefreshInterval::try_from(60).unwrap().seconds(), 60);
     assert!(MetricsRefreshInterval::try_from(61).is_err());
+}
+
+#[test]
+fn refresh_interval_exposes_its_canonical_limits() {
+    assert_eq!(MetricsRefreshInterval::MIN_SECONDS, 1);
+    assert_eq!(MetricsRefreshInterval::MAX_SECONDS, 60);
 }
 
 #[test]
@@ -92,4 +98,26 @@ fn reset_leaves_other_indicator_groups_unchanged() {
     assert!(!value.labels.visible);
     assert_eq!(value.labels.color_mode, LabelColorMode::Fixed);
     assert_eq!(value.refresh_interval.seconds(), 7);
+}
+
+#[test]
+fn color_and_identifier_resets_have_separate_scopes() {
+    let mut value = IndicatorPreferences::default();
+    value.cpu_color.fixed.set_variants_enabled(true);
+    value.cpu_color.mode = statlet::indicator_preferences::MetricColorMode::Fixed;
+    value.identifiers.cpu.mode = MetricIdentifierMode::SystemSymbol;
+    let identifiers = value.identifiers.clone();
+
+    value.reset(IndicatorPreferenceGroup::CpuAndRam);
+
+    assert_eq!(value.cpu_color, IndicatorPreferences::default().cpu_color);
+    assert_eq!(value.identifiers, identifiers);
+
+    value.reset(IndicatorPreferenceGroup::Identifiers);
+
+    assert_eq!(
+        value.identifiers,
+        IndicatorPreferences::default().identifiers
+    );
+    assert_eq!(value.cpu_color, IndicatorPreferences::default().cpu_color);
 }
