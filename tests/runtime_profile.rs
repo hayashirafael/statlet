@@ -155,6 +155,63 @@ fn development_profile_rejects_storage_overrides_into_production_namespace() {
 }
 
 #[test]
+fn development_profile_rejects_default_storage_root_symlinked_to_production() {
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    let dev_root = home.join("Library/Application Support/Statlet/Dev");
+    fs::create_dir_all(&dev_root).unwrap();
+    symlink("..", dev_root.join("task-a-0123456789ab")).unwrap();
+    let profile = RuntimeProfile::resolve(BundleProfileMetadata {
+        bundle_identifier: Some("io.github.hayashirafael.Statlet.dev.task-a-0123456789ab".into()),
+        runtime_profile: Some("development".into()),
+        dev_instance_id: Some("task-a-0123456789ab".into()),
+        dev_display_name: Some("Task A".into()),
+        dev_short_marker: Some("0123".into()),
+    })
+    .unwrap();
+
+    let result = profile.storage(&home, StorageOverrides::default());
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn development_profile_returns_resolved_safe_storage_override() {
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    let safe_storage = directory.path().join("safe-storage");
+    fs::create_dir_all(&safe_storage).unwrap();
+    let safe_alias = directory.path().join("safe-alias");
+    symlink(&safe_storage, &safe_alias).unwrap();
+    let profile = RuntimeProfile::resolve(BundleProfileMetadata {
+        bundle_identifier: Some("io.github.hayashirafael.Statlet.dev.task-a-0123456789ab".into()),
+        runtime_profile: Some("development".into()),
+        dev_instance_id: Some("task-a-0123456789ab".into()),
+        dev_display_name: Some("Task A".into()),
+        dev_short_marker: Some("0123".into()),
+    })
+    .unwrap();
+
+    let storage = profile
+        .storage(
+            &home,
+            StorageOverrides {
+                preferences_path: Some(safe_alias.join("preferences.json")),
+                icon_assets_directory: None,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        storage.preferences_path,
+        safe_storage
+            .canonicalize()
+            .unwrap()
+            .join("preferences.json")
+    );
+}
+
+#[test]
 fn development_profile_rejects_preferences_symlink_to_existing_production_file() {
     let directory = tempdir().unwrap();
     let home = directory.path().join("home");
@@ -330,7 +387,7 @@ fn runtime_profile_manifest_validation_fails_closed() {
 }
 
 #[test]
-fn explicit_storage_overrides_are_preserved_outside_the_production_namespace() {
+fn explicit_storage_overrides_resolve_outside_the_production_namespace() {
     let profile = RuntimeProfile::resolve(BundleProfileMetadata {
         bundle_identifier: Some("io.github.hayashirafael.Statlet.dev.task-a-0123456789ab".into()),
         runtime_profile: Some("development".into()),
@@ -349,13 +406,17 @@ fn explicit_storage_overrides_are_preserved_outside_the_production_namespace() {
         )
         .unwrap();
 
+    let resolved_external_root = PathBuf::from("/tmp")
+        .canonicalize()
+        .unwrap()
+        .join("statlet-a");
     assert_eq!(
         storage.preferences_path,
-        PathBuf::from("/tmp/statlet-a/preferences.json")
+        resolved_external_root.join("preferences.json")
     );
     assert_eq!(
         storage.icon_assets_directory,
-        PathBuf::from("/tmp/statlet-a/icons")
+        resolved_external_root.join("icons")
     );
     assert_eq!(
         storage.history_path,

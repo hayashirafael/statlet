@@ -97,7 +97,20 @@ impl RuntimeProfile {
         let production_root = home.join("Library/Application Support/Statlet");
         let root = match self {
             Self::Production => production_root.clone(),
-            Self::Development(identity) => production_root.join("Dev").join(&identity.instance_id),
+            Self::Development(identity) => {
+                let profile_root = production_root.join("Dev").join(&identity.instance_id);
+                let resolved_production_root = resolve_with_existing_ancestor(&production_root)?;
+                let resolved_profile_root = resolve_with_existing_ancestor(&profile_root)?;
+                let expected_profile_root = resolved_production_root
+                    .join("Dev")
+                    .join(&identity.instance_id);
+                if resolved_profile_root != expected_profile_root {
+                    return Err(RuntimeProfileError(
+                        "development storage cannot use the production namespace".into(),
+                    ));
+                }
+                resolved_profile_root
+            }
         };
         let preferences_path = overrides
             .preferences_path
@@ -133,6 +146,7 @@ impl RuntimeProfile {
                     "development storage cannot use the production namespace".into(),
                 ));
             }
+            return Ok(resolved_override);
         }
         Ok(normalized)
     }
