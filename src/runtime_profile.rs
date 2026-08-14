@@ -122,13 +122,17 @@ impl RuntimeProfile {
         profile_root: &Path,
     ) -> Result<PathBuf, RuntimeProfileError> {
         let normalized = lexically_normalize_absolute(path)?;
-        if matches!(self, Self::Development(_))
-            && normalized.starts_with(production_root)
-            && !normalized.starts_with(profile_root)
-        {
-            return Err(RuntimeProfileError(
-                "development storage cannot use the production namespace".into(),
-            ));
+        if matches!(self, Self::Development(_)) {
+            let resolved_override = resolve_with_existing_ancestor(&normalized)?;
+            let resolved_production_root = resolve_with_existing_ancestor(production_root)?;
+            let resolved_profile_root = resolve_with_existing_ancestor(profile_root)?;
+            if resolved_override.starts_with(resolved_production_root)
+                && !resolved_override.starts_with(resolved_profile_root)
+            {
+                return Err(RuntimeProfileError(
+                    "development storage cannot use the production namespace".into(),
+                ));
+            }
         }
         Ok(normalized)
     }
@@ -145,6 +149,10 @@ impl RuntimeProfile {
 
 impl RuntimePresentation {
     pub fn window_title(&self, production_title: &str) -> String {
+        self.development_title(production_title)
+    }
+
+    fn development_title(&self, production_title: &str) -> String {
         self.development.as_ref().map_or_else(
             || production_title.to_owned(),
             |identity| {
@@ -184,15 +192,7 @@ impl RuntimePresentation {
     }
 
     pub fn notification_title(&self, production_title: &str) -> String {
-        self.development.as_ref().map_or_else(
-            || production_title.to_owned(),
-            |identity| {
-                format!(
-                    "{production_title} — Dev {}: {}",
-                    identity.short_marker, identity.display_name
-                )
-            },
-        )
+        self.development_title(production_title)
     }
 
     pub fn notification_request_id(&self, production_id: &str) -> String {
@@ -231,6 +231,40 @@ fn lexically_normalize_absolute(path: &Path) -> Result<PathBuf, RuntimeProfileEr
         }
     }
     Ok(normalized)
+}
+
+fn resolve_with_existing_ancestor(path: &Path) -> Result<PathBuf, RuntimeProfileError> {
+    let normalized = lexically_normalize_absolute(path)?;
+    let mut candidate = normalized.as_path();
+    let mut missing_components = Vec::new();
+
+    loop {
+        match candidate.canonicalize() {
+            Ok(mut resolved) => {
+                for component in missing_components.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match candidate.symlink_metadata() {
+                    Ok(_) => return Err(unresolvable_storage_path()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(unresolvable_storage_path()),
+                }
+                let component = candidate
+                    .file_name()
+                    .ok_or_else(unresolvable_storage_path)?;
+                missing_components.push(component.to_os_string());
+                candidate = candidate.parent().ok_or_else(unresolvable_storage_path)?;
+            }
+            Err(_) => return Err(unresolvable_storage_path()),
+        }
+    }
+}
+
+fn unresolvable_storage_path() -> RuntimeProfileError {
+    RuntimeProfileError("storage path cannot be resolved safely".into())
 }
 
 fn valid_instance_id(instance_id: &str) -> bool {

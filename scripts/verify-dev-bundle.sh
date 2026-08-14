@@ -60,4 +60,3 @@ grep -Fq "Apache License" "$app/Contents/Resources/LICENSE"
 grep -Fq "Statlet third-party licenses" "$app/Contents/Resources/THIRD_PARTY_LICENSES.html"
 
 echo "Verified Statlet Dev bundle: $instance_id, version $cargo_version, macOS 14+, arm64, ad-hoc hardened-runtime"
-

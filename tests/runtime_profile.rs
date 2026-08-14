@@ -1,8 +1,11 @@
+use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
 use statlet::runtime_profile::{
     BundleProfileMetadata, RuntimeProfile, StorageOverrides, PRODUCTION_BUNDLE_IDENTIFIER,
 };
+use tempfile::tempdir;
 
 #[test]
 fn production_profile_preserves_storage_and_presentation_byte_for_byte() {
@@ -145,6 +148,64 @@ fn development_profile_rejects_storage_overrides_into_production_namespace() {
                 "/Users/example/Library/Application Support/Statlet/preferences.json",
             )),
             icon_assets_directory: None,
+        },
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn development_profile_rejects_preferences_symlink_to_existing_production_file() {
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    let production_root = home.join("Library/Application Support/Statlet");
+    fs::create_dir_all(&production_root).unwrap();
+    let production_preferences = production_root.join("preferences.json");
+    fs::write(&production_preferences, "{}").unwrap();
+    let preferences_alias = directory.path().join("preferences-alias.json");
+    symlink(&production_preferences, &preferences_alias).unwrap();
+    let profile = RuntimeProfile::resolve(BundleProfileMetadata {
+        bundle_identifier: Some("io.github.hayashirafael.Statlet.dev.task-a-0123456789ab".into()),
+        runtime_profile: Some("development".into()),
+        dev_instance_id: Some("task-a-0123456789ab".into()),
+        dev_display_name: Some("Task A".into()),
+        dev_short_marker: Some("0123".into()),
+    })
+    .unwrap();
+
+    let result = profile.storage(
+        &home,
+        StorageOverrides {
+            preferences_path: Some(preferences_alias),
+            icon_assets_directory: None,
+        },
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn development_profile_rejects_missing_assets_leaf_beneath_production_symlink() {
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    let production_root = home.join("Library/Application Support/Statlet");
+    fs::create_dir_all(&production_root).unwrap();
+    let production_alias = directory.path().join("production-alias");
+    symlink(&production_root, &production_alias).unwrap();
+    let profile = RuntimeProfile::resolve(BundleProfileMetadata {
+        bundle_identifier: Some("io.github.hayashirafael.Statlet.dev.task-a-0123456789ab".into()),
+        runtime_profile: Some("development".into()),
+        dev_instance_id: Some("task-a-0123456789ab".into()),
+        dev_display_name: Some("Task A".into()),
+        dev_short_marker: Some("0123".into()),
+    })
+    .unwrap();
+
+    let result = profile.storage(
+        &home,
+        StorageOverrides {
+            preferences_path: None,
+            icon_assets_directory: Some(production_alias.join("indicator-icons")),
         },
     );
 
