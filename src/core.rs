@@ -4,10 +4,11 @@ use std::time::Duration;
 use crate::disk::DiskObservation;
 use crate::history::HistoryEventKind;
 use crate::indicator_preferences::{
-    AppearanceColors, FontFamilyPreference, FontSize, FontWeight, IndicatorAppearance,
-    IndicatorLabel, IndicatorPreferenceGroup, IndicatorPreferences, LabelColorMode, LabelSpacing,
-    MetricColorMode, MetricColorPreferences, MetricIdentifierMode, MetricIdentifierPreferences,
-    MetricKind, MetricsRefreshInterval, PngIconMetadata, SrgbColor, SystemSymbolName,
+    AppearanceColors, FontFamilyPreference, FontSize, FontWeight, IdentifierPreferences,
+    IndicatorAppearance, IndicatorLabel, IndicatorPreferenceGroup, IndicatorPreferences,
+    LabelColorMode, LabelSpacing, MetricColorMode, MetricColorPreferences, MetricIdentifierMode,
+    MetricIdentifierPreferences, MetricKind, MetricsRefreshInterval, PngIconMetadata, SrgbColor,
+    SystemSymbolName,
 };
 use crate::mole::MoleStatus;
 use crate::system_usage::SystemUsageSection;
@@ -148,6 +149,12 @@ pub enum AppEvent {
         metric: MetricKind,
         message: String,
     },
+    IdentifierResetPersistenceFailed {
+        previous: IdentifierPreferences,
+        message: String,
+    },
+    GlobalIndicatorResetPersistenceFailed(Box<GlobalIndicatorResetFailure>),
+    GlobalIndicatorUndoPersistenceFailed(Box<GlobalIndicatorUndoFailure>),
     UpdateIndicator(IndicatorPreferenceChange),
     ResetIndicatorGroup(IndicatorPreferenceGroup),
     ResetIndicatorConfirmed,
@@ -167,6 +174,27 @@ pub enum PreferencesSaveStatus {
 pub enum PreferencesSaveResult {
     Saved,
     Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalIndicatorResetFailure {
+    pub previous: IndicatorPreferences,
+    pub replaced_undo: Option<IndicatorPreferences>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalIndicatorUndoFailure {
+    pub current: IndicatorPreferences,
+    pub undo: IndicatorPreferences,
+    pub message: String,
+    pub stage: GlobalIndicatorUndoFailureStage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GlobalIndicatorUndoFailureStage {
+    AssetPreparation,
+    Persistence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -268,6 +296,24 @@ pub enum AppEffect {
         metric: MetricKind,
         mutation: MetricPngAssetMutation,
         previous: MetricIdentifierPreferences,
+        preferences: Preferences,
+    },
+    PersistIdentifierReset {
+        previous: IdentifierPreferences,
+        preferences: Preferences,
+    },
+    PersistGlobalIndicatorReset {
+        previous: IndicatorPreferences,
+        replaced_undo: Option<IndicatorPreferences>,
+        preferences: Preferences,
+    },
+    PersistGlobalIndicatorUndo {
+        current: IndicatorPreferences,
+        undo: IndicatorPreferences,
+        preferences: Preferences,
+    },
+    DiscardGlobalIndicatorUndo {
+        discarded: IndicatorPreferences,
         preferences: Preferences,
     },
     Quit,
@@ -637,6 +683,55 @@ impl StatletCore {
                 );
                 Vec::new()
             }
+            AppEvent::IdentifierResetPersistenceFailed { previous, message } => {
+                let affected = [
+                    (MetricKind::Cpu, previous.cpu.png.is_some()),
+                    (MetricKind::Ram, previous.ram.png.is_some()),
+                ];
+                self.state.preferences.indicator.identifiers = previous;
+                self.state.preferences_save_status = PreferencesSaveStatus::Failed;
+                for (metric, has_png) in affected {
+                    if has_png {
+                        self.set_indicator_icon_error(
+                            metric,
+                            message.clone(),
+                            IndicatorIconErrorOwner::Independent,
+                        );
+                    }
+                }
+                vec![AppEffect::RequestIndicatorRedraw]
+            }
+            AppEvent::GlobalIndicatorResetPersistenceFailed(failure) => {
+                let GlobalIndicatorResetFailure {
+                    previous,
+                    replaced_undo,
+                    message,
+                } = *failure;
+                let failed_interval = self.state.preferences.indicator.refresh_interval;
+                self.state.preferences.indicator = previous.clone();
+                self.indicator_reset_undo = replaced_undo;
+                self.state.can_undo_indicator_reset = self.indicator_reset_undo.is_some();
+                self.state.preferences_save_status = PreferencesSaveStatus::Failed;
+                self.set_global_indicator_asset_error(&previous, message);
+                self.failed_indicator_persistence_effects(failed_interval)
+            }
+            AppEvent::GlobalIndicatorUndoPersistenceFailed(failure) => {
+                let GlobalIndicatorUndoFailure {
+                    current,
+                    undo,
+                    message,
+                    stage,
+                } = *failure;
+                let failed_interval = self.state.preferences.indicator.refresh_interval;
+                self.state.preferences.indicator = current.clone();
+                self.set_global_indicator_asset_error_for(&[&current, &undo], message);
+                self.indicator_reset_undo = Some(undo);
+                self.state.can_undo_indicator_reset = true;
+                if stage == GlobalIndicatorUndoFailureStage::Persistence {
+                    self.state.preferences_save_status = PreferencesSaveStatus::Failed;
+                }
+                self.failed_indicator_persistence_effects(failed_interval)
+            }
             AppEvent::UpdateIndicator(change) => {
                 let previous_interval = self.state.preferences.indicator.refresh_interval;
                 let explicit_identifier_mode_metric = match &change {
@@ -653,6 +748,9 @@ impl StatletCore {
                     }
                     _ => None,
                 };
+                if let Some(metric) = explicit_identifier_mode_metric {
+                    self.clear_stale_indicator_icon_error(metric);
+                }
                 if !change.apply(&mut self.state.preferences.indicator) {
                     return explicit_identifier_mode_metric
                         .map(|metric| self.cancel_pending_png_imports([metric]))
@@ -673,7 +771,10 @@ impl StatletCore {
             AppEvent::ResetIndicatorGroup(group) => {
                 let previous = self.state.preferences.indicator.clone();
                 self.state.preferences.indicator.reset(group);
-                let mut effects = if group == IndicatorPreferenceGroup::CpuAndRam {
+                let mut effects = if group == IndicatorPreferenceGroup::Identifiers {
+                    for metric in [MetricKind::Cpu, MetricKind::Ram] {
+                        self.clear_stale_indicator_icon_error(metric);
+                    }
                     self.cancel_pending_png_imports([MetricKind::Cpu, MetricKind::Ram])
                 } else {
                     Vec::new()
@@ -681,20 +782,50 @@ impl StatletCore {
                 if self.state.preferences.indicator == previous {
                     return effects;
                 }
-                effects.extend(self.indicator_effects(previous.refresh_interval));
+                if group == IndicatorPreferenceGroup::Identifiers {
+                    effects.push(AppEffect::RequestIndicatorRedraw);
+                    effects.push(AppEffect::PersistIdentifierReset {
+                        previous: previous.identifiers,
+                        preferences: self.state.preferences.clone(),
+                    });
+                } else {
+                    effects.extend(self.indicator_effects(previous.refresh_interval));
+                }
                 effects
             }
             AppEvent::ResetIndicatorConfirmed => {
                 let previous = self.state.preferences.indicator.clone();
-                self.indicator_reset_undo = Some(previous.clone());
+                if previous == IndicatorPreferences::default()
+                    && self.indicator_reset_undo.is_none()
+                {
+                    for metric in [MetricKind::Cpu, MetricKind::Ram] {
+                        self.clear_stale_indicator_icon_error(metric);
+                    }
+                    return self.cancel_pending_png_imports([MetricKind::Cpu, MetricKind::Ram]);
+                }
+                let replaced_undo = self.indicator_reset_undo.replace(previous.clone());
                 self.state.can_undo_indicator_reset = true;
                 self.state.preferences.indicator = IndicatorPreferences::default();
+                for metric in [MetricKind::Cpu, MetricKind::Ram] {
+                    self.clear_stale_indicator_icon_error(metric);
+                }
                 let mut effects =
                     self.cancel_pending_png_imports([MetricKind::Cpu, MetricKind::Ram]);
-                if self.state.preferences.indicator == previous {
+                if self.state.preferences.indicator == previous && replaced_undo.is_none() {
                     return effects;
                 }
-                effects.extend(self.indicator_effects(previous.refresh_interval));
+                if self.state.preferences.indicator != previous {
+                    let current_interval = self.state.preferences.indicator.refresh_interval;
+                    if current_interval != previous.refresh_interval {
+                        effects.push(AppEffect::SetMetricsSamplingInterval(current_interval));
+                    }
+                    effects.push(AppEffect::RequestIndicatorRedraw);
+                }
+                effects.push(AppEffect::PersistGlobalIndicatorReset {
+                    previous,
+                    replaced_undo,
+                    preferences: self.state.preferences.clone(),
+                });
                 effects
             }
             AppEvent::UndoIndicatorReset => {
@@ -702,20 +833,35 @@ impl StatletCore {
                     return Vec::new();
                 };
                 self.state.can_undo_indicator_reset = false;
+                let current = self.state.preferences.indicator.clone();
                 let current_interval = self.state.preferences.indicator.refresh_interval;
-                if self.state.preferences.indicator == previous {
-                    return Vec::new();
+                let mut effects = Vec::new();
+                if current != previous {
+                    self.state.preferences.indicator = previous.clone();
+                    let restored_interval = self.state.preferences.indicator.refresh_interval;
+                    if restored_interval != current_interval {
+                        effects.push(AppEffect::SetMetricsSamplingInterval(restored_interval));
+                    }
+                    effects.push(AppEffect::RequestIndicatorRedraw);
                 }
-                self.state.preferences.indicator = previous;
-                self.indicator_effects(current_interval)
+                effects.push(AppEffect::PersistGlobalIndicatorUndo {
+                    current,
+                    undo: previous,
+                    preferences: self.state.preferences.clone(),
+                });
+                effects
             }
             AppEvent::PreferencesWindowClosed => {
-                self.indicator_reset_undo = None;
+                let discarded = self.indicator_reset_undo.take();
                 self.state.can_undo_indicator_reset = false;
-                vec![
-                    AppEffect::FlushPreferences(self.state.preferences.clone()),
-                    AppEffect::ReleasePreferencesWindow,
-                ]
+                let persistence = discarded.map_or_else(
+                    || AppEffect::FlushPreferences(self.state.preferences.clone()),
+                    |discarded| AppEffect::DiscardGlobalIndicatorUndo {
+                        discarded,
+                        preferences: self.state.preferences.clone(),
+                    },
+                );
+                vec![persistence, AppEffect::ReleasePreferencesWindow]
             }
             AppEvent::RetrySavePreferences => {
                 vec![AppEffect::FlushPreferences(self.state.preferences.clone())]
@@ -739,6 +885,15 @@ impl StatletCore {
         self.state.indicator_icon_error_owners[index] = None;
     }
 
+    fn clear_stale_indicator_icon_error(&mut self, metric: MetricKind) {
+        let index = metric_index(metric);
+        if self.state.indicator_icon_error_owners[index]
+            == Some(IndicatorIconErrorOwner::Independent)
+        {
+            self.clear_indicator_icon_error(metric);
+        }
+    }
+
     fn set_indicator_icon_error(
         &mut self,
         metric: MetricKind,
@@ -748,6 +903,47 @@ impl StatletCore {
         let index = metric_index(metric);
         self.state.indicator_icon_errors[index] = Some(message);
         self.state.indicator_icon_error_owners[index] = Some(owner);
+    }
+
+    fn set_global_indicator_asset_error(
+        &mut self,
+        indicator: &IndicatorPreferences,
+        message: String,
+    ) {
+        self.set_global_indicator_asset_error_for(&[indicator], message);
+    }
+
+    fn set_global_indicator_asset_error_for(
+        &mut self,
+        indicators: &[&IndicatorPreferences],
+        message: String,
+    ) {
+        for metric in [MetricKind::Cpu, MetricKind::Ram] {
+            let has_png = indicators.iter().any(|indicator| match metric {
+                MetricKind::Cpu => indicator.identifiers.cpu.png.is_some(),
+                MetricKind::Ram => indicator.identifiers.ram.png.is_some(),
+            });
+            if has_png {
+                self.set_indicator_icon_error(
+                    metric,
+                    message.clone(),
+                    IndicatorIconErrorOwner::PreferencesDurability,
+                );
+            }
+        }
+    }
+
+    fn failed_indicator_persistence_effects(
+        &self,
+        failed_interval: MetricsRefreshInterval,
+    ) -> Vec<AppEffect> {
+        let restored_interval = self.state.preferences.indicator.refresh_interval;
+        let mut effects = Vec::with_capacity(2);
+        if restored_interval != failed_interval {
+            effects.push(AppEffect::SetMetricsSamplingInterval(restored_interval));
+        }
+        effects.push(AppEffect::RequestIndicatorRedraw);
+        effects
     }
 
     fn clear_resolved_durability_warnings(&mut self) {
