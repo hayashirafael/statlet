@@ -6,6 +6,7 @@ const HEADING_HEIGHT: f64 = 24.0;
 const ROW_HEIGHT: f64 = 28.0;
 const MESSAGE_HEIGHT: f64 = 20.0;
 const IDENTIFIER_DETAIL_HEIGHT: f64 = 32.0;
+const IDENTIFIER_ERROR_HEIGHT: f64 = 52.0;
 const CONTROL_X: f64 = 100.0;
 
 pub fn preserve_scroll_origin_from_top(
@@ -26,6 +27,56 @@ pub struct IndicatorControlsVisibility {
     pub cpu_editor: bool,
     pub ram_editor: bool,
     pub labels_editor: bool,
+    pub cpu_identifier_error: bool,
+    pub ram_identifier_error: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MessageLayout {
+    x: f64,
+    width: f64,
+    height: f64,
+    maximum_lines: isize,
+}
+
+impl MessageLayout {
+    pub const fn identifier_transaction_error() -> Self {
+        Self {
+            x: CONTROL_X,
+            width: 450.0,
+            height: IDENTIFIER_ERROR_HEIGHT,
+            maximum_lines: 3,
+        }
+    }
+
+    pub const fn preferences_save_error() -> Self {
+        Self {
+            x: 0.0,
+            width: 212.0,
+            height: 36.0,
+            maximum_lines: 2,
+        }
+    }
+
+    pub const fn x(self) -> f64 {
+        self.x
+    }
+
+    pub const fn width(self) -> f64 {
+        self.width
+    }
+
+    pub const fn height(self) -> f64 {
+        self.height
+    }
+
+    pub const fn maximum_lines(self) -> isize {
+        self.maximum_lines
+    }
+
+    pub const fn wraps(self) -> bool {
+        self.maximum_lines > 1
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -145,9 +196,13 @@ pub struct IndicatorControlsLayout {
     identifiers_heading: VerticalSlot,
     cpu_identifier_row: RowSlot,
     cpu_identifier_detail: VerticalSlot,
+    cpu_identifier_error: Option<VerticalSlot>,
     ram_identifier_row: RowSlot,
     ram_identifier_detail: VerticalSlot,
+    ram_identifier_error: Option<VerticalSlot>,
+    identifiers_reset: ControlSlot,
     labels_heading: VerticalSlot,
+    labels_reset: ControlSlot,
     labels_visibility_row: RowSlot,
     labels_mode_row: RowSlot,
     labels_editor: Option<VerticalSlot>,
@@ -183,13 +238,26 @@ impl IndicatorControlsLayout {
         let cpu_identifier_row = row(&mut cursor);
         cursor += INLINE_GAP;
         let cpu_identifier_detail = vertical(&mut cursor, IDENTIFIER_DETAIL_HEIGHT);
+        let cpu_identifier_error = optional_message(
+            &mut cursor,
+            visibility.cpu_identifier_error,
+            MessageLayout::identifier_transaction_error().height(),
+        );
         cursor += INLINE_GAP;
         let ram_identifier_row = row(&mut cursor);
         cursor += INLINE_GAP;
         let ram_identifier_detail = vertical(&mut cursor, IDENTIFIER_DETAIL_HEIGHT);
+        let ram_identifier_error = optional_message(
+            &mut cursor,
+            visibility.ram_identifier_error,
+            MessageLayout::identifier_transaction_error().height(),
+        );
+        cursor += INLINE_GAP;
+        let identifiers_reset = control(vertical(&mut cursor, ROW_HEIGHT), 350.0, 200.0);
 
         cursor += GROUP_GAP;
         let labels_heading = vertical(&mut cursor, HEADING_HEIGHT);
+        let labels_reset = control(labels_heading, 390.0, 160.0);
         cursor += INLINE_GAP;
         let labels_visibility_row = row(&mut cursor);
         cursor += INLINE_GAP;
@@ -228,9 +296,13 @@ impl IndicatorControlsLayout {
             identifiers_heading,
             cpu_identifier_row,
             cpu_identifier_detail,
+            cpu_identifier_error,
             ram_identifier_row,
             ram_identifier_detail,
+            ram_identifier_error,
+            identifiers_reset,
             labels_heading,
+            labels_reset,
             labels_visibility_row,
             labels_mode_row,
             labels_editor,
@@ -275,14 +347,26 @@ impl IndicatorControlsLayout {
     pub const fn cpu_identifier_detail(self) -> VerticalSlot {
         self.cpu_identifier_detail
     }
+    pub const fn cpu_identifier_error(self) -> Option<VerticalSlot> {
+        self.cpu_identifier_error
+    }
     pub const fn ram_identifier_row(self) -> RowSlot {
         self.ram_identifier_row
     }
     pub const fn ram_identifier_detail(self) -> VerticalSlot {
         self.ram_identifier_detail
     }
+    pub const fn ram_identifier_error(self) -> Option<VerticalSlot> {
+        self.ram_identifier_error
+    }
+    pub const fn identifiers_reset(self) -> ControlSlot {
+        self.identifiers_reset
+    }
     pub const fn labels_heading(self) -> VerticalSlot {
         self.labels_heading
+    }
+    pub const fn labels_reset(self) -> ControlSlot {
+        self.labels_reset
     }
     pub const fn labels_visibility_row(self) -> RowSlot {
         self.labels_visibility_row
@@ -326,6 +410,28 @@ impl IndicatorControlsLayout {
     pub const fn content_height(self) -> f64 {
         self.content_height
     }
+
+    pub fn page_height(self) -> f64 {
+        let colors = self
+            .ram_editor()
+            .unwrap_or(self.ram_row().vertical())
+            .bottom()
+            - self.colors_heading().top();
+        let labels = self
+            .labels_editor()
+            .unwrap_or(self.labels_mode_row().vertical())
+            .bottom()
+            - self.identifiers_heading().top();
+        let typography = self.layout_warning().bottom() - self.typography_heading().top();
+        let refresh = self.interval_error().bottom() - self.update_heading().top();
+
+        colors.max(labels).max(typography).max(refresh)
+    }
+
+    pub fn labels_page_origin_y(self, slot: VerticalSlot) -> f64 {
+        slot.origin_y(self.content_height()) + self.page_height() - self.content_height()
+            + self.identifiers_heading().top()
+    }
 }
 
 fn vertical(cursor: &mut f64, height: f64) -> VerticalSlot {
@@ -353,6 +459,15 @@ fn optional_editor(cursor: &mut f64, visible: bool) -> Option<VerticalSlot> {
     if visible {
         *cursor += INLINE_GAP;
         Some(vertical(cursor, COLOR_EDITOR_HEIGHT))
+    } else {
+        None
+    }
+}
+
+fn optional_message(cursor: &mut f64, visible: bool, height: f64) -> Option<VerticalSlot> {
+    if visible {
+        *cursor += INLINE_GAP;
+        Some(vertical(cursor, height))
     } else {
         None
     }
@@ -402,6 +517,17 @@ mod tests {
         assert!(layout.colors_reset().x() > layout.cpu_row().control_x());
         assert_eq!(layout.colors_reset().width(), 160.0);
         assert_eq!(GROUP_GAP, 24.0);
+    }
+
+    #[test]
+    fn labels_reset_stays_in_the_group_heading_away_from_the_spacing_row() {
+        let layout = IndicatorControlsLayout::new(IndicatorControlsVisibility::default());
+
+        assert!(
+            layout.labels_reset().bottom() <= layout.labels_visibility_row().top(),
+            "labels reset must not intersect the row containing the spacing slider and value"
+        );
+        assert_eq!(layout.labels_reset().vertical(), layout.labels_heading());
     }
 
     #[test]
@@ -462,11 +588,13 @@ mod tests {
 
     #[test]
     fn every_editor_visibility_combination_has_consistent_non_overlapping_slots() {
-        for mask in 0_u8..8 {
+        for mask in 0_u8..32 {
             let visibility = IndicatorControlsVisibility {
                 cpu_editor: mask & 0b001 != 0,
                 ram_editor: mask & 0b010 != 0,
                 labels_editor: mask & 0b100 != 0,
+                cpu_identifier_error: mask & 0b01000 != 0,
+                ram_identifier_error: mask & 0b10000 != 0,
             };
             let layout = IndicatorControlsLayout::new(visibility);
 
@@ -483,8 +611,11 @@ mod tests {
                 Some(layout.identifiers_heading()),
                 Some(layout.cpu_identifier_row().vertical()),
                 Some(layout.cpu_identifier_detail()),
+                layout.cpu_identifier_error(),
                 Some(layout.ram_identifier_row().vertical()),
                 Some(layout.ram_identifier_detail()),
+                layout.ram_identifier_error(),
+                Some(layout.identifiers_reset().vertical()),
                 Some(layout.labels_heading()),
                 Some(layout.labels_visibility_row().vertical()),
                 Some(layout.labels_mode_row().vertical()),
@@ -518,7 +649,7 @@ mod tests {
                         .ram_editor()
                         .unwrap_or(layout.ram_row().vertical())
                         .bottom(),
-                layout.labels_heading().top() - layout.ram_identifier_detail().bottom(),
+                layout.labels_heading().top() - layout.identifiers_reset().bottom(),
                 layout.typography_heading().top()
                     - layout
                         .labels_editor()

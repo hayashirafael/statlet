@@ -8,10 +8,148 @@ mod layout;
 
 pub use layout::{
     preserve_scroll_origin_from_top, ControlSlot, IndicatorControlsLayout,
-    IndicatorControlsVisibility, RowSlot, VerticalSlot,
+    IndicatorControlsVisibility, MessageLayout, RowSlot, VerticalSlot,
 };
 
 const SYSTEM_MONOSPACED_LABEL: &str = "System Monospaced";
+const PREFERENCES_SAVE_ERROR: &str = "Não foi possível salvar as preferências.";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreferencesArea {
+    #[default]
+    Colors,
+    Labels,
+    Typography,
+    Refresh,
+    DiskAndMole,
+}
+
+impl PreferencesArea {
+    pub const fn from_sidebar_row(row: isize) -> Option<Self> {
+        match row {
+            0 => Some(Self::Colors),
+            1 => Some(Self::Labels),
+            2 => Some(Self::Typography),
+            3 => Some(Self::Refresh),
+            4 => Some(Self::DiskAndMole),
+            _ => None,
+        }
+    }
+
+    pub const fn sidebar_label(self) -> &'static str {
+        match self {
+            Self::Colors => "Cores",
+            Self::Labels => "Rótulos",
+            Self::Typography => "Tipografia",
+            Self::Refresh => "Atualização",
+            Self::DiskAndMole => "Disco e Mole",
+        }
+    }
+
+    pub const fn indicator_index(self) -> Option<usize> {
+        match self {
+            Self::Colors => Some(0),
+            Self::Labels => Some(1),
+            Self::Typography => Some(2),
+            Self::Refresh => Some(3),
+            Self::DiskAndMole => None,
+        }
+    }
+
+    pub const fn is_indicator(self) -> bool {
+        self.indicator_index().is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreferencesShellFocusTarget {
+    ResetIndicator,
+    RetrySave,
+    Sidebar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreferencesShellPresentation {
+    area: PreferencesArea,
+    can_undo_indicator_reset: bool,
+    save_status: PreferencesSaveStatus,
+}
+
+impl PreferencesShellPresentation {
+    pub const fn new(
+        area: PreferencesArea,
+        can_undo_indicator_reset: bool,
+        save_status: PreferencesSaveStatus,
+    ) -> Self {
+        Self {
+            area,
+            can_undo_indicator_reset,
+            save_status,
+        }
+    }
+
+    pub const fn indicator_reset_visible(self) -> bool {
+        self.area.is_indicator()
+    }
+
+    pub const fn undo_visible(self) -> bool {
+        self.indicator_reset_visible() && self.can_undo_indicator_reset
+    }
+
+    pub const fn retry_visible(self) -> bool {
+        matches!(self.save_status, PreferencesSaveStatus::Failed)
+    }
+
+    pub const fn save_error(self) -> Option<&'static str> {
+        if self.retry_visible() {
+            Some(PREFERENCES_SAVE_ERROR)
+        } else {
+            None
+        }
+    }
+
+    pub const fn focus_target_after_area_controls(self) -> PreferencesShellFocusTarget {
+        if self.indicator_reset_visible() {
+            PreferencesShellFocusTarget::ResetIndicator
+        } else if self.retry_visible() {
+            PreferencesShellFocusTarget::RetrySave
+        } else {
+            PreferencesShellFocusTarget::Sidebar
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreferencesNavigationPolicy {
+    area_changed: bool,
+}
+
+impl PreferencesNavigationPolicy {
+    pub fn between(current: PreferencesArea, selected: PreferencesArea) -> Self {
+        Self {
+            area_changed: current != selected,
+        }
+    }
+
+    pub fn scroll_origin_y(
+        self,
+        origin_y: f64,
+        viewport_height: f64,
+        old_document_height: f64,
+        new_document_height: f64,
+    ) -> f64 {
+        if self.area_changed {
+            (new_document_height - viewport_height).max(0.0)
+        } else {
+            preserve_scroll_origin_from_top(
+                origin_y,
+                viewport_height,
+                old_document_height,
+                new_document_height,
+            )
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreferencesControlsPresentation {
@@ -54,6 +192,103 @@ pub enum IdentifierDetailPresentation {
         source_name: Option<String>,
         can_remove: bool,
     },
+}
+
+const LATENT_TEXT_LABEL_HELP: &str = "Preservado para o modo Texto.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LabelEditingFocusTarget {
+    CpuLabel,
+    RamLabel,
+    Spacing,
+    LabelColorMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LabelEditingPresentation {
+    cpu_enabled: bool,
+    ram_enabled: bool,
+}
+
+impl LabelEditingPresentation {
+    pub const fn new(cpu_mode: MetricIdentifierMode, ram_mode: MetricIdentifierMode) -> Self {
+        Self {
+            cpu_enabled: matches!(cpu_mode, MetricIdentifierMode::Text),
+            ram_enabled: matches!(ram_mode, MetricIdentifierMode::Text),
+        }
+    }
+
+    pub const fn cpu_enabled(self) -> bool {
+        self.cpu_enabled
+    }
+
+    pub const fn ram_enabled(self) -> bool {
+        self.ram_enabled
+    }
+
+    pub const fn spacing_enabled(self) -> bool {
+        self.cpu_enabled || self.ram_enabled
+    }
+
+    pub const fn cpu_help(self) -> Option<&'static str> {
+        if self.cpu_enabled {
+            None
+        } else {
+            Some(LATENT_TEXT_LABEL_HELP)
+        }
+    }
+
+    pub const fn ram_help(self) -> Option<&'static str> {
+        if self.ram_enabled {
+            None
+        } else {
+            Some(LATENT_TEXT_LABEL_HELP)
+        }
+    }
+
+    pub const fn spacing_help(self) -> Option<&'static str> {
+        if self.spacing_enabled() {
+            None
+        } else {
+            Some(LATENT_TEXT_LABEL_HELP)
+        }
+    }
+
+    pub fn focus_order(self) -> Vec<LabelEditingFocusTarget> {
+        let mut order = Vec::with_capacity(4);
+        if self.cpu_enabled {
+            order.push(LabelEditingFocusTarget::CpuLabel);
+        }
+        if self.ram_enabled {
+            order.push(LabelEditingFocusTarget::RamLabel);
+        }
+        if self.spacing_enabled() {
+            order.push(LabelEditingFocusTarget::Spacing);
+        }
+        order.push(LabelEditingFocusTarget::LabelColorMode);
+        order
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypographyWarningKind {
+    FontFallback,
+    Layout,
+}
+
+impl TypographyWarningKind {
+    pub const fn accessibility_identifier(self) -> &'static str {
+        match self {
+            Self::FontFallback => "indicator.font.fallback-warning",
+            Self::Layout => "indicator.font.layout-warning",
+        }
+    }
+
+    pub const fn accessibility_label(self, message: Option<&str>) -> Option<&str> {
+        match self {
+            Self::FontFallback | Self::Layout => message,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -208,8 +443,51 @@ pub fn filter_font_families(
 pub struct InvalidIntervalDraft;
 
 impl InvalidIntervalDraft {
-    pub const fn message(self) -> &'static str {
-        "Digite um número inteiro de 1 a 60."
+    pub fn message(self) -> String {
+        format!(
+            "Digite um número inteiro de {} a {}.",
+            MetricsRefreshInterval::MIN_SECONDS,
+            MetricsRefreshInterval::MAX_SECONDS
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntervalFieldFormat {
+    minimum: u8,
+    maximum: u8,
+}
+
+impl IntervalFieldFormat {
+    pub const fn seconds() -> Self {
+        Self {
+            minimum: MetricsRefreshInterval::MIN_SECONDS,
+            maximum: MetricsRefreshInterval::MAX_SECONDS,
+        }
+    }
+
+    pub const fn minimum(self) -> u8 {
+        self.minimum
+    }
+
+    pub const fn maximum(self) -> u8 {
+        self.maximum
+    }
+
+    pub const fn allows_floats(self) -> bool {
+        false
+    }
+
+    pub const fn uses_grouping_separator(self) -> bool {
+        false
+    }
+
+    pub const fn validates_partial_input(self) -> bool {
+        true
+    }
+
+    pub const fn accepts_invalid_commit_for_domain_validation(self) -> bool {
+        true
     }
 }
 

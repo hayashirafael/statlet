@@ -139,6 +139,21 @@ fn global_reset_keeps_disk_preferences_and_undo_replaces_later_indicator_edits()
 }
 
 #[test]
+fn resetting_default_indicator_does_not_expose_an_unbacked_undo() {
+    let mut app = StatletCore::new();
+    let save_status = app.state().preferences_save_status;
+
+    let reset_effects = app.handle(AppEvent::ResetIndicatorConfirmed);
+
+    assert!(reset_effects
+        .iter()
+        .all(|effect| !matches!(effect, AppEffect::PersistGlobalIndicatorReset { .. })));
+    assert!(!app.state().can_undo_indicator_reset);
+    assert!(app.handle(AppEvent::UndoIndicatorReset).is_empty());
+    assert_eq!(app.state().preferences_save_status, save_status);
+}
+
+#[test]
 fn closing_preferences_discards_only_the_transient_undo_snapshot() {
     let mut app = customized_app(false);
 
@@ -149,13 +164,12 @@ fn closing_preferences_discards_only_the_transient_undo_snapshot() {
     assert!(app.handle(AppEvent::UndoIndicatorReset).is_empty());
     assert_eq!(app.state().preferences, after_reset);
     assert!(!app.state().can_undo_indicator_reset);
-    assert_eq!(
-        effects,
-        vec![
-            AppEffect::FlushPreferences(after_reset),
-            AppEffect::ReleasePreferencesWindow,
-        ]
-    );
+    assert_eq!(effects.last(), Some(&AppEffect::ReleasePreferencesWindow));
+    assert!(matches!(
+        effects.first(),
+        Some(AppEffect::DiscardGlobalIndicatorUndo { preferences, .. })
+            if preferences == &after_reset
+    ));
 }
 
 #[test]
@@ -236,24 +250,28 @@ fn global_reset_and_undo_reschedule_only_when_the_interval_changes() {
     let reset_effects = app.handle(AppEvent::ResetIndicatorConfirmed);
 
     assert_eq!(
-        reset_effects,
-        vec![
-            AppEffect::SetMetricsSamplingInterval(default_interval),
-            AppEffect::RequestIndicatorRedraw,
-            AppEffect::QueuePreferencesSave(app.state().preferences.clone()),
-        ]
+        reset_effects[0],
+        AppEffect::SetMetricsSamplingInterval(default_interval)
     );
+    assert_eq!(reset_effects[1], AppEffect::RequestIndicatorRedraw);
+    assert!(matches!(
+        &reset_effects[2],
+        AppEffect::PersistGlobalIndicatorReset { preferences, .. }
+            if preferences == &app.state().preferences
+    ));
 
     let undo_effects = app.handle(AppEvent::UndoIndicatorReset);
 
     assert_eq!(
-        undo_effects,
-        vec![
-            AppEffect::SetMetricsSamplingInterval(customized_interval),
-            AppEffect::RequestIndicatorRedraw,
-            AppEffect::QueuePreferencesSave(app.state().preferences.clone()),
-        ]
+        undo_effects[0],
+        AppEffect::SetMetricsSamplingInterval(customized_interval)
     );
+    assert_eq!(undo_effects[1], AppEffect::RequestIndicatorRedraw);
+    assert!(matches!(
+        &undo_effects[2],
+        AppEffect::PersistGlobalIndicatorUndo { preferences, .. }
+            if preferences == &app.state().preferences
+    ));
 }
 
 #[test]

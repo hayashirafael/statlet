@@ -1,10 +1,14 @@
 use statlet::indicator_preferences::{
-    AppearanceColors, FixedColorPreferences, MetricsRefreshInterval, SrgbColor,
+    AppearanceColors, FixedColorPreferences, MetricIdentifierMode, MetricsRefreshInterval,
+    SrgbColor,
 };
 use statlet::preferences_view::{
     color_well_configuration, filter_font_families, ColorEditorFocusTarget, ColorEditorRows,
     ColorEditorState, ColorWellPresentation, FontPickerInteraction, FontRow, HexDraft,
-    HexDraftError, HexEdit, IntervalDraft,
+    HexDraftError, HexEdit, IndicatorControlsLayout, IndicatorControlsVisibility, IntervalDraft,
+    IntervalFieldFormat, LabelEditingFocusTarget, LabelEditingPresentation, MessageLayout,
+    PreferencesArea, PreferencesNavigationPolicy, PreferencesShellFocusTarget,
+    PreferencesShellPresentation, TypographyWarningKind,
 };
 
 #[test]
@@ -46,6 +50,132 @@ fn interval_draft_applies_only_whole_values_from_one_through_sixty() {
     assert!(draft.commit("1.5").is_err());
     assert_eq!(draft.commit("60").unwrap().seconds(), 60);
     assert!(draft.commit("61").is_err());
+}
+
+#[test]
+fn label_editing_tracks_each_metric_mode_and_skips_disabled_controls() {
+    use LabelEditingFocusTarget::{CpuLabel, LabelColorMode, RamLabel, Spacing};
+
+    let graphical = [
+        MetricIdentifierMode::SystemSymbol,
+        MetricIdentifierMode::Png,
+    ];
+    let text_text =
+        LabelEditingPresentation::new(MetricIdentifierMode::Text, MetricIdentifierMode::Text);
+    assert_eq!(
+        (text_text.cpu_enabled(), text_text.ram_enabled()),
+        (true, true)
+    );
+    assert!(text_text.spacing_enabled());
+    assert_eq!(
+        text_text.focus_order(),
+        vec![CpuLabel, RamLabel, Spacing, LabelColorMode]
+    );
+
+    for non_text in graphical {
+        let cpu_only = LabelEditingPresentation::new(MetricIdentifierMode::Text, non_text);
+        assert_eq!(
+            (cpu_only.cpu_enabled(), cpu_only.ram_enabled()),
+            (true, false)
+        );
+        assert!(cpu_only.spacing_enabled());
+        assert_eq!(
+            cpu_only.focus_order(),
+            vec![CpuLabel, Spacing, LabelColorMode]
+        );
+
+        let ram_only = LabelEditingPresentation::new(non_text, MetricIdentifierMode::Text);
+        assert_eq!(
+            (ram_only.cpu_enabled(), ram_only.ram_enabled()),
+            (false, true)
+        );
+        assert!(ram_only.spacing_enabled());
+        assert_eq!(
+            ram_only.focus_order(),
+            vec![RamLabel, Spacing, LabelColorMode]
+        );
+    }
+
+    for cpu_mode in graphical {
+        for ram_mode in graphical {
+            let neither = LabelEditingPresentation::new(cpu_mode, ram_mode);
+            assert_eq!(
+                (neither.cpu_enabled(), neither.ram_enabled()),
+                (false, false)
+            );
+            assert!(!neither.spacing_enabled());
+            assert_eq!(neither.focus_order(), vec![LabelColorMode]);
+            assert_eq!(
+                (
+                    neither.cpu_help(),
+                    neither.ram_help(),
+                    neither.spacing_help()
+                ),
+                (
+                    Some("Preservado para o modo Texto."),
+                    Some("Preservado para o modo Texto."),
+                    Some("Preservado para o modo Texto.")
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn typography_warnings_expose_stable_ax_identity_only_while_visible() {
+    let fallback = TypographyWarningKind::FontFallback;
+    let layout = TypographyWarningKind::Layout;
+
+    assert_eq!(
+        fallback.accessibility_identifier(),
+        "indicator.font.fallback-warning"
+    );
+    assert_eq!(
+        layout.accessibility_identifier(),
+        "indicator.font.layout-warning"
+    );
+    assert_eq!(
+        fallback.accessibility_label(Some("Fonte substituída")),
+        Some("Fonte substituída")
+    );
+    assert_eq!(layout.accessibility_label(None), None);
+}
+
+#[test]
+fn refresh_interval_field_uses_an_integer_native_format_from_one_through_sixty() {
+    let format = IntervalFieldFormat::seconds();
+
+    assert_eq!((format.minimum(), format.maximum()), (1, 60));
+    assert!(!format.allows_floats());
+    assert!(!format.uses_grouping_separator());
+    assert!(format.validates_partial_input());
+    assert!(format.accepts_invalid_commit_for_domain_validation());
+}
+
+#[test]
+fn interval_commit_matrix_preserves_the_last_valid_value_on_every_invalid_draft() {
+    let initial = MetricsRefreshInterval::try_from(2).unwrap();
+
+    for invalid in ["", "0", "61", "abc", "1.5", "-1", "256"] {
+        let mut draft = IntervalDraft::new(initial);
+        assert!(
+            draft.commit(invalid).is_err(),
+            "{invalid:?} must be invalid"
+        );
+        assert_eq!(draft.text(), invalid);
+        assert_eq!(draft.valid_interval(), initial);
+        assert_eq!(
+            draft.error().map(|error| error.message()),
+            Some("Digite um número inteiro de 1 a 60.".to_owned())
+        );
+    }
+
+    for valid in [("1", 1), (" 2 ", 2), ("60", 60)] {
+        let mut draft = IntervalDraft::new(initial);
+        assert_eq!(draft.commit(valid.0).unwrap().seconds(), valid.1);
+        assert_eq!(draft.text(), valid.1.to_string());
+        assert_eq!(draft.error(), None);
+    }
 }
 
 #[test]
@@ -195,6 +325,13 @@ fn relevant_preferences_state_changes_the_controls_presentation() {
     app.handle(AppEvent::SetMoleIntegrationEnabled(true));
     assert!(cache.should_apply(app.state()));
 
+    app.handle(AppEvent::UpdateIndicator(
+        statlet::core::IndicatorPreferenceChange::SetFontSize(
+            statlet::indicator_preferences::FontSize::try_from(14).unwrap(),
+        ),
+    ));
+    assert!(cache.should_apply(app.state()));
+
     app.handle(AppEvent::ResetIndicatorConfirmed);
     assert!(cache.should_apply(app.state()));
 
@@ -202,6 +339,106 @@ fn relevant_preferences_state_changes_the_controls_presentation() {
         PreferencesSaveResult::Failed,
     ));
     assert!(cache.should_apply(app.state()));
+}
+
+#[test]
+fn save_recovery_is_visible_and_keyboard_reachable_from_disk_and_mole() {
+    use statlet::core::PreferencesSaveStatus;
+
+    let failed = PreferencesShellPresentation::new(
+        PreferencesArea::DiskAndMole,
+        false,
+        PreferencesSaveStatus::Failed,
+    );
+
+    assert_eq!(
+        failed.save_error(),
+        Some("Não foi possível salvar as preferências.")
+    );
+    assert!(failed.retry_visible());
+    assert!(!failed.indicator_reset_visible());
+    assert_eq!(
+        failed.focus_target_after_area_controls(),
+        PreferencesShellFocusTarget::RetrySave
+    );
+
+    let saved = PreferencesShellPresentation::new(
+        PreferencesArea::DiskAndMole,
+        false,
+        PreferencesSaveStatus::Saved,
+    );
+    assert_eq!(saved.save_error(), None);
+    assert!(!saved.retry_visible());
+    assert_eq!(
+        saved.focus_target_after_area_controls(),
+        PreferencesShellFocusTarget::Sidebar
+    );
+}
+
+#[test]
+fn area_navigation_reveals_the_new_page_but_same_area_reflow_preserves_scroll() {
+    let switched =
+        PreferencesNavigationPolicy::between(PreferencesArea::Labels, PreferencesArea::Colors);
+    assert_eq!(switched.scroll_origin_y(180.0, 344.0, 648.0, 820.0), 476.0);
+
+    let same_area =
+        PreferencesNavigationPolicy::between(PreferencesArea::Labels, PreferencesArea::Labels);
+    assert_eq!(same_area.scroll_origin_y(180.0, 344.0, 648.0, 820.0), 352.0);
+}
+
+#[test]
+fn identifier_reset_has_its_own_row_before_label_controls() {
+    let layout = IndicatorControlsLayout::new(IndicatorControlsVisibility::default());
+
+    assert!(layout.identifiers_reset().top() >= layout.ram_identifier_detail().bottom());
+    assert!(layout.labels_heading().top() >= layout.identifiers_reset().bottom());
+}
+
+#[test]
+fn labels_page_translation_keeps_identifier_reset_inside_its_visible_group() {
+    let layout = IndicatorControlsLayout::new(IndicatorControlsVisibility::default());
+    let reset = layout.identifiers_reset().vertical();
+    let reset_y = layout.labels_page_origin_y(reset);
+    let heading_y = layout.labels_page_origin_y(layout.identifiers_heading());
+    let labels_y = layout.labels_page_origin_y(layout.labels_heading());
+
+    assert!(reset_y >= 0.0);
+    assert!(reset_y + reset.height() <= layout.page_height());
+    assert!(reset_y + reset.height() <= heading_y);
+    assert!(labels_y + layout.labels_heading().height() <= reset_y);
+}
+
+#[test]
+fn transaction_errors_get_dedicated_wrapped_rows_and_reflow_following_content() {
+    let compact = IndicatorControlsLayout::new(IndicatorControlsVisibility::default());
+    let failed = IndicatorControlsLayout::new(IndicatorControlsVisibility {
+        cpu_identifier_error: true,
+        ram_identifier_error: true,
+        ..IndicatorControlsVisibility::default()
+    });
+    let cpu_error = failed.cpu_identifier_error().expect("CPU error row");
+    let ram_error = failed.ram_identifier_error().expect("RAM error row");
+    let message = MessageLayout::identifier_transaction_error();
+
+    assert!(message.wraps());
+    assert!(message.maximum_lines() >= 2);
+    assert!(message.width() >= 400.0);
+    assert!(cpu_error.height() >= message.height());
+    assert!(cpu_error.top() >= failed.cpu_identifier_detail().bottom());
+    assert!(failed.ram_identifier_row().top() >= cpu_error.bottom());
+    assert!(ram_error.top() >= failed.ram_identifier_detail().bottom());
+    assert!(failed.identifiers_reset().top() >= ram_error.bottom());
+    assert!(failed.page_height() > compact.page_height());
+}
+
+#[test]
+fn global_save_error_uses_two_line_wrapping_above_retry() {
+    let message = MessageLayout::preferences_save_error();
+
+    assert!(message.wraps());
+    assert!(message.maximum_lines() >= 2);
+    assert!(message.height() >= 32.0);
+    assert!(message.width() >= 200.0);
 }
 
 #[test]

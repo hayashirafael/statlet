@@ -455,14 +455,18 @@ impl TryFrom<u8> for MetricsRefreshInterval {
     type Error = InvalidMetricsRefreshInterval;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            1..=60 => Ok(Self(value)),
-            _ => Err(InvalidMetricsRefreshInterval),
+        if (Self::MIN_SECONDS..=Self::MAX_SECONDS).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(InvalidMetricsRefreshInterval)
         }
     }
 }
 
 impl MetricsRefreshInterval {
+    pub const MIN_SECONDS: u8 = 1;
+    pub const MAX_SECONDS: u8 = 60;
+
     pub const fn seconds(self) -> u8 {
         self.0
     }
@@ -487,6 +491,7 @@ pub struct IndicatorPreferences {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IndicatorPreferenceGroup {
     CpuAndRam,
+    Identifiers,
     Labels,
     Typography,
     RefreshInterval,
@@ -499,8 +504,8 @@ impl IndicatorPreferences {
             IndicatorPreferenceGroup::CpuAndRam => {
                 self.cpu_color = defaults.cpu_color;
                 self.ram_color = defaults.ram_color;
-                self.identifiers = defaults.identifiers;
             }
+            IndicatorPreferenceGroup::Identifiers => self.identifiers = defaults.identifiers,
             IndicatorPreferenceGroup::Labels => self.labels = defaults.labels,
             IndicatorPreferenceGroup::Typography => self.typography = defaults.typography,
             IndicatorPreferenceGroup::RefreshInterval => {
