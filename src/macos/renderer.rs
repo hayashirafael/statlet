@@ -1778,13 +1778,13 @@ mod tests {
         let measurer = FontTextMeasurer::new(&font);
         let gauge_identifier = MetricIdentifierVisual::SystemSymbol {
             name: SystemSymbolName::new("gauge.with.dots.needle.33percent").unwrap(),
-            size: statlet::indicator_preferences::SystemSymbolSize::try_from(14).unwrap(),
+            size: statlet::indicator_preferences::SystemSymbolSize::try_from(12).unwrap(),
             color: SegmentColor::Semantic(SemanticColor::Neutral),
             fallback_text: "C ".to_owned(),
         };
         let memorychip_identifier = MetricIdentifierVisual::SystemSymbol {
             name: SystemSymbolName::new("memorychip").unwrap(),
-            size: statlet::indicator_preferences::SystemSymbolSize::try_from(14).unwrap(),
+            size: statlet::indicator_preferences::SystemSymbolSize::try_from(12).unwrap(),
             color: SegmentColor::Semantic(SemanticColor::Neutral),
             fallback_text: "R ".to_owned(),
         };
