@@ -10,7 +10,7 @@ use crate::indicator_preferences::{
     IdentifierPreferences, IndicatorLabel, IndicatorPreferences, LabelColorMode, LabelPreferences,
     LabelSpacing, MetricColorMode, MetricColorPreferences, MetricIdentifierMode,
     MetricIdentifierPreferences, MetricsRefreshInterval, PngIconMetadata, SrgbColor,
-    SystemSymbolName, TypographyPreferences,
+    SystemSymbolName, SystemSymbolSize, TypographyPreferences,
 };
 
 const CURRENT_VERSION: u8 = 2;
@@ -343,9 +343,16 @@ impl StoredIndicatorPreferences {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct StoredIdentifierPreferences {
+    #[serde(default = "default_system_symbol_size")]
+    system_symbol_size: u8,
     cpu: StoredMetricIdentifierPreferences,
     ram: StoredMetricIdentifierPreferences,
+}
+
+const fn default_system_symbol_size() -> u8 {
+    12
 }
 
 impl Default for StoredIdentifierPreferences {
@@ -357,6 +364,7 @@ impl Default for StoredIdentifierPreferences {
 impl From<IdentifierPreferences> for StoredIdentifierPreferences {
     fn from(preferences: IdentifierPreferences) -> Self {
         Self {
+            system_symbol_size: preferences.system_symbol_size.points(),
             cpu: preferences.cpu.into(),
             ram: preferences.ram.into(),
         }
@@ -366,6 +374,7 @@ impl From<IdentifierPreferences> for StoredIdentifierPreferences {
 impl StoredIdentifierPreferences {
     fn into_preferences(self) -> Option<IdentifierPreferences> {
         Some(IdentifierPreferences {
+            system_symbol_size: SystemSymbolSize::try_from(self.system_symbol_size).ok()?,
             cpu: self.cpu.into_preferences()?,
             ram: self.ram.into_preferences()?,
         })

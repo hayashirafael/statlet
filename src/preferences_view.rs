@@ -205,6 +205,76 @@ pub enum LabelEditingFocusTarget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdentifierEditingFocusTarget {
+    CpuMode,
+    CpuSymbol,
+    CpuChoosePng,
+    CpuRemovePng,
+    RamMode,
+    RamSymbol,
+    RamChoosePng,
+    RamRemovePng,
+    SystemSymbolSize,
+    ResetIdentifiers,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdentifierEditingPresentation {
+    cpu_mode: MetricIdentifierMode,
+    ram_mode: MetricIdentifierMode,
+}
+
+impl IdentifierEditingPresentation {
+    pub const fn new(cpu_mode: MetricIdentifierMode, ram_mode: MetricIdentifierMode) -> Self {
+        Self { cpu_mode, ram_mode }
+    }
+
+    pub const fn system_symbol_size_enabled(self) -> bool {
+        matches!(self.cpu_mode, MetricIdentifierMode::SystemSymbol)
+            || matches!(self.ram_mode, MetricIdentifierMode::SystemSymbol)
+    }
+
+    pub const fn system_symbol_size_help(self) -> &'static str {
+        "Ajusta o tamanho compartilhado dos ícones do macOS de CPU e RAM."
+    }
+
+    pub fn focus_order(
+        self,
+        cpu_png_available: bool,
+        ram_png_available: bool,
+    ) -> Vec<IdentifierEditingFocusTarget> {
+        use IdentifierEditingFocusTarget::*;
+        let mut order = vec![CpuMode];
+        match self.cpu_mode {
+            MetricIdentifierMode::Text => {}
+            MetricIdentifierMode::SystemSymbol => order.push(CpuSymbol),
+            MetricIdentifierMode::Png => {
+                order.push(CpuChoosePng);
+                if cpu_png_available {
+                    order.push(CpuRemovePng);
+                }
+            }
+        }
+        order.push(RamMode);
+        match self.ram_mode {
+            MetricIdentifierMode::Text => {}
+            MetricIdentifierMode::SystemSymbol => order.push(RamSymbol),
+            MetricIdentifierMode::Png => {
+                order.push(RamChoosePng);
+                if ram_png_available {
+                    order.push(RamRemovePng);
+                }
+            }
+        }
+        if self.system_symbol_size_enabled() {
+            order.push(SystemSymbolSize);
+        }
+        order.push(ResetIdentifiers);
+        order
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LabelEditingPresentation {
     cpu_enabled: bool,
     ram_enabled: bool,

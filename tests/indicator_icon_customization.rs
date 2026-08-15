@@ -10,7 +10,7 @@ use statlet::indicator::{
 };
 use statlet::indicator_preferences::{
     IndicatorLabel, IndicatorPreferences, MetricIdentifierMode, MetricKind, PngIconMetadata,
-    SystemSymbolName, MACOS_14_SF_SYMBOL_CATALOG_YEAR,
+    SystemSymbolName, SystemSymbolSize, MACOS_14_SF_SYMBOL_CATALOG_YEAR,
 };
 use statlet::preferences::PreferencesStore;
 use statlet::preferences_view::{
@@ -32,8 +32,63 @@ fn identifier_defaults_preserve_c_and_r_text_with_metric_specific_symbols_ready(
     );
     assert!(preferences.identifiers.cpu.png.is_none());
     assert!(preferences.identifiers.ram.png.is_none());
+    assert_eq!(preferences.identifiers.system_symbol_size.points(), 12);
     assert_eq!(preferences.labels.cpu.as_str(), "C");
     assert_eq!(preferences.labels.ram.as_str(), "R");
+}
+
+#[test]
+fn composed_system_symbols_carry_the_shared_size_without_changing_png_or_text() {
+    let mut preferences = IndicatorPreferences::default();
+    preferences.identifiers.system_symbol_size = SystemSymbolSize::try_from(14).unwrap();
+    preferences.identifiers.cpu.mode = MetricIdentifierMode::SystemSymbol;
+    preferences.identifiers.ram.mode = MetricIdentifierMode::Png;
+    preferences.identifiers.ram.png = Some(PngIconMetadata::new("ram.png", 18, 18, 700).unwrap());
+
+    let scene = compose_indicator(
+        &status(),
+        &preferences,
+        statlet::indicator_preferences::IndicatorAppearance::Light,
+    );
+
+    assert!(matches!(
+        scene.top_identifier,
+        Some(MetricIdentifierVisual::SystemSymbol { size, .. }) if size.points() == 14
+    ));
+    assert!(matches!(
+        scene.bottom_identifier,
+        Some(MetricIdentifierVisual::Png { ref metadata, .. })
+            if metadata.source_name() == "ram.png"
+    ));
+    assert_eq!(
+        scene.top,
+        vec![statlet::indicator::IndicatorRun {
+            text: "42%".to_owned(),
+            color: SegmentColor::Semantic(SemanticColor::Warning),
+        }]
+    );
+}
+
+#[test]
+fn changing_shared_symbol_size_leaves_png_scene_identity_unchanged() {
+    let mut preferences = IndicatorPreferences::default();
+    preferences.identifiers.cpu.mode = MetricIdentifierMode::Png;
+    preferences.identifiers.cpu.png = Some(PngIconMetadata::new("cpu.png", 18, 18, 700).unwrap());
+    preferences.identifiers.system_symbol_size = SystemSymbolSize::try_from(8).unwrap();
+    let at_eight = compose_indicator(
+        &status(),
+        &preferences,
+        statlet::indicator_preferences::IndicatorAppearance::Light,
+    );
+    preferences.identifiers.system_symbol_size = SystemSymbolSize::try_from(14).unwrap();
+    let at_fourteen = compose_indicator(
+        &status(),
+        &preferences,
+        statlet::indicator_preferences::IndicatorAppearance::Light,
+    );
+
+    assert_eq!(at_eight.top_identifier, at_fourteen.top_identifier);
+    assert_eq!(at_eight.top, at_fourteen.top);
 }
 
 #[test]
@@ -257,6 +312,7 @@ fn system_symbol_replaces_only_the_cpu_text_identifier_in_the_surface_spec() {
         surface.top.identifier,
         Some(MetricIdentifierVisual::SystemSymbol {
             name: SystemSymbolName::new("cpu").unwrap(),
+            size: SystemSymbolSize::default(),
             color: SegmentColor::Semantic(SemanticColor::Neutral),
             fallback_text: "C ".into(),
         })
@@ -281,6 +337,7 @@ fn graphical_identifier_keeps_a_compact_stable_prefix_when_the_text_label_is_lon
         scene.surface_spec().top.identifier,
         Some(MetricIdentifierVisual::SystemSymbol {
             name: SystemSymbolName::new("cpu").unwrap(),
+            size: SystemSymbolSize::default(),
             color: SegmentColor::Semantic(SemanticColor::Neutral),
             fallback_text: "C ".into(),
         })

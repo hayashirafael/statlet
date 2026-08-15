@@ -2,7 +2,7 @@ use crate::core::{DiskBadge, MetricContent, MetricSeverity, StatusContent};
 use crate::indicator_preferences::{
     IndicatorAppearance, IndicatorPreferences, LabelColorMode, MetricColorMode,
     MetricColorPreferences, MetricIdentifierMode, MetricKind, PngIconMetadata, SrgbColor,
-    SystemSymbolName,
+    SystemSymbolName, SystemSymbolSize,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +41,7 @@ pub struct IndicatorScene {
 pub enum MetricIdentifierVisual {
     SystemSymbol {
         name: SystemSymbolName,
+        size: SystemSymbolSize,
         color: SegmentColor,
         fallback_text: String,
     },
@@ -463,6 +464,7 @@ fn metric_presentation(
         MetricIdentifierMode::SystemSymbol => (
             Some(MetricIdentifierVisual::SystemSymbol {
                 name: identifier.system_symbol.clone(),
+                size: preferences.identifiers.system_symbol_size,
                 color: label_color,
                 fallback_text,
             }),
@@ -593,12 +595,40 @@ pub fn measure_stable_layout_with_prefixes(
     }
 }
 
+pub fn measure_stable_layout_with_prefix_widths(
+    measurer: &impl TextMeasurer,
+    cpu_prefix_width: Option<f64>,
+    ram_prefix_width: Option<f64>,
+    default_width: f64,
+) -> StableLayout {
+    let cpu_width = widest_metric_width_with_prefix(measurer, cpu_prefix_width.unwrap_or(0.0));
+    let ram_width = widest_metric_width_with_prefix(measurer, ram_prefix_width.unwrap_or(0.0));
+    let base_width = cpu_width.max(ram_width);
+
+    StableLayout {
+        cpu_width,
+        ram_width,
+        warning_badge_width: measurer.width(" !"),
+        error_badge_width: measurer.width(" ×"),
+        diagnostics: LayoutDiagnostics {
+            exceeds_menu_bar_height: measurer.content_height() > 22.0,
+            exceeds_curated_width: base_width > 2.0 * default_width,
+        },
+    }
+}
+
 fn widest_metric_width(measurer: &impl TextMeasurer, prefix: Option<&str>) -> f64 {
     (0..=100)
         .map(|percent| {
             let text = format!("{}{}%", prefix.unwrap_or(""), percent);
             measurer.width(&text)
         })
+        .fold(0.0, f64::max)
+}
+
+fn widest_metric_width_with_prefix(measurer: &impl TextMeasurer, prefix_width: f64) -> f64 {
+    (0..=100)
+        .map(|percent| prefix_width + measurer.width(&format!("{percent}%")))
         .fold(0.0, f64::max)
 }
 
