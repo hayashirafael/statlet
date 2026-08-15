@@ -71,7 +71,7 @@ Enquanto o campo estiver incompleto ou inválido, a última cor válida continua
 
 Um único controle **Mostrar rótulos C/R** governa as duas linhas. Não é possível ocultar apenas um deles.
 
-Cada linha oferece seu próprio campo de rótulo. O campo aceita de 1 a 10 caracteres Unicode depois de remover espaços externos; valores vazios ou maiores são rejeitados sem alterar a preferência já válida. Um terceiro campo escolhe de 0 a 4 espaços entre o rótulo e o percentual. O padrão compacto continua `C 18% / R 63%`.
+Cada linha oferece seu próprio campo de rótulo. O campo aceita de 1 a 10 caracteres Unicode depois de remover espaços externos; valores vazios ou maiores são rejeitados sem alterar a preferência já válida. Um terceiro controle escolhe dez níveis decimais entre 0 e 1 espaço: `0`, `0,1` … `0,9` e `1 espaço`. O nível `10` preserva exatamente a largura visual do espaço literal legado; o rótulo não armazena padding e o renderer mede/aplica o delta explicitamente. O padrão compacto continua `C 18% / R 63%`.
 
 Quando visíveis, existem três modos de cor:
 
@@ -158,9 +158,9 @@ Alterar cor, rótulo ou tipografia apenas redesenha. Alterar o intervalo também
 
 ## Persistência e migração
 
-O schema de preferências passa da versão 1 para a versão 2. A versão 2 adiciona um bloco de preferências do indicador e mantém `moleIntegrationEnabled` e `warningThreshold` sem mudança semântica.
+O schema de preferências passa da versão 1 para a versão 2. A versão 2 adiciona um bloco de preferências do indicador e mantém `moleIntegrationEnabled` e `warningThreshold` sem mudança semântica. A versão 3 representa o espaçamento de rótulo em décimos (`0..10`): ao carregar v2, `0` permanece `0` e qualquer valor legado de `1..4` migra para `10`; v1 ou arquivo ausente usam o padrão `10`.
 
-Ao carregar a versão 1, o Statlet preserva os valores existentes de Disco e Mole e preenche o indicador com os padrões listados acima. O próximo salvamento grava a versão 2. Arquivo ausente, corrompido ou com versão não suportada continua produzindo defaults seguros.
+Ao carregar a versão 1, o Statlet preserva os valores existentes de Disco e Mole e preenche o indicador com os padrões listados acima. O próximo salvamento grava a versão 3. Arquivo ausente, corrompido ou com versão não suportada continua produzindo defaults seguros.
 
 Cada alteração válida salva o documento completo por substituição atômica, como hoje. Se a gravação falhar:
 

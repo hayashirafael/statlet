@@ -1,5 +1,6 @@
 use statlet::indicator::{
-    measure_stable_layout, measure_stable_layout_with_prefixes, TextMeasurer,
+    measure_stable_layout, measure_stable_layout_with_prefixes,
+    measure_stable_layout_with_prefixes_and_spacing, TextMeasurer,
 };
 
 struct FakeMeasurer;
@@ -55,6 +56,40 @@ fn custom_label_prefixes_and_spacing_are_measured_before_rendering() {
     assert_eq!(layout.cpu_width, FakeMeasurer.width("CPU uso  100%"));
     assert_eq!(layout.ram_width, FakeMeasurer.width("Memória  100%"));
     assert_eq!(layout.base_width(), layout.ram_width);
+}
+
+#[test]
+fn decimal_spacing_layout_is_monotonic_and_level_ten_matches_one_literal_space() {
+    let full = measure_stable_layout_with_prefixes_and_spacing(
+        &FakeMeasurer,
+        Some("CPU uso"),
+        Some("Memória"),
+        10,
+        10,
+        40.0,
+    );
+    let legacy = measure_stable_layout_with_prefixes(
+        &FakeMeasurer,
+        Some("CPU uso "),
+        Some("Memória "),
+        40.0,
+    );
+
+    assert_eq!(full.cpu_width, legacy.cpu_width);
+    assert_eq!(full.ram_width, legacy.ram_width);
+
+    for level in 1..10 {
+        let layout = measure_stable_layout_with_prefixes_and_spacing(
+            &FakeMeasurer,
+            Some("CPU uso"),
+            Some("Memória"),
+            level,
+            level,
+            40.0,
+        );
+        assert!(layout.cpu_width < full.cpu_width, "CPU level {level}");
+        assert!(layout.ram_width < full.ram_width, "RAM level {level}");
+    }
 }
 
 #[test]

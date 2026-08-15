@@ -35,11 +35,11 @@ fn version_one_migrates_disk_values_and_defaults_the_indicator() {
     assert_eq!(loaded.indicator, IndicatorPreferences::default());
     assert_eq!(loaded.indicator.labels.cpu.as_str(), "C");
     assert_eq!(loaded.indicator.labels.ram.as_str(), "R");
-    assert_eq!(loaded.indicator.labels.spacing.spaces(), 1);
+    assert_eq!(loaded.indicator.labels.spacing.level(), 10);
 }
 
 #[test]
-fn version_two_round_trip_preserves_nested_indicator_preferences() {
+fn version_three_round_trip_preserves_nested_indicator_preferences() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("preferences.json");
     let store = PreferencesStore::new(path.clone());
@@ -52,7 +52,7 @@ fn version_two_round_trip_preserves_nested_indicator_preferences() {
     assert_eq!(store.load(), expected);
     let saved =
         serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(saved["version"], 2);
+    assert_eq!(saved["version"], 3);
     assert_eq!(
         saved["indicator"]["typography"]["family"],
         serde_json::json!({ "named": "Avenir Next" })
@@ -60,7 +60,7 @@ fn version_two_round_trip_preserves_nested_indicator_preferences() {
 }
 
 #[test]
-fn version_two_round_trip_preserves_custom_labels_and_spacing() {
+fn version_three_round_trip_preserves_custom_labels_and_spacing() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("preferences.json");
     let store = PreferencesStore::new(path.clone());
@@ -77,6 +77,30 @@ fn version_two_round_trip_preserves_custom_labels_and_spacing() {
     assert_eq!(saved["indicator"]["labels"]["cpu"], "CPU uso");
     assert_eq!(saved["indicator"]["labels"]["ram"], "Memória");
     assert_eq!(saved["indicator"]["labels"]["spacing"], 3);
+}
+
+#[test]
+fn version_two_spacing_migrates_legacy_spaces_to_decimal_levels() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("preferences.json");
+    let store = PreferencesStore::new(path.clone());
+
+    store.save(Preferences::default()).unwrap();
+    let stored =
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path).unwrap()).unwrap();
+
+    for (legacy, expected) in [(0, 0), (1, 10), (4, 10)] {
+        let mut v2 = stored.clone();
+        v2["version"] = serde_json::json!(2);
+        v2["indicator"]["labels"]["spacing"] = serde_json::json!(legacy);
+        fs::write(&path, serde_json::to_vec(&v2).unwrap()).unwrap();
+
+        assert_eq!(
+            store.load().indicator.labels.spacing,
+            LabelSpacing::try_from(expected).unwrap(),
+            "legacy spacing {legacy}"
+        );
+    }
 }
 
 #[test]
@@ -177,7 +201,7 @@ fn invalid_nested_version_two_values_load_safe_defaults() {
             "/indicator/typography/family",
             serde_json::json!({ "named": "   " }),
         ),
-        ("unsupported version", "/version", serde_json::json!(3)),
+        ("unsupported version", "/version", serde_json::json!(4)),
     ];
 
     for (case, pointer, invalid_value) in invalid_values {
@@ -221,7 +245,7 @@ fn valid_versioned_preferences_round_trip_with_atomic_replacement() {
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&json).unwrap(),
         serde_json::json!({
-            "version": 2,
+            "version": 3,
             "moleIntegrationEnabled": false,
             "warningThreshold": 95,
             "indicator": {
@@ -263,7 +287,7 @@ fn valid_versioned_preferences_round_trip_with_atomic_replacement() {
                     },
                     "cpu": "C",
                     "ram": "R",
-                    "spacing": 1
+                    "spacing": 10
                 },
                 "typography": {
                     "family": "systemMonospaced",

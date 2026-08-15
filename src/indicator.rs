@@ -25,6 +25,7 @@ pub enum SegmentColor {
 pub struct IndicatorRun {
     pub text: String,
     pub color: SegmentColor,
+    pub trailing_spacing_level: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,10 +154,12 @@ pub fn compose_indicator(
             DiskBadge::Warning => IndicatorRun {
                 text: " !".to_owned(),
                 color: SegmentColor::Semantic(SemanticColor::DiskWarning),
+                trailing_spacing_level: 0,
             },
             DiskBadge::Error => IndicatorRun {
                 text: " ×".to_owned(),
                 color: SegmentColor::Semantic(SemanticColor::DiskError),
+                trailing_spacing_level: 0,
             },
         }),
         accessibility_label: status.accessibility_label.clone(),
@@ -268,7 +271,14 @@ fn resolve_metric_identifier_fallback(
             ..
         } => (fallback_text, fallback_color),
     };
-    runs.insert(0, IndicatorRun { text, color });
+    runs.insert(
+        0,
+        IndicatorRun {
+            text,
+            color,
+            trailing_spacing_level: 0,
+        },
+    );
     true
 }
 
@@ -422,13 +432,15 @@ fn metric_runs(
             }
         };
         runs.push(IndicatorRun {
-            text: format!("{label}{}", " ".repeat(preferences.labels.spacing.spaces())),
+            text: label.to_owned(),
             color,
+            trailing_spacing_level: preferences.labels.spacing.level(),
         });
     }
     runs.push(IndicatorRun {
         text: format!("{}%", metric.percent),
         color: metric_color,
+        trailing_spacing_level: 0,
     });
     runs
 }
@@ -457,6 +469,7 @@ fn metric_presentation(
     let value_run = IndicatorRun {
         text: format!("{}%", metric.percent),
         color: metric_color,
+        trailing_spacing_level: 0,
     };
     match identifier.mode {
         MetricIdentifierMode::Text => unreachable!("text mode returned above"),
@@ -484,6 +497,7 @@ fn metric_presentation(
                     IndicatorRun {
                         text: fallback_text,
                         color: label_color,
+                        trailing_spacing_level: 0,
                     },
                     value_run,
                 ],
@@ -593,12 +607,48 @@ pub fn measure_stable_layout_with_prefixes(
     }
 }
 
+pub fn measure_stable_layout_with_prefixes_and_spacing(
+    measurer: &impl TextMeasurer,
+    cpu_prefix: Option<&str>,
+    ram_prefix: Option<&str>,
+    cpu_spacing_level: u8,
+    ram_spacing_level: u8,
+    default_width: f64,
+) -> StableLayout {
+    let cpu_width = widest_metric_width_with_spacing(measurer, cpu_prefix, cpu_spacing_level);
+    let ram_width = widest_metric_width_with_spacing(measurer, ram_prefix, ram_spacing_level);
+    let base_width = cpu_width.max(ram_width);
+
+    StableLayout {
+        cpu_width,
+        ram_width,
+        warning_badge_width: measurer.width(" !"),
+        error_badge_width: measurer.width(" ×"),
+        diagnostics: LayoutDiagnostics {
+            exceeds_menu_bar_height: measurer.content_height() > 22.0,
+            exceeds_curated_width: base_width > 2.0 * default_width,
+        },
+    }
+}
+
 fn widest_metric_width(measurer: &impl TextMeasurer, prefix: Option<&str>) -> f64 {
     (0..=100)
         .map(|percent| {
             let text = format!("{}{}%", prefix.unwrap_or(""), percent);
             measurer.width(&text)
         })
+        .fold(0.0, f64::max)
+}
+
+fn widest_metric_width_with_spacing(
+    measurer: &impl TextMeasurer,
+    prefix: Option<&str>,
+    spacing_level: u8,
+) -> f64 {
+    let prefix_width = prefix.map_or(0.0, |prefix| measurer.width(prefix));
+    let spacing_width = measurer.width(" ") * f64::from(spacing_level) / 10.0;
+    (0..=100)
+        .map(|percent| measurer.width(&format!("{percent}%")) + prefix_width + spacing_width)
         .fold(0.0, f64::max)
 }
 

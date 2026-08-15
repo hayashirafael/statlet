@@ -21,9 +21,9 @@ use objc2_foundation::{
 
 use statlet::icon_assets::IconAssetStore;
 use statlet::indicator::{
-    measure_stable_layout, measure_stable_layout_with_prefixes, IndicatorRun, IndicatorScene,
-    LayoutDiagnostics, MetricIdentifierVisual, SegmentColor, SemanticColor, StableLayout,
-    TextMeasurer,
+    measure_stable_layout, measure_stable_layout_with_prefixes_and_spacing, IndicatorRun,
+    IndicatorScene, LayoutDiagnostics, MetricIdentifierVisual, SegmentColor, SemanticColor,
+    StableLayout, TextMeasurer,
 };
 use statlet::indicator_preferences::{
     FontWeight, MetricKind, PngIconMetadata, TypographyPreferences,
@@ -85,6 +85,8 @@ struct LayoutKey {
     weight: FontWeight,
     cpu_prefix: Option<String>,
     ram_prefix: Option<String>,
+    cpu_spacing_level: u8,
+    ram_spacing_level: u8,
     dev_marker: Option<String>,
 }
 
@@ -185,6 +187,7 @@ enum IdentifierIdentity {
 struct RunIdentity {
     text: String,
     paint: PaintIdentity,
+    trailing_spacing_level: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,6 +209,7 @@ fn paint_key(scene: &IndicatorScene, layout: LayoutKey, appearance: String) -> P
             &IndicatorRun {
                 text: text.clone(),
                 color: SegmentColor::Semantic(SemanticColor::Neutral),
+                trailing_spacing_level: 0,
             },
             &appearance,
         )
@@ -310,6 +314,7 @@ fn run_identity(run: &IndicatorRun, appearance: &str) -> RunIdentity {
     RunIdentity {
         text: run.text.clone(),
         paint: paint_identity(run.color, appearance),
+        trailing_spacing_level: run.trailing_spacing_level,
     }
 }
 
@@ -518,6 +523,13 @@ fn metric_prefix(
         .or_else(|| label_prefix(runs))
 }
 
+fn metric_spacing_level(runs: &[IndicatorRun]) -> u8 {
+    match runs {
+        [label, _] => label.trailing_spacing_level,
+        _ => 0,
+    }
+}
+
 type TextAttributes = Retained<NSDictionary<NSString, AnyObject>>;
 
 #[derive(Clone)]
@@ -680,6 +692,8 @@ impl Renderer {
         let measurer = resolved.measurer;
         let cpu_prefix = metric_prefix(&scene.top, scene.top_identifier.as_ref());
         let ram_prefix = metric_prefix(&scene.bottom, scene.bottom_identifier.as_ref());
+        let cpu_spacing_level = metric_spacing_level(&scene.top);
+        let ram_spacing_level = metric_spacing_level(&scene.bottom);
         let marker_plan = if slot == RenderSlot::Status {
             status_marker_plan(&self.presentation, |text| measurer.width(text))
         } else {
@@ -694,13 +708,17 @@ impl Renderer {
             weight: typography.weight,
             cpu_prefix,
             ram_prefix,
+            cpu_spacing_level,
+            ram_spacing_level,
             dev_marker: marker_plan.text.clone(),
         };
         let layout = self.cache.resolve_layout(slot, &layout_key, || {
-            measure_stable_layout_with_prefixes(
+            measure_stable_layout_with_prefixes_and_spacing(
                 &measurer,
                 layout_key.cpu_prefix.as_deref(),
                 layout_key.ram_prefix.as_deref(),
+                layout_key.cpu_spacing_level,
+                layout_key.ram_spacing_level,
                 self.default_width,
             )
         });
@@ -961,6 +979,7 @@ fn draw_image(
                     &IndicatorRun {
                         text: marker.clone(),
                         color: SegmentColor::Semantic(SemanticColor::Neutral),
+                        trailing_spacing_level: 0,
                     },
                     text.attributes,
                     text.appearance_name,
@@ -1029,6 +1048,7 @@ fn draw_metric_line(
                 &IndicatorRun {
                     text: fallback_text.clone(),
                     color: fallback_color,
+                    trailing_spacing_level: 0,
                 },
                 context.attributes,
                 context.appearance_name,
@@ -1072,7 +1092,8 @@ fn draw_metric_line(
                 context.appearance_name,
             )
             .drawAtPoint(NSPoint {
-                x: label_value_origin(context.measurer, &label.text),
+                x: label_value_origin(context.measurer, &label.text)
+                    + context.measurer.width(" ") * f64::from(label.trailing_spacing_level) / 10.0,
                 y,
             });
         }
@@ -1588,6 +1609,8 @@ mod tests {
             weight: FontWeight::Medium,
             cpu_prefix: labels_visible.then(|| "C ".to_owned()),
             ram_prefix: labels_visible.then(|| "R ".to_owned()),
+            cpu_spacing_level: 0,
+            ram_spacing_level: 0,
             dev_marker: None,
         }
     }
@@ -1635,6 +1658,17 @@ mod tests {
             || measure_stable_layout(&measurer, false, 40.0),
         );
         assert!(measurer.calls.get() > after_labels);
+
+        let after_typography = measurer.calls.get();
+        let mut decimal_spacing_key = layout_key("Menlo", false);
+        decimal_spacing_key.cpu_spacing_level = 5;
+        cache.resolve_layout(RenderSlot::Status, &decimal_spacing_key, || {
+            measure_stable_layout(&measurer, false, 40.0)
+        });
+        assert!(
+            measurer.calls.get() > after_typography,
+            "a decimal spacing level must invalidate the layout cache"
+        );
     }
 
     #[test]
@@ -1666,10 +1700,12 @@ mod tests {
             top: vec![IndicatorRun {
                 text: "C 42%".to_owned(),
                 color: SegmentColor::Semantic(SemanticColor::Warning),
+                trailing_spacing_level: 0,
             }],
             bottom: vec![IndicatorRun {
                 text: "R 68%".to_owned(),
                 color: SegmentColor::Semantic(SemanticColor::Warning),
+                trailing_spacing_level: 0,
             }],
             top_identifier: None,
             bottom_identifier: None,
@@ -1726,10 +1762,12 @@ mod tests {
             top: vec![IndicatorRun {
                 text: "42%".to_owned(),
                 color: SegmentColor::Srgb(SrgbColor::parse_hex("#AF52DE").unwrap()),
+                trailing_spacing_level: 0,
             }],
             bottom: vec![IndicatorRun {
                 text: "68%".to_owned(),
                 color: SegmentColor::Semantic(SemanticColor::Good),
+                trailing_spacing_level: 0,
             }],
             top_identifier: None,
             bottom_identifier: None,
@@ -1913,10 +1951,12 @@ mod tests {
             top: vec![IndicatorRun {
                 text: "C 42%".to_owned(),
                 color: SegmentColor::Semantic(SemanticColor::Warning),
+                trailing_spacing_level: 0,
             }],
             bottom: vec![IndicatorRun {
                 text: "R 68%".to_owned(),
                 color: SegmentColor::Semantic(SemanticColor::Good),
+                trailing_spacing_level: 0,
             }],
             top_identifier: None,
             bottom_identifier: None,
@@ -2205,6 +2245,7 @@ mod tests {
         warning.disk_badge = Some(IndicatorRun {
             text: " !".to_owned(),
             color: SegmentColor::Semantic(SemanticColor::DiskWarning),
+            trailing_spacing_level: 0,
         });
         let mut changed = warning.clone();
         changed.disk_badge.as_mut().unwrap().text = " ?".to_owned();
@@ -2237,6 +2278,7 @@ mod tests {
                 .map(|text| IndicatorRun {
                     text: (*text).to_owned(),
                     color: SegmentColor::Semantic(SemanticColor::Neutral),
+                    trailing_spacing_level: 0,
                 })
                 .collect()
         };
@@ -2255,10 +2297,12 @@ mod tests {
             top: vec![IndicatorRun {
                 text: "C 42%".to_owned(),
                 color,
+                trailing_spacing_level: 0,
             }],
             bottom: vec![IndicatorRun {
                 text: "R 68%".to_owned(),
                 color,
+                trailing_spacing_level: 0,
             }],
             top_identifier: None,
             bottom_identifier: None,

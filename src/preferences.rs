@@ -13,7 +13,7 @@ use crate::indicator_preferences::{
     SystemSymbolName, TypographyPreferences,
 };
 
-const CURRENT_VERSION: u8 = 2;
+const CURRENT_VERSION: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreferencesCommitState {
@@ -144,7 +144,7 @@ impl PreferencesStore {
             .write(true)
             .open(temporary_path)
             .map_err(PreferencesSaveError::not_committed)?;
-        let stored = StoredPreferencesV2::from(preferences);
+        let stored = StoredPreferencesV3::from(preferences);
         serde_json::to_writer_pretty(&mut file, &stored)
             .map_err(io::Error::other)
             .map_err(PreferencesSaveError::not_committed)?;
@@ -244,6 +244,9 @@ fn decode(bytes: &[u8]) -> Option<Preferences> {
         2 => serde_json::from_slice::<StoredPreferencesV2>(bytes)
             .ok()?
             .into_preferences(),
+        3 => serde_json::from_slice::<StoredPreferencesV3>(bytes)
+            .ok()?
+            .into_preferences(),
         _ => None,
     }
 }
@@ -279,7 +282,30 @@ struct StoredPreferencesV2 {
     indicator: StoredIndicatorPreferences,
 }
 
-impl From<Preferences> for StoredPreferencesV2 {
+impl StoredPreferencesV2 {
+    fn into_preferences(self) -> Option<Preferences> {
+        if self.version != 2 {
+            return None;
+        }
+
+        Some(Preferences {
+            mole_integration_enabled: self.mole_integration_enabled,
+            warning_threshold: WarningThreshold::try_from(self.warning_threshold).ok()?,
+            indicator: self.indicator.into_preferences(true)?,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredPreferencesV3 {
+    version: u8,
+    mole_integration_enabled: bool,
+    warning_threshold: u8,
+    indicator: StoredIndicatorPreferences,
+}
+
+impl From<Preferences> for StoredPreferencesV3 {
     fn from(preferences: Preferences) -> Self {
         Self {
             version: CURRENT_VERSION,
@@ -290,7 +316,7 @@ impl From<Preferences> for StoredPreferencesV2 {
     }
 }
 
-impl StoredPreferencesV2 {
+impl StoredPreferencesV3 {
     fn into_preferences(self) -> Option<Preferences> {
         if self.version != CURRENT_VERSION {
             return None;
@@ -299,7 +325,7 @@ impl StoredPreferencesV2 {
         Some(Preferences {
             mole_integration_enabled: self.mole_integration_enabled,
             warning_threshold: WarningThreshold::try_from(self.warning_threshold).ok()?,
-            indicator: self.indicator.into_preferences()?,
+            indicator: self.indicator.into_preferences(false)?,
         })
     }
 }
@@ -330,12 +356,12 @@ impl From<IndicatorPreferences> for StoredIndicatorPreferences {
 }
 
 impl StoredIndicatorPreferences {
-    fn into_preferences(self) -> Option<IndicatorPreferences> {
+    fn into_preferences(self, migrate_v2_spacing: bool) -> Option<IndicatorPreferences> {
         Some(IndicatorPreferences {
             cpu_color: self.cpu_color.into_preferences()?,
             ram_color: self.ram_color.into_preferences()?,
             identifiers: self.identifiers.into_preferences()?,
-            labels: self.labels.into_preferences()?,
+            labels: self.labels.into_preferences(migrate_v2_spacing)?,
             typography: self.typography.into_preferences()?,
             refresh_interval: MetricsRefreshInterval::try_from(self.refresh_interval).ok()?,
         })
@@ -596,13 +622,13 @@ impl From<LabelPreferences> for StoredLabelPreferences {
             fixed: preferences.fixed.into(),
             cpu: Some(preferences.cpu.as_str().to_owned()),
             ram: Some(preferences.ram.as_str().to_owned()),
-            spacing: Some(preferences.spacing.spaces() as u8),
+            spacing: Some(preferences.spacing.level()),
         }
     }
 }
 
 impl StoredLabelPreferences {
-    fn into_preferences(self) -> Option<LabelPreferences> {
+    fn into_preferences(self, migrate_v2_spacing: bool) -> Option<LabelPreferences> {
         let defaults = IndicatorPreferences::default().labels;
         Some(LabelPreferences {
             visible: self.visible,
@@ -622,6 +648,13 @@ impl StoredLabelPreferences {
                 .unwrap_or(defaults.ram),
             spacing: self
                 .spacing
+                .map(|value| {
+                    if migrate_v2_spacing && value > 0 {
+                        10
+                    } else {
+                        value
+                    }
+                })
                 .map(LabelSpacing::try_from)
                 .transpose()
                 .ok()?

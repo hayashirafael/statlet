@@ -586,16 +586,12 @@ impl IndicatorControlsTarget {
             .ok()
             .and_then(|value| LabelSpacing::try_from(value).ok());
         let Some(spacing) = spacing else {
-            self.ivars().label_spacing.setIntegerValue(
-                isize::try_from(self.ivars().selected_label_spacing.get().spaces())
-                    .expect("label spacing fits NSInteger"),
-            );
+            self.ivars().label_spacing.setIntegerValue(isize::from(
+                self.ivars().selected_label_spacing.get().level(),
+            ));
             return;
         };
-        let value = match spacing.spaces() {
-            1 => "1 espaço".to_owned(),
-            spaces => format!("{spaces} espaços"),
-        };
+        let value = label_spacing_value(spacing);
         set_slider_value_text(
             &self.ivars().label_spacing,
             &self.ivars().label_spacing_value,
@@ -613,6 +609,14 @@ fn restore_identifier_segment(control: &NSSegmentedControl, mode: MetricIdentifi
         MetricIdentifierMode::SystemSymbol => 1,
         MetricIdentifierMode::Png => 2,
     });
+}
+
+fn label_spacing_value(spacing: LabelSpacing) -> String {
+    match spacing.level() {
+        0 => "0 espaços".to_owned(),
+        10 => "1 espaço".to_owned(),
+        level => format!("0,{level} espaço"),
+    }
 }
 
 struct IndicatorLayoutViews {
@@ -1857,14 +1861,9 @@ impl IndicatorControls {
                 .map(objc2_foundation::NSString::from_str)
                 .as_deref(),
         );
-        self.label_spacing.setIntegerValue(
-            isize::try_from(preferences.labels.spacing.spaces())
-                .expect("label spacing fits NSInteger"),
-        );
-        let spacing_value = match preferences.labels.spacing.spaces() {
-            1 => "1 espaço".to_owned(),
-            spaces => format!("{spaces} espaços"),
-        };
+        self.label_spacing
+            .setIntegerValue(isize::from(preferences.labels.spacing.level()));
+        let spacing_value = label_spacing_value(preferences.labels.spacing);
         set_slider_value_text(
             &self.label_spacing,
             &self.layout_views.label_spacing_value,
