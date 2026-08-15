@@ -827,10 +827,8 @@ impl Renderer {
             IdentifierImages {
                 top: top_identifier_image.as_deref(),
                 bottom: bottom_identifier_image.as_deref(),
-            },
-            IdentifierPrefixWidths {
-                top: cpu_prefix_width,
-                bottom: ram_prefix_width,
+                top_prefix_width: cpu_prefix_width,
+                bottom_prefix_width: ram_prefix_width,
             },
             &font.font,
             &measurer,
@@ -991,11 +989,8 @@ impl TextMeasurer for FontTextMeasurer {
 struct IdentifierImages<'a> {
     top: Option<&'a NSImage>,
     bottom: Option<&'a NSImage>,
-}
-
-struct IdentifierPrefixWidths {
-    top: Option<f64>,
-    bottom: Option<f64>,
+    top_prefix_width: Option<f64>,
+    bottom_prefix_width: Option<f64>,
 }
 
 struct ImageRenderEnvironment<'a> {
@@ -1006,7 +1001,6 @@ struct ImageRenderEnvironment<'a> {
 fn draw_image(
     scene: &IndicatorScene,
     identifier_images: IdentifierImages<'_>,
-    identifier_prefix_widths: IdentifierPrefixWidths,
     font: &NSFont,
     measurer: &FontTextMeasurer,
     layout: StableLayout,
@@ -1048,7 +1042,7 @@ fn draw_image(
                 &scene.bottom,
                 scene.bottom_identifier.as_ref(),
                 identifier_images.bottom,
-                identifier_prefix_widths.bottom,
+                identifier_images.bottom_prefix_width,
                 margin - descent,
                 layout.ram_width,
                 &mut text,
@@ -1057,7 +1051,7 @@ fn draw_image(
                 &scene.top,
                 scene.top_identifier.as_ref(),
                 identifier_images.top,
-                identifier_prefix_widths.top,
+                identifier_images.top_prefix_width,
                 margin + cap_height + LINE_GAP - descent,
                 layout.cpu_width,
                 &mut text,
