@@ -558,6 +558,21 @@ fn metric_prefix_width(
     }
 }
 
+fn shared_graphical_prefix_widths(
+    top_identifier: Option<&MetricIdentifierVisual>,
+    bottom_identifier: Option<&MetricIdentifierVisual>,
+    top_width: Option<f64>,
+    bottom_width: Option<f64>,
+) -> (Option<f64>, Option<f64>) {
+    match (top_identifier, bottom_identifier, top_width, bottom_width) {
+        (Some(_), Some(_), Some(top_width), Some(bottom_width)) => {
+            let shared_width = top_width.max(bottom_width);
+            (Some(shared_width), Some(shared_width))
+        }
+        _ => (top_width, bottom_width),
+    }
+}
+
 fn metric_spacing_level(runs: &[IndicatorRun]) -> u8 {
     match runs {
         [label, _] => label.trailing_spacing_level,
@@ -772,6 +787,12 @@ impl Renderer {
             scene.bottom_identifier.as_ref(),
             bottom_identifier_image.as_deref(),
         );
+        let (cpu_prefix_width, ram_prefix_width) = shared_graphical_prefix_widths(
+            scene.top_identifier.as_ref(),
+            scene.bottom_identifier.as_ref(),
+            cpu_prefix_width,
+            ram_prefix_width,
+        );
         let cpu_spacing_width = layout_key.cpu_prefix.as_deref().map_or(0.0, |prefix| {
             trailing_spacing_width(&measurer, prefix, layout_key.cpu_spacing_level)
         });
@@ -806,6 +827,10 @@ impl Renderer {
             IdentifierImages {
                 top: top_identifier_image.as_deref(),
                 bottom: bottom_identifier_image.as_deref(),
+            },
+            IdentifierPrefixWidths {
+                top: cpu_prefix_width,
+                bottom: ram_prefix_width,
             },
             &font.font,
             &measurer,
@@ -968,6 +993,11 @@ struct IdentifierImages<'a> {
     bottom: Option<&'a NSImage>,
 }
 
+struct IdentifierPrefixWidths {
+    top: Option<f64>,
+    bottom: Option<f64>,
+}
+
 struct ImageRenderEnvironment<'a> {
     appearance: &'a NSAppearance,
     marker: StatusMarkerPlan,
@@ -976,6 +1006,7 @@ struct ImageRenderEnvironment<'a> {
 fn draw_image(
     scene: &IndicatorScene,
     identifier_images: IdentifierImages<'_>,
+    identifier_prefix_widths: IdentifierPrefixWidths,
     font: &NSFont,
     measurer: &FontTextMeasurer,
     layout: StableLayout,
@@ -1017,6 +1048,7 @@ fn draw_image(
                 &scene.bottom,
                 scene.bottom_identifier.as_ref(),
                 identifier_images.bottom,
+                identifier_prefix_widths.bottom,
                 margin - descent,
                 layout.ram_width,
                 &mut text,
@@ -1025,6 +1057,7 @@ fn draw_image(
                 &scene.top,
                 scene.top_identifier.as_ref(),
                 identifier_images.top,
+                identifier_prefix_widths.top,
                 margin + cap_height + LINE_GAP - descent,
                 layout.cpu_width,
                 &mut text,
@@ -1079,6 +1112,7 @@ fn draw_metric_line(
     runs: &[IndicatorRun],
     identifier: Option<&MetricIdentifierVisual>,
     identifier_image: Option<&NSImage>,
+    resolved_prefix_width: Option<f64>,
     y: f64,
     line_width: f64,
     context: &mut DrawTextContext<'_>,
@@ -1096,9 +1130,10 @@ fn draw_metric_line(
                 ..
             } => (fallback_text, *color),
         };
-        let prefix_width =
+        let prefix_width = resolved_prefix_width.unwrap_or_else(|| {
             metric_prefix_width(context.measurer, runs, Some(identifier), identifier_image)
-                .unwrap_or_else(|| context.measurer.width(fallback_text));
+                .unwrap_or_else(|| context.measurer.width(fallback_text))
+        });
         if let Some(image) = identifier_image {
             draw_metric_identifier(image, identifier, y, prefix_width, context);
         } else {
@@ -1184,7 +1219,12 @@ fn draw_metric_identifier(
             let Some(metrics) = system_symbol_image_metrics(image) else {
                 return;
             };
-            system_symbol_draw_rect(metrics, cap_height, y - context.font.descender())
+            system_symbol_draw_rect(
+                metrics,
+                cap_height,
+                y - context.font.descender(),
+                (prefix_width - spacing).max(1.0),
+            )
         }
         MetricIdentifierVisual::Png { .. } => {
             let source = image.size();
@@ -1264,9 +1304,10 @@ fn system_symbol_draw_rect(
     metrics: SystemSymbolImageMetrics,
     cap_height: f64,
     cap_origin_y: f64,
+    column_width: f64,
 ) -> IdentifierDrawRect {
     IdentifierDrawRect {
-        x: -metrics.alignment_x,
+        x: (column_width - metrics.alignment_width) / 2.0 - metrics.alignment_x,
         y: cap_origin_y + (cap_height - metrics.alignment_height) / 2.0 - metrics.alignment_y,
         width: metrics.image_width,
         height: metrics.image_height,
@@ -1699,13 +1740,85 @@ mod tests {
                 alignment_width: optical_width,
                 alignment_height: optical_height,
             };
-            let rect = system_symbol_draw_rect(metrics, 9.0, 2.0);
+            let rect = system_symbol_draw_rect(metrics, 9.0, 2.0, optical_width);
             let optical_center_y = rect.y + metrics.alignment_y + optical_height / 2.0;
 
             assert!((optical_center_y - 6.5).abs() < f64::EPSILON);
             assert_eq!(rect.width, point_size);
             assert_eq!(rect.height, point_size);
         }
+    }
+
+    #[test]
+    fn graphical_identifiers_share_an_optical_column_before_their_percentages() {
+        let Some(_marker) = MainThreadMarker::new() else {
+            eprintln!("SKIP: AppKit symbol validation requires a main-thread test marker");
+            return;
+        };
+        let color = NSColor::labelColor();
+        let gauge = create_system_symbol_image(
+            &SystemSymbolName::new("gauge.with.dots.needle.33percent").unwrap(),
+            &color,
+            12.0,
+            FontWeight::Medium,
+        )
+        .unwrap();
+        let memorychip = create_system_symbol_image(
+            &SystemSymbolName::new("memorychip").unwrap(),
+            &color,
+            12.0,
+            FontWeight::Medium,
+        )
+        .unwrap();
+        let gauge_metrics = system_symbol_image_metrics(&gauge).unwrap();
+        let memorychip_metrics = system_symbol_image_metrics(&memorychip).unwrap();
+        assert_eq!(gauge_metrics.alignment_width, 14.5);
+        assert_eq!(memorychip_metrics.alignment_width, 16.0);
+        let font = NSFont::monospacedSystemFontOfSize_weight(12.0, unsafe { NSFontWeightMedium });
+        let measurer = FontTextMeasurer::new(&font);
+        let gauge_identifier = MetricIdentifierVisual::SystemSymbol {
+            name: SystemSymbolName::new("gauge.with.dots.needle.33percent").unwrap(),
+            size: statlet::indicator_preferences::SystemSymbolSize::try_from(14).unwrap(),
+            color: SegmentColor::Semantic(SemanticColor::Neutral),
+            fallback_text: "C ".to_owned(),
+        };
+        let memorychip_identifier = MetricIdentifierVisual::SystemSymbol {
+            name: SystemSymbolName::new("memorychip").unwrap(),
+            size: statlet::indicator_preferences::SystemSymbolSize::try_from(14).unwrap(),
+            color: SegmentColor::Semantic(SemanticColor::Neutral),
+            fallback_text: "R ".to_owned(),
+        };
+        let gauge_width =
+            metric_prefix_width(&measurer, &[], Some(&gauge_identifier), Some(&gauge)).unwrap();
+        let memorychip_width = metric_prefix_width(
+            &measurer,
+            &[],
+            Some(&memorychip_identifier),
+            Some(&memorychip),
+        )
+        .unwrap();
+        assert_ne!(gauge_width, memorychip_width);
+        let (gauge_width, memorychip_width) = shared_graphical_prefix_widths(
+            Some(&gauge_identifier),
+            Some(&memorychip_identifier),
+            Some(gauge_width),
+            Some(memorychip_width),
+        );
+        let shared_column_width = gauge_width.unwrap() - measurer.width(" ");
+        let gauge_rect = system_symbol_draw_rect(gauge_metrics, 10.0, 2.0, shared_column_width);
+        let memorychip_rect =
+            system_symbol_draw_rect(memorychip_metrics, 10.0, 2.0, shared_column_width);
+        let gauge_center =
+            gauge_rect.x + gauge_metrics.alignment_x + gauge_metrics.alignment_width / 2.0;
+        let memorychip_center = memorychip_rect.x
+            + memorychip_metrics.alignment_x
+            + memorychip_metrics.alignment_width / 2.0;
+
+        assert!(
+            (gauge_width.unwrap() - memorychip_width.unwrap()).abs() < f64::EPSILON,
+            "gauge and memorychip must share one prefix width before their percentages"
+        );
+        assert!((gauge_center - memorychip_center).abs() < f64::EPSILON);
     }
 
     #[test]
