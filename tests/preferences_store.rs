@@ -104,6 +104,23 @@ fn version_two_spacing_migrates_legacy_spaces_to_decimal_levels() {
 }
 
 #[test]
+fn version_two_spacing_above_the_legacy_range_loads_safe_defaults() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("preferences.json");
+    let store = PreferencesStore::new(path.clone());
+
+    store.save(Preferences::default()).unwrap();
+    let mut stored =
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path).unwrap()).unwrap();
+    stored["version"] = serde_json::json!(2);
+    stored["moleIntegrationEnabled"] = serde_json::json!(true);
+    stored["indicator"]["labels"]["spacing"] = serde_json::json!(5);
+    fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+    assert_eq!(store.load(), Preferences::default());
+}
+
+#[test]
 fn corrupt_or_unsupported_preferences_load_safe_defaults() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("preferences.json");

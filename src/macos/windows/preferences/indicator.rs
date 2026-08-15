@@ -615,7 +615,7 @@ fn label_spacing_value(spacing: LabelSpacing) -> String {
     match spacing.level() {
         0 => "0 espaços".to_owned(),
         10 => "1 espaço".to_owned(),
-        level => format!("0,{level} espaço"),
+        level => format!("0.{level} espaço"),
     }
 }
 
@@ -2525,13 +2525,13 @@ mod tests {
     use std::path::PathBuf;
 
     use statlet::icon_assets::IconAssetStore;
-    use statlet::indicator_preferences::MetricKind;
+    use statlet::indicator_preferences::{LabelSpacing, MetricKind};
     use statlet::preferences_view::PreferencesArea;
     use statlet::runtime_profile::{BundleProfileMetadata, RuntimeProfile};
 
     use super::{
-        fitted_heading_width, get_or_create_font_resources, png_panel_presentation,
-        IndicatorAreaVisibility,
+        fitted_heading_width, get_or_create_font_resources, label_spacing_value,
+        png_panel_presentation, IndicatorAreaVisibility,
     };
 
     #[test]
@@ -2651,5 +2651,20 @@ mod tests {
         assert_eq!(fitted_heading_width(60.0), 92.0);
         assert_eq!(fitted_heading_width(120.0), 120.0);
         assert_eq!(fitted_heading_width(420.0), 378.0);
+    }
+
+    #[test]
+    fn label_spacing_value_uses_decimal_points_for_intermediate_levels() {
+        for (level, expected) in [
+            (0, "0 espaços"),
+            (1, "0.1 espaço"),
+            (9, "0.9 espaço"),
+            (10, "1 espaço"),
+        ] {
+            assert_eq!(
+                label_spacing_value(LabelSpacing::try_from(level).unwrap()),
+                expected
+            );
+        }
     }
 }

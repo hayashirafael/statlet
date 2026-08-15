@@ -92,6 +92,49 @@ fn decimal_spacing_layout_is_monotonic_and_level_ten_matches_one_literal_space()
     }
 }
 
+struct ContextualSpacingMeasurer;
+
+impl TextMeasurer for ContextualSpacingMeasurer {
+    fn width(&self, text: &str) -> f64 {
+        match text {
+            "CPU uso" => 50.0,
+            "CPU uso " => 61.0,
+            "CPU uso 100%" => 82.0,
+            "Memória" => 60.0,
+            "Memória " => 73.0,
+            "Memória 100%" => 94.0,
+            "100%" => 21.0,
+            " " => 4.0,
+            _ => text.chars().count() as f64 * 7.0,
+        }
+    }
+
+    fn content_height(&self) -> f64 {
+        18.0
+    }
+}
+
+#[test]
+fn decimal_spacing_uses_the_contextual_literal_space_delta() {
+    let full = measure_stable_layout_with_prefixes_and_spacing(
+        &ContextualSpacingMeasurer,
+        Some("CPU uso"),
+        Some("Memória"),
+        10,
+        10,
+        40.0,
+    );
+    let legacy = measure_stable_layout_with_prefixes(
+        &ContextualSpacingMeasurer,
+        Some("CPU uso "),
+        Some("Memória "),
+        40.0,
+    );
+
+    assert_eq!(full.cpu_width, legacy.cpu_width);
+    assert_eq!(full.ram_width, legacy.ram_width);
+}
+
 #[test]
 fn hidden_label_values_keep_the_same_three_digit_right_alignment() {
     let layout = measure_stable_layout(&FakeMeasurer, false, 40.0);

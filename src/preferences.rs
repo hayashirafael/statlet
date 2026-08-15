@@ -630,6 +630,25 @@ impl From<LabelPreferences> for StoredLabelPreferences {
 impl StoredLabelPreferences {
     fn into_preferences(self, migrate_v2_spacing: bool) -> Option<LabelPreferences> {
         let defaults = IndicatorPreferences::default().labels;
+        let spacing = self
+            .spacing
+            .map(|value| {
+                if migrate_v2_spacing {
+                    match value {
+                        0 => Ok(0),
+                        1..=4 => Ok(10),
+                        _ => Err(()),
+                    }
+                } else {
+                    Ok(value)
+                }
+            })
+            .transpose()
+            .ok()?
+            .map(LabelSpacing::try_from)
+            .transpose()
+            .ok()?
+            .unwrap_or(defaults.spacing);
         Some(LabelPreferences {
             visible: self.visible,
             color_mode: self.color_mode.into(),
@@ -646,19 +665,7 @@ impl StoredLabelPreferences {
                 .transpose()
                 .ok()?
                 .unwrap_or(defaults.ram),
-            spacing: self
-                .spacing
-                .map(|value| {
-                    if migrate_v2_spacing && value > 0 {
-                        10
-                    } else {
-                        value
-                    }
-                })
-                .map(LabelSpacing::try_from)
-                .transpose()
-                .ok()?
-                .unwrap_or(defaults.spacing),
+            spacing,
         })
     }
 }

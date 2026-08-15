@@ -21,9 +21,9 @@ use objc2_foundation::{
 
 use statlet::icon_assets::IconAssetStore;
 use statlet::indicator::{
-    measure_stable_layout, measure_stable_layout_with_prefixes_and_spacing, IndicatorRun,
-    IndicatorScene, LayoutDiagnostics, MetricIdentifierVisual, SegmentColor, SemanticColor,
-    StableLayout, TextMeasurer,
+    measure_stable_layout, measure_stable_layout_with_prefixes_and_spacing, trailing_spacing_width,
+    IndicatorRun, IndicatorScene, LayoutDiagnostics, MetricIdentifierVisual, SegmentColor,
+    SemanticColor, StableLayout, TextMeasurer,
 };
 use statlet::indicator_preferences::{
     FontWeight, MetricKind, PngIconMetadata, TypographyPreferences,
@@ -1093,7 +1093,11 @@ fn draw_metric_line(
             )
             .drawAtPoint(NSPoint {
                 x: label_value_origin(context.measurer, &label.text)
-                    + context.measurer.width(" ") * f64::from(label.trailing_spacing_level) / 10.0,
+                    + trailing_spacing_width(
+                        context.measurer,
+                        &label.text,
+                        label.trailing_spacing_level,
+                    ),
                 y,
             });
         }

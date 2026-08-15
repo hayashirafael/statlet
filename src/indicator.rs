@@ -646,10 +646,21 @@ fn widest_metric_width_with_spacing(
     spacing_level: u8,
 ) -> f64 {
     let prefix_width = prefix.map_or(0.0, |prefix| measurer.width(prefix));
-    let spacing_width = measurer.width(" ") * f64::from(spacing_level) / 10.0;
+    let spacing_width = prefix.map_or(0.0, |prefix| {
+        trailing_spacing_width(measurer, prefix, spacing_level)
+    });
     (0..=100)
         .map(|percent| measurer.width(&format!("{percent}%")) + prefix_width + spacing_width)
         .fold(0.0, f64::max)
+}
+
+pub fn trailing_spacing_width(
+    measurer: &impl TextMeasurer,
+    prefix: &str,
+    spacing_level: u8,
+) -> f64 {
+    let prefix_with_space = format!("{prefix} ");
+    (measurer.width(&prefix_with_space) - measurer.width(prefix)) * f64::from(spacing_level) / 10.0
 }
 
 #[cfg(test)]

@@ -71,7 +71,7 @@ Enquanto o campo estiver incompleto ou inválido, a última cor válida continua
 
 Um único controle **Mostrar rótulos C/R** governa as duas linhas. Não é possível ocultar apenas um deles.
 
-Cada linha oferece seu próprio campo de rótulo. O campo aceita de 1 a 10 caracteres Unicode depois de remover espaços externos; valores vazios ou maiores são rejeitados sem alterar a preferência já válida. Um terceiro controle escolhe dez níveis decimais entre 0 e 1 espaço: `0`, `0,1` … `0,9` e `1 espaço`. O nível `10` preserva exatamente a largura visual do espaço literal legado; o rótulo não armazena padding e o renderer mede/aplica o delta explicitamente. O padrão compacto continua `C 18% / R 63%`.
+Cada linha oferece seu próprio campo de rótulo. O campo aceita de 1 a 10 caracteres Unicode depois de remover espaços externos; valores vazios ou maiores são rejeitados sem alterar a preferência já válida. Um terceiro controle escolhe dez níveis decimais entre 0 e 1 espaço: `0`, `0.1` … `0.9` e `1 espaço`. O nível `10` preserva exatamente a largura visual do espaço literal legado; o rótulo não armazena padding e o renderer mede/aplica o delta explicitamente. O padrão compacto continua `C 18% / R 63%`.
 
 Quando visíveis, existem três modos de cor:
 
