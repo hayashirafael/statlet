@@ -5,10 +5,11 @@ use statlet::indicator_preferences::{
 use statlet::preferences_view::{
     color_well_configuration, filter_font_families, ColorEditorFocusTarget, ColorEditorRows,
     ColorEditorState, ColorWellPresentation, FontPickerInteraction, FontRow, HexDraft,
-    HexDraftError, HexEdit, IndicatorControlsLayout, IndicatorControlsVisibility, IntervalDraft,
-    IntervalFieldFormat, LabelEditingFocusTarget, LabelEditingPresentation, MessageLayout,
-    PreferencesArea, PreferencesNavigationPolicy, PreferencesShellFocusTarget,
-    PreferencesShellPresentation, TypographyWarningKind,
+    HexDraftError, HexEdit, IdentifierEditingFocusTarget, IdentifierEditingPresentation,
+    IndicatorControlsLayout, IndicatorControlsVisibility, IntervalDraft, IntervalFieldFormat,
+    LabelEditingFocusTarget, LabelEditingPresentation, MessageLayout, PreferencesArea,
+    PreferencesNavigationPolicy, PreferencesShellFocusTarget, PreferencesShellPresentation,
+    TypographyWarningKind,
 };
 
 #[test]
@@ -119,6 +120,71 @@ fn label_editing_tracks_each_metric_mode_and_skips_disabled_controls() {
             );
         }
     }
+}
+
+#[test]
+fn shared_symbol_size_stays_visible_but_is_enabled_only_for_a_system_symbol() {
+    let neither =
+        IdentifierEditingPresentation::new(MetricIdentifierMode::Text, MetricIdentifierMode::Png);
+    assert!(!neither.system_symbol_size_enabled());
+    assert_eq!(
+        neither.system_symbol_size_help(),
+        "Ajusta o tamanho compartilhado dos ícones do macOS de CPU e RAM."
+    );
+
+    for modes in [
+        (
+            MetricIdentifierMode::SystemSymbol,
+            MetricIdentifierMode::Text,
+        ),
+        (
+            MetricIdentifierMode::Png,
+            MetricIdentifierMode::SystemSymbol,
+        ),
+    ] {
+        assert!(IdentifierEditingPresentation::new(modes.0, modes.1).system_symbol_size_enabled());
+    }
+}
+
+#[test]
+fn identifier_focus_order_skips_hidden_details_and_disabled_shared_size() {
+    use IdentifierEditingFocusTarget::{
+        CpuMode, CpuSymbol, RamChoosePng, RamMode, RamRemovePng, ResetIdentifiers, SystemSymbolSize,
+    };
+
+    let presentation = IdentifierEditingPresentation::new(
+        MetricIdentifierMode::SystemSymbol,
+        MetricIdentifierMode::Png,
+    );
+    assert_eq!(
+        presentation.focus_order(false, false),
+        vec![
+            CpuMode,
+            CpuSymbol,
+            RamMode,
+            RamChoosePng,
+            SystemSymbolSize,
+            ResetIdentifiers,
+        ]
+    );
+    assert_eq!(
+        presentation.focus_order(false, true),
+        vec![
+            CpuMode,
+            CpuSymbol,
+            RamMode,
+            RamChoosePng,
+            RamRemovePng,
+            SystemSymbolSize,
+            ResetIdentifiers,
+        ]
+    );
+
+    let disabled =
+        IdentifierEditingPresentation::new(MetricIdentifierMode::Text, MetricIdentifierMode::Png);
+    assert!(!disabled
+        .focus_order(false, false)
+        .contains(&SystemSymbolSize));
 }
 
 #[test]
@@ -390,7 +456,8 @@ fn area_navigation_reveals_the_new_page_but_same_area_reflow_preserves_scroll() 
 fn identifier_reset_has_its_own_row_before_label_controls() {
     let layout = IndicatorControlsLayout::new(IndicatorControlsVisibility::default());
 
-    assert!(layout.identifiers_reset().top() >= layout.ram_identifier_detail().bottom());
+    assert!(layout.system_symbol_size_row().top() >= layout.ram_identifier_detail().bottom());
+    assert!(layout.identifiers_reset().top() >= layout.system_symbol_size_row().bottom());
     assert!(layout.labels_heading().top() >= layout.identifiers_reset().bottom());
 }
 

@@ -21,7 +21,7 @@ use objc2_foundation::{
 
 use statlet::icon_assets::IconAssetStore;
 use statlet::indicator::{
-    measure_stable_layout, measure_stable_layout_with_prefixes, IndicatorRun, IndicatorScene,
+    measure_stable_layout, measure_stable_layout_with_prefix_widths, IndicatorRun, IndicatorScene,
     LayoutDiagnostics, MetricIdentifierVisual, SegmentColor, SemanticColor, StableLayout,
     TextMeasurer,
 };
@@ -85,7 +85,15 @@ struct LayoutKey {
     weight: FontWeight,
     cpu_prefix: Option<String>,
     ram_prefix: Option<String>,
+    cpu_symbol: Option<SystemSymbolLayoutIdentity>,
+    ram_symbol: Option<SystemSymbolLayoutIdentity>,
     dev_marker: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SystemSymbolLayoutIdentity {
+    name: String,
+    size: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -170,6 +178,7 @@ struct PaintKey {
 enum IdentifierIdentity {
     SystemSymbol {
         name: String,
+        size: u8,
         paint: PaintIdentity,
         fallback_text: String,
     },
@@ -279,10 +288,12 @@ fn identifier_identity(
     match identifier {
         MetricIdentifierVisual::SystemSymbol {
             name,
+            size,
             color,
             fallback_text,
         } => IdentifierIdentity::SystemSymbol {
             name: name.as_str().to_owned(),
+            size: size.points(),
             paint: paint_identity(*color, appearance),
             fallback_text: fallback_text.clone(),
         },
@@ -325,16 +336,11 @@ struct SurfaceCache<I> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct IdentifierImageKey {
-    identity: IdentifierImageIdentity,
-    size: u8,
-    weight: FontWeight,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum IdentifierImageIdentity {
+enum IdentifierImageKey {
     SystemSymbol {
         name: String,
+        size: u8,
+        weight: FontWeight,
         paint: PaintIdentity,
     },
     Png {
@@ -348,24 +354,21 @@ fn identifier_image_key(
     typography: &TypographyPreferences,
     appearance: &str,
 ) -> IdentifierImageKey {
-    let identity = match identifier {
-        MetricIdentifierVisual::SystemSymbol { name, color, .. } => {
-            IdentifierImageIdentity::SystemSymbol {
-                name: name.as_str().to_owned(),
-                paint: paint_identity(*color, appearance),
-            }
-        }
+    match identifier {
+        MetricIdentifierVisual::SystemSymbol {
+            name, size, color, ..
+        } => IdentifierImageKey::SystemSymbol {
+            name: name.as_str().to_owned(),
+            size: size.points(),
+            weight: typography.weight,
+            paint: paint_identity(*color, appearance),
+        },
         MetricIdentifierVisual::Png {
             metric, metadata, ..
-        } => IdentifierImageIdentity::Png {
+        } => IdentifierImageKey::Png {
             metric: *metric,
             metadata: metadata.clone(),
         },
-    };
-    IdentifierImageKey {
-        identity,
-        size: typography.size.points(),
-        weight: typography.weight,
     }
 }
 
@@ -409,8 +412,8 @@ impl<I: Clone> IdentifierImageCache<I> {
     fn clear_semantic(&mut self) {
         self.entries.retain(|entry| {
             !matches!(
-                entry.key.identity,
-                IdentifierImageIdentity::SystemSymbol {
+                entry.key,
+                IdentifierImageKey::SystemSymbol {
                     paint: PaintIdentity::Semantic { .. },
                     ..
                 }
@@ -516,6 +519,38 @@ fn metric_prefix(
             | MetricIdentifierVisual::Png { fallback_text, .. } => fallback_text.clone(),
         })
         .or_else(|| label_prefix(runs))
+}
+
+fn system_symbol_layout_identity(
+    identifier: Option<&MetricIdentifierVisual>,
+) -> Option<SystemSymbolLayoutIdentity> {
+    match identifier {
+        Some(MetricIdentifierVisual::SystemSymbol { name, size, .. }) => {
+            Some(SystemSymbolLayoutIdentity {
+                name: name.as_str().to_owned(),
+                size: size.points(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn metric_prefix_width(
+    measurer: &impl TextMeasurer,
+    runs: &[IndicatorRun],
+    identifier: Option<&MetricIdentifierVisual>,
+    image: Option<&NSImage>,
+) -> Option<f64> {
+    match identifier {
+        Some(MetricIdentifierVisual::SystemSymbol { fallback_text, .. }) => image
+            .and_then(system_symbol_image_metrics)
+            .map(|metrics| metrics.alignment_width + measurer.width(" "))
+            .or_else(|| Some(measurer.width(fallback_text))),
+        Some(MetricIdentifierVisual::Png { fallback_text, .. }) => {
+            Some(measurer.width(fallback_text))
+        }
+        None => label_prefix(runs).map(|prefix| measurer.width(&prefix)),
+    }
 }
 
 type TextAttributes = Retained<NSDictionary<NSString, AnyObject>>;
@@ -678,6 +713,17 @@ impl Renderer {
         let resolved = self.resolve_typography(typography);
         let font = resolved.font;
         let measurer = resolved.measurer;
+        let appearance_name = appearance.name().to_string();
+        let top_identifier_image = self.resolve_identifier_image(
+            scene.top_identifier.as_ref(),
+            typography,
+            &appearance_name,
+        );
+        let bottom_identifier_image = self.resolve_identifier_image(
+            scene.bottom_identifier.as_ref(),
+            typography,
+            &appearance_name,
+        );
         let cpu_prefix = metric_prefix(&scene.top, scene.top_identifier.as_ref());
         let ram_prefix = metric_prefix(&scene.bottom, scene.bottom_identifier.as_ref());
         let marker_plan = if slot == RenderSlot::Status {
@@ -694,28 +740,31 @@ impl Renderer {
             weight: typography.weight,
             cpu_prefix,
             ram_prefix,
+            cpu_symbol: system_symbol_layout_identity(scene.top_identifier.as_ref()),
+            ram_symbol: system_symbol_layout_identity(scene.bottom_identifier.as_ref()),
             dev_marker: marker_plan.text.clone(),
         };
+        let cpu_prefix_width = metric_prefix_width(
+            &measurer,
+            &scene.top,
+            scene.top_identifier.as_ref(),
+            top_identifier_image.as_deref(),
+        );
+        let ram_prefix_width = metric_prefix_width(
+            &measurer,
+            &scene.bottom,
+            scene.bottom_identifier.as_ref(),
+            bottom_identifier_image.as_deref(),
+        );
         let layout = self.cache.resolve_layout(slot, &layout_key, || {
-            measure_stable_layout_with_prefixes(
+            measure_stable_layout_with_prefix_widths(
                 &measurer,
-                layout_key.cpu_prefix.as_deref(),
-                layout_key.ram_prefix.as_deref(),
+                cpu_prefix_width,
+                ram_prefix_width,
                 self.default_width,
             )
         });
-        let appearance_name = appearance.name().to_string();
         let paint_key = paint_key(scene, layout_key.clone(), appearance_name.clone());
-        let top_identifier_image = self.resolve_identifier_image(
-            scene.top_identifier.as_ref(),
-            typography,
-            &appearance_name,
-        );
-        let bottom_identifier_image = self.resolve_identifier_image(
-            scene.bottom_identifier.as_ref(),
-            typography,
-            &appearance_name,
-        );
         let identifier_resolved = [
             scene.top_identifier.is_none() || top_identifier_image.is_some(),
             scene.bottom_identifier.is_none() || bottom_identifier_image.is_some(),
@@ -812,14 +861,14 @@ impl Renderer {
         let icon_asset_store = &self.icon_asset_store;
         self.identifier_images.resolve(key, || {
             let image = match identifier {
-                MetricIdentifierVisual::SystemSymbol { name, color, .. } => {
-                    create_system_symbol_image(
-                        name,
-                        &resolve_color(*color),
-                        f64::from(typography.size.points()),
-                        typography.weight,
-                    )
-                }
+                MetricIdentifierVisual::SystemSymbol {
+                    name, size, color, ..
+                } => create_system_symbol_image(
+                    name,
+                    &resolve_color(*color),
+                    f64::from(size.points()),
+                    typography.weight,
+                ),
                 MetricIdentifierVisual::Png { metric, .. } => {
                     let path = icon_asset_store.path_for(*metric);
                     let path = path.to_str()?;
@@ -827,7 +876,15 @@ impl Renderer {
                 }
             }?;
             let image_size = image.size();
-            (image_size.width > 0.0 && image_size.height > 0.0).then_some(image)
+            let valid = match identifier {
+                MetricIdentifierVisual::SystemSymbol { .. } => {
+                    system_symbol_image_metrics(&image).is_some()
+                }
+                MetricIdentifierVisual::Png { .. } => {
+                    image_size.width > 0.0 && image_size.height > 0.0
+                }
+            };
+            valid.then_some(image)
         })
     }
 
@@ -1014,15 +1071,11 @@ fn draw_metric_line(
                 ..
             } => (fallback_text, *color),
         };
-        let prefix_width = context.measurer.width(fallback_text);
+        let prefix_width =
+            metric_prefix_width(context.measurer, runs, Some(identifier), identifier_image)
+                .unwrap_or_else(|| context.measurer.width(fallback_text));
         if let Some(image) = identifier_image {
-            draw_metric_identifier(
-                image,
-                y,
-                prefix_width,
-                matches!(identifier, MetricIdentifierVisual::SystemSymbol { .. }),
-                context,
-            );
+            draw_metric_identifier(image, identifier, y, prefix_width, context);
         } else {
             attributed_scene_run(
                 context.font,
@@ -1088,23 +1141,32 @@ fn draw_metric_line(
 
 fn draw_metric_identifier(
     image: &NSImage,
+    identifier: &MetricIdentifierVisual,
     y: f64,
     prefix_width: f64,
-    is_system_symbol: bool,
     context: &DrawTextContext<'_>,
 ) {
     let spacing = context.measurer.width(" ");
-    let available_height = context.font.capHeight().max(1.0);
-    let source = image.size();
-    let rect = identifier_draw_rect(
-        source.width,
-        source.height,
-        prefix_width,
-        available_height,
-        spacing,
-        y,
-        is_system_symbol,
-    );
+    let cap_height = context.font.capHeight().max(1.0);
+    let rect = match identifier {
+        MetricIdentifierVisual::SystemSymbol { .. } => {
+            let Some(metrics) = system_symbol_image_metrics(image) else {
+                return;
+            };
+            system_symbol_draw_rect(metrics, cap_height, y - context.font.descender())
+        }
+        MetricIdentifierVisual::Png { .. } => {
+            let source = image.size();
+            png_identifier_draw_rect(
+                source.width,
+                source.height,
+                prefix_width,
+                cap_height,
+                spacing,
+                y,
+            )
+        }
+    };
     image.drawInRect(NSRect::new(
         NSPoint::new(rect.x, rect.y),
         NSSize::new(rect.width, rect.height),
@@ -1118,35 +1180,65 @@ struct IdentifierDrawRect {
     height: f64,
 }
 
-fn identifier_draw_rect(
+fn png_identifier_draw_rect(
     source_width: f64,
     source_height: f64,
     prefix_width: f64,
     line_height: f64,
     spacing: f64,
     y: f64,
-    is_system_symbol: bool,
 ) -> IdentifierDrawRect {
-    let (drawing_width, horizontal_width) = if is_system_symbol {
-        (line_height.max(1.0), prefix_width)
-    } else {
-        let width = (prefix_width - spacing).max(1.0);
-        (width, width)
-    };
+    let drawing_width = (prefix_width - spacing).max(1.0);
     let drawing_height = line_height.max(1.0);
     let scale =
         (drawing_width / source_width.max(1.0)).min(drawing_height / source_height.max(1.0));
     let width = source_width * scale;
     let height = source_height * scale;
     IdentifierDrawRect {
-        x: (horizontal_width - width) / 2.0,
-        y: y + if is_system_symbol {
-            (drawing_height - height) / 2.0
-        } else {
-            0.0
-        },
+        x: (drawing_width - width) / 2.0,
+        y,
         width,
         height,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SystemSymbolImageMetrics {
+    image_width: f64,
+    image_height: f64,
+    alignment_x: f64,
+    alignment_y: f64,
+    alignment_width: f64,
+    alignment_height: f64,
+}
+
+fn system_symbol_image_metrics(image: &NSImage) -> Option<SystemSymbolImageMetrics> {
+    let image_size = image.size();
+    let alignment = image.alignmentRect();
+    (image_size.width > 0.0
+        && image_size.height > 0.0
+        && alignment.size.width > 0.0
+        && alignment.size.height > 0.0)
+        .then_some(SystemSymbolImageMetrics {
+            image_width: image_size.width,
+            image_height: image_size.height,
+            alignment_x: alignment.origin.x,
+            alignment_y: alignment.origin.y,
+            alignment_width: alignment.size.width,
+            alignment_height: alignment.size.height,
+        })
+}
+
+fn system_symbol_draw_rect(
+    metrics: SystemSymbolImageMetrics,
+    cap_height: f64,
+    cap_origin_y: f64,
+) -> IdentifierDrawRect {
+    IdentifierDrawRect {
+        x: -metrics.alignment_x,
+        y: cap_origin_y + (cap_height - metrics.alignment_height) / 2.0 - metrics.alignment_y,
+        width: metrics.image_width,
+        height: metrics.image_height,
     }
 }
 
@@ -1372,13 +1464,9 @@ mod tests {
     fn identifier_image_cache_keeps_failures_until_the_resolution_key_changes() {
         let calls = Cell::new(0);
         let mut cache = IdentifierImageCache::default();
-        let key = IdentifierImageKey {
-            identity: IdentifierImageIdentity::Png {
-                metric: MetricKind::Cpu,
-                metadata: PngIconMetadata::new("cpu.png", 12, 12, 400).unwrap(),
-            },
-            size: 12,
-            weight: FontWeight::Medium,
+        let key = IdentifierImageKey::Png {
+            metric: MetricKind::Cpu,
+            metadata: PngIconMetadata::new("cpu.png", 12, 12, 400).unwrap(),
         };
 
         assert_eq!(
@@ -1407,13 +1495,9 @@ mod tests {
         );
         assert_eq!(calls.get(), 1);
 
-        let changed = IdentifierImageKey {
-            identity: IdentifierImageIdentity::Png {
-                metric: MetricKind::Cpu,
-                metadata: PngIconMetadata::new("cpu.png", 12, 12, 401).unwrap(),
-            },
-            size: 12,
-            weight: FontWeight::Medium,
+        let changed = IdentifierImageKey::Png {
+            metric: MetricKind::Cpu,
+            metadata: PngIconMetadata::new("cpu.png", 12, 12, 401).unwrap(),
         };
         assert_eq!(
             cache.resolve(changed, || {
@@ -1562,23 +1646,89 @@ mod tests {
     }
 
     #[test]
-    fn system_symbol_draw_rect_uses_a_line_height_square_box() {
-        let rect = identifier_draw_rect(12.0, 12.0, 12.0, 10.0, 4.0, 2.0, true);
-
-        assert_eq!(rect.x, 1.0);
-        assert_eq!(rect.y, 2.0);
-        assert_eq!(rect.width, 10.0);
-        assert_eq!(rect.height, 10.0);
-    }
-
-    #[test]
     fn png_draw_rect_keeps_the_legacy_prefix_width_limit() {
-        let rect = identifier_draw_rect(12.0, 12.0, 11.0, 10.0, 4.0, 2.0, false);
+        let rect = png_identifier_draw_rect(12.0, 12.0, 11.0, 10.0, 4.0, 2.0);
 
         assert_eq!(rect.x, 0.0);
         assert_eq!(rect.y, 2.0);
         assert_eq!(rect.width, 7.0);
         assert_eq!(rect.height, 7.0);
+    }
+
+    #[test]
+    fn optical_system_symbol_rect_centers_its_alignment_area_for_all_supported_sizes() {
+        for (point_size, optical_width, optical_height) in
+            [(8.0, 5.5, 6.0), (12.0, 8.0, 9.0), (14.0, 10.0, 10.5)]
+        {
+            let metrics = SystemSymbolImageMetrics {
+                image_width: point_size,
+                image_height: point_size,
+                alignment_x: (point_size - optical_width) / 2.0,
+                alignment_y: (point_size - optical_height) / 2.0,
+                alignment_width: optical_width,
+                alignment_height: optical_height,
+            };
+            let rect = system_symbol_draw_rect(metrics, 9.0, 2.0);
+            let optical_center_y = rect.y + metrics.alignment_y + optical_height / 2.0;
+
+            assert!((optical_center_y - 6.5).abs() < f64::EPSILON);
+            assert_eq!(rect.width, point_size);
+            assert_eq!(rect.height, point_size);
+        }
+    }
+
+    #[test]
+    fn symbol_size_invalidates_layout_paint_and_image_keys_but_png_image_key_stays_stable() {
+        let typography = statlet::indicator_preferences::IndicatorPreferences::default().typography;
+        let color = SegmentColor::Semantic(SemanticColor::Neutral);
+        let symbol_at = |points| MetricIdentifierVisual::SystemSymbol {
+            name: SystemSymbolName::new("cpu").unwrap(),
+            size: statlet::indicator_preferences::SystemSymbolSize::try_from(points).unwrap(),
+            color,
+            fallback_text: "C ".to_owned(),
+        };
+        let symbol_at_eight = symbol_at(8);
+        let symbol_at_fourteen = symbol_at(14);
+        assert_ne!(
+            identifier_image_key(&symbol_at_eight, &typography, "NSAppearanceNameAqua"),
+            identifier_image_key(&symbol_at_fourteen, &typography, "NSAppearanceNameAqua")
+        );
+        let mut layout_at_eight = layout_key("Menlo", false);
+        layout_at_eight.cpu_symbol = system_symbol_layout_identity(Some(&symbol_at_eight));
+        let mut layout_at_fourteen = layout_key("Menlo", false);
+        layout_at_fourteen.cpu_symbol = system_symbol_layout_identity(Some(&symbol_at_fourteen));
+        assert_ne!(layout_at_eight, layout_at_fourteen);
+
+        let mut scene_at_eight = scene_with_lines(&["42%"], &["R 68%"]);
+        scene_at_eight.top_identifier = Some(symbol_at_eight);
+        let mut scene_at_fourteen = scene_at_eight.clone();
+        scene_at_fourteen.top_identifier = Some(symbol_at_fourteen);
+        assert_ne!(
+            paint_key(
+                &scene_at_eight,
+                layout_at_eight,
+                "NSAppearanceNameAqua".to_owned()
+            ),
+            paint_key(
+                &scene_at_fourteen,
+                layout_at_fourteen,
+                "NSAppearanceNameAqua".to_owned()
+            )
+        );
+
+        let png = MetricIdentifierVisual::Png {
+            metric: MetricKind::Cpu,
+            metadata: PngIconMetadata::new("cpu.png", 12, 12, 400).unwrap(),
+            fallback_color: color,
+            fallback_text: "C ".to_owned(),
+        };
+        let mut other_typography = typography.clone();
+        other_typography.size = statlet::indicator_preferences::FontSize::try_from(14).unwrap();
+        other_typography.weight = FontWeight::Bold;
+        assert_eq!(
+            identifier_image_key(&png, &typography, "NSAppearanceNameAqua"),
+            identifier_image_key(&png, &other_typography, "NSAppearanceNameDarkAqua")
+        );
     }
 
     fn layout_key(family: &str, labels_visible: bool) -> LayoutKey {
@@ -1588,6 +1738,8 @@ mod tests {
             weight: FontWeight::Medium,
             cpu_prefix: labels_visible.then(|| "C ".to_owned()),
             ram_prefix: labels_visible.then(|| "R ".to_owned()),
+            cpu_symbol: None,
+            ram_symbol: None,
             dev_marker: None,
         }
     }
@@ -1705,6 +1857,7 @@ mod tests {
         let mut scene = scene_with_lines(&["42%"], &["68%"]);
         scene.top_identifier = Some(MetricIdentifierVisual::SystemSymbol {
             name: SystemSymbolName::new("cpu").unwrap(),
+            size: statlet::indicator_preferences::SystemSymbolSize::default(),
             color: SegmentColor::Srgb(SrgbColor::parse_hex("#112233").unwrap()),
             fallback_text: "C ".into(),
         });
@@ -1950,7 +2103,7 @@ mod tests {
     }
 
     #[test]
-    fn every_macos_14_allowlisted_symbol_also_resolves_on_the_current_host() {
+    fn every_macos_14_allowlisted_symbol_has_a_valid_optical_rect_at_supported_sizes() {
         let Some(_marker) = MainThreadMarker::new() else {
             eprintln!("SKIP: AppKit symbol validation requires a main-thread test marker");
             return;
@@ -1958,11 +2111,23 @@ mod tests {
         let color = NSColor::labelColor();
         for name in SystemSymbolName::curated_names() {
             let name = SystemSymbolName::new(name).unwrap();
-            assert!(
-                create_system_symbol_image(&name, &color, 12.0, FontWeight::Medium).is_some(),
-                "macOS 14 allowlisted SF Symbol {} must resolve on the current host",
-                name.as_str()
-            );
+            for points in [8.0, 12.0, 14.0] {
+                let image = create_system_symbol_image(&name, &color, points, FontWeight::Medium)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "macOS 14 allowlisted SF Symbol {} must resolve at {points} pt",
+                            name.as_str()
+                        )
+                    });
+                let metrics = system_symbol_image_metrics(&image).unwrap_or_else(|| {
+                    panic!(
+                        "macOS 14 allowlisted SF Symbol {} must expose alignmentRect at {points} pt",
+                        name.as_str()
+                    )
+                });
+                assert!(metrics.alignment_width <= metrics.image_width);
+                assert!(metrics.alignment_height <= metrics.image_height);
+            }
         }
     }
 
@@ -2159,12 +2324,14 @@ mod tests {
         let mut before = scene_with_lines(&["42%"], &["R ", "68%"]);
         before.top_identifier = Some(MetricIdentifierVisual::SystemSymbol {
             name: SystemSymbolName::new("cpu").unwrap(),
+            size: statlet::indicator_preferences::SystemSymbolSize::default(),
             color: SegmentColor::Semantic(SemanticColor::Neutral),
             fallback_text: "C ".to_owned(),
         });
         let mut after = before.clone();
         after.top_identifier = Some(MetricIdentifierVisual::SystemSymbol {
             name: SystemSymbolName::new("waveform.path.ecg").unwrap(),
+            size: statlet::indicator_preferences::SystemSymbolSize::default(),
             color: SegmentColor::Semantic(SemanticColor::Neutral),
             fallback_text: "C ".to_owned(),
         });

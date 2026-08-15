@@ -20,13 +20,13 @@ use statlet::icon_assets::IconAssetStore;
 use statlet::indicator_preferences::{
     FontFamilyPreference, FontSize, FontWeight, IndicatorLabel, IndicatorPreferenceGroup,
     IndicatorPreferences, LabelColorMode, LabelSpacing, MetricColorMode, MetricIdentifierMode,
-    MetricKind, SystemSymbolName, TypographyPreferences,
+    MetricKind, SystemSymbolName, SystemSymbolSize, TypographyPreferences,
 };
 use statlet::preferences_view::{
-    ColorEditorState, IdentifierDetailPresentation, IndicatorControlsLayout,
-    IndicatorControlsVisibility, IntervalDraft, IntervalFieldFormat, LabelEditingFocusTarget,
-    LabelEditingPresentation, MetricIdentifierControlPresentation, PreferencesArea,
-    TypographyWarningKind,
+    ColorEditorState, IdentifierDetailPresentation, IdentifierEditingFocusTarget,
+    IdentifierEditingPresentation, IndicatorControlsLayout, IndicatorControlsVisibility,
+    IntervalDraft, IntervalFieldFormat, LabelEditingFocusTarget, LabelEditingPresentation,
+    MetricIdentifierControlPresentation, PreferencesArea, TypographyWarningKind,
 };
 use statlet::runtime_profile::RuntimePresentation;
 use tao::event_loop::EventLoopProxy;
@@ -35,7 +35,7 @@ use super::color_editor::{ColorBinding, ColorEditor};
 use super::font_picker::FontPicker;
 use super::{
     configure_discrete_slider, font_size_slider_contract, label_spacing_slider_contract,
-    IndicatorFontFallback, IndicatorLayoutDiagnostics,
+    system_symbol_size_slider_contract, IndicatorFontFallback, IndicatorLayoutDiagnostics,
 };
 use crate::macos::fonts::FontCatalog;
 use crate::macos::RuntimeEvent;
@@ -53,8 +53,11 @@ struct IndicatorControlsTargetIvars {
     selected_label_spacing: Cell<LabelSpacing>,
     selected_cpu_identifier_mode: Cell<MetricIdentifierMode>,
     selected_ram_identifier_mode: Cell<MetricIdentifierMode>,
+    selected_system_symbol_size: Cell<SystemSymbolSize>,
     cpu_png_available: Cell<bool>,
     ram_png_available: Cell<bool>,
+    system_symbol_size: Retained<NSSlider>,
+    system_symbol_size_value: Retained<NSTextField>,
     cpu_label_field: Retained<NSTextField>,
     ram_label_field: Retained<NSTextField>,
     label_spacing: Retained<NSSlider>,
@@ -178,6 +181,11 @@ define_class!(
         #[unsafe(method(changeRamSystemSymbol:))]
         fn change_ram_system_symbol(&self, sender: &NSPopUpButton) {
             self.change_system_symbol(MetricKind::Ram, sender);
+        }
+
+        #[unsafe(method(changeSystemSymbolSize:))]
+        fn change_system_symbol_size(&self, sender: &NSSlider) {
+            self.apply_system_symbol_size(sender.integerValue());
         }
 
         #[unsafe(method(chooseCpuPng:))]
@@ -520,6 +528,33 @@ impl IndicatorControlsTarget {
         }
     }
 
+    fn apply_system_symbol_size(&self, value: isize) {
+        if self.ivars().applying.get() {
+            return;
+        }
+        let size = u8::try_from(value)
+            .ok()
+            .and_then(|points| SystemSymbolSize::try_from(points).ok());
+        let Some(size) = size else {
+            self.ivars().system_symbol_size.setIntegerValue(
+                self.ivars()
+                    .selected_system_symbol_size
+                    .get()
+                    .points()
+                    .into(),
+            );
+            return;
+        };
+        set_slider_value_text(
+            &self.ivars().system_symbol_size,
+            &self.ivars().system_symbol_size_value,
+            &format!("{} pt", size.points()),
+        );
+        if size != self.ivars().selected_system_symbol_size.replace(size) {
+            self.send(IndicatorPreferenceChange::SetSystemSymbolSize(size));
+        }
+    }
+
     fn commit_refresh_interval(&self, field: &NSTextField) {
         self.commit_refresh_interval_text(&field.stringValue().to_string());
     }
@@ -627,6 +662,9 @@ struct IndicatorLayoutViews {
     identifiers_heading: Retained<NSTextField>,
     cpu_identifier: MetricIdentifierControls,
     ram_identifier: MetricIdentifierControls,
+    system_symbol_size_label: Retained<NSTextField>,
+    system_symbol_size: Retained<NSSlider>,
+    system_symbol_size_value: Retained<NSTextField>,
     reset_identifiers: Retained<NSButton>,
     labels_heading: Retained<NSTextField>,
     labels_visible: Retained<NSButton>,
@@ -966,6 +1004,26 @@ impl IndicatorLayoutViews {
             layout.ram_identifier_error(),
             content_height,
         );
+        let symbol_size_row = layout.system_symbol_size_row();
+        let symbol_size_y = symbol_size_row.origin_y(content_height);
+        set_slot_frame(
+            &self.system_symbol_size_label,
+            symbol_size_row.label_x(),
+            symbol_size_y,
+            symbol_size_row.height(),
+        );
+        set_slot_frame(
+            &self.system_symbol_size,
+            132.0,
+            symbol_size_y,
+            symbol_size_row.height(),
+        );
+        set_slot_frame(
+            &self.system_symbol_size_value,
+            348.0,
+            symbol_size_y,
+            symbol_size_row.height(),
+        );
         let identifiers_reset = layout.identifiers_reset();
         self.reset_identifiers.setFrame(NSRect::new(
             NSPoint::new(
@@ -1206,6 +1264,9 @@ impl IndicatorLayoutViews {
                 self.ram_identifier.views()[4],
                 self.ram_identifier.views()[5],
                 self.ram_identifier.views()[6],
+                &self.system_symbol_size_label,
+                &self.system_symbol_size,
+                &self.system_symbol_size_value,
                 &self.reset_identifiers,
                 &self.labels_heading,
                 &self.labels_visible,
@@ -1269,6 +1330,7 @@ pub(super) struct IndicatorControls {
     cpu_identifier: MetricIdentifierControls,
     ram_identifier: MetricIdentifierControls,
     thumbnail_assets: ThumbnailAssetPlan,
+    system_symbol_size: Retained<NSSlider>,
     reset_identifiers: Retained<NSButton>,
     labels_visible: Retained<NSButton>,
     label_spacing: Retained<NSSlider>,
@@ -1347,6 +1409,21 @@ impl IndicatorControls {
         let identifiers_heading = heading(mtm, "Identificadores", 0.0);
         let cpu_identifier = metric_identifier_controls(mtm, MetricKind::Cpu);
         let ram_identifier = metric_identifier_controls(mtm, MetricKind::Ram);
+        let system_symbol_size_label = text_label(mtm, "Tamanho do ícone", 0.0);
+        system_symbol_size_label.setFrameSize(NSSize::new(124.0, 28.0));
+        let system_symbol_size = NSSlider::initWithFrame(
+            NSSlider::alloc(mtm),
+            NSRect::new(NSPoint::new(132.0, 0.0), NSSize::new(208.0, 28.0)),
+        );
+        configure_discrete_slider(&system_symbol_size, system_symbol_size_slider_contract());
+        let system_symbol_size_value = NSTextField::labelWithString(ns_string!("12 pt"), mtm);
+        system_symbol_size_value.setFrame(NSRect::new(
+            NSPoint::new(348.0, 0.0),
+            NSSize::new(58.0, 28.0),
+        ));
+        system_symbol_size_value.setAccessibilityIdentifier(Some(ns_string!(
+            "indicator.identifiers.system-symbol-size.value"
+        )));
         let reset_identifiers = reset_button(
             mtm,
             "Restaurar identificadores",
@@ -1535,8 +1612,11 @@ impl IndicatorControls {
                 selected_label_spacing: Cell::new(defaults.labels.spacing),
                 selected_cpu_identifier_mode: Cell::new(defaults.identifiers.cpu.mode),
                 selected_ram_identifier_mode: Cell::new(defaults.identifiers.ram.mode),
+                selected_system_symbol_size: Cell::new(defaults.identifiers.system_symbol_size),
                 cpu_png_available: Cell::new(defaults.identifiers.cpu.png.is_some()),
                 ram_png_available: Cell::new(defaults.identifiers.ram.png.is_some()),
+                system_symbol_size: system_symbol_size.clone(),
+                system_symbol_size_value: system_symbol_size_value.clone(),
                 cpu_label_field: cpu_label_field.clone(),
                 ram_label_field: ram_label_field.clone(),
                 label_spacing: label_spacing.clone(),
@@ -1555,6 +1635,7 @@ impl IndicatorControls {
             &ram_mode,
             &cpu_identifier,
             &ram_identifier,
+            &system_symbol_size,
             &reset_identifiers,
             &labels_visible,
             &cpu_label_field,
@@ -1599,6 +1680,9 @@ impl IndicatorControls {
         {
             labels_page.addSubview(child);
         }
+        labels_page.addSubview(&system_symbol_size_label);
+        labels_page.addSubview(&system_symbol_size);
+        labels_page.addSubview(&system_symbol_size_value);
         labels_page.addSubview(&reset_identifiers);
         for child in [
             &*labels_heading as &NSView,
@@ -1678,6 +1762,9 @@ impl IndicatorControls {
             identifiers_heading: identifiers_heading.clone(),
             cpu_identifier: cpu_identifier.retained(),
             ram_identifier: ram_identifier.retained(),
+            system_symbol_size_label: system_symbol_size_label.clone(),
+            system_symbol_size: system_symbol_size.clone(),
+            system_symbol_size_value: system_symbol_size_value.clone(),
             reset_identifiers: reset_identifiers.clone(),
             labels_heading: labels_heading.clone(),
             labels_visible: labels_visible.clone(),
@@ -1723,6 +1810,7 @@ impl IndicatorControls {
             cpu_identifier,
             ram_identifier,
             thumbnail_assets,
+            system_symbol_size,
             reset_identifiers,
             labels_visible,
             label_spacing,
@@ -1783,6 +1871,27 @@ impl IndicatorControls {
             ram_icon_error,
             ram_icon_pending,
             &self.thumbnail_assets,
+        );
+        let identifier_editing = IdentifierEditingPresentation::new(
+            preferences.identifiers.cpu.mode,
+            preferences.identifiers.ram.mode,
+        );
+        self.target
+            .ivars()
+            .selected_system_symbol_size
+            .set(preferences.identifiers.system_symbol_size);
+        self.system_symbol_size
+            .setIntegerValue(preferences.identifiers.system_symbol_size.points().into());
+        self.system_symbol_size
+            .setEnabled(identifier_editing.system_symbol_size_enabled());
+        self.system_symbol_size
+            .setAccessibilityHelp(Some(&objc2_foundation::NSString::from_str(
+                identifier_editing.system_symbol_size_help(),
+            )));
+        set_slider_value_text(
+            &self.system_symbol_size,
+            &self.layout_views.system_symbol_size_value,
+            &format!("{} pt", preferences.identifiers.system_symbol_size.points()),
         );
         self.cpu_mode
             .setSelectedSegment(match preferences.cpu_color.mode {
@@ -1943,67 +2052,26 @@ impl IndicatorControls {
             } else {
                 self.ram_mode.setNextKeyView(Some(&self.reset_cpu_and_ram));
             }
-            match preferences.identifiers.cpu.mode {
-                MetricIdentifierMode::Text => self
-                    .cpu_identifier
-                    .mode
-                    .setNextKeyView(Some(&self.ram_identifier.mode)),
-                MetricIdentifierMode::SystemSymbol => {
-                    self.cpu_identifier
-                        .mode
-                        .setNextKeyView(Some(&self.cpu_identifier.symbol));
-                    self.cpu_identifier
-                        .symbol
-                        .setNextKeyView(Some(&self.ram_identifier.mode));
+            let identifier_control = |target| -> &NSView {
+                match target {
+                    IdentifierEditingFocusTarget::CpuMode => &self.cpu_identifier.mode,
+                    IdentifierEditingFocusTarget::CpuSymbol => &self.cpu_identifier.symbol,
+                    IdentifierEditingFocusTarget::CpuChoosePng => &self.cpu_identifier.choose_png,
+                    IdentifierEditingFocusTarget::CpuRemovePng => &self.cpu_identifier.remove,
+                    IdentifierEditingFocusTarget::RamMode => &self.ram_identifier.mode,
+                    IdentifierEditingFocusTarget::RamSymbol => &self.ram_identifier.symbol,
+                    IdentifierEditingFocusTarget::RamChoosePng => &self.ram_identifier.choose_png,
+                    IdentifierEditingFocusTarget::RamRemovePng => &self.ram_identifier.remove,
+                    IdentifierEditingFocusTarget::SystemSymbolSize => &self.system_symbol_size,
+                    IdentifierEditingFocusTarget::ResetIdentifiers => &self.reset_identifiers,
                 }
-                MetricIdentifierMode::Png => {
-                    self.cpu_identifier
-                        .mode
-                        .setNextKeyView(Some(&self.cpu_identifier.choose_png));
-                    if preferences.identifiers.cpu.png.is_some() {
-                        self.cpu_identifier
-                            .choose_png
-                            .setNextKeyView(Some(&self.cpu_identifier.remove));
-                        self.cpu_identifier
-                            .remove
-                            .setNextKeyView(Some(&self.ram_identifier.mode));
-                    } else {
-                        self.cpu_identifier
-                            .choose_png
-                            .setNextKeyView(Some(&self.ram_identifier.mode));
-                    }
-                }
-            }
-            match preferences.identifiers.ram.mode {
-                MetricIdentifierMode::Text => self
-                    .ram_identifier
-                    .mode
-                    .setNextKeyView(Some(&self.reset_identifiers)),
-                MetricIdentifierMode::SystemSymbol => {
-                    self.ram_identifier
-                        .mode
-                        .setNextKeyView(Some(&self.ram_identifier.symbol));
-                    self.ram_identifier
-                        .symbol
-                        .setNextKeyView(Some(&self.reset_identifiers));
-                }
-                MetricIdentifierMode::Png => {
-                    self.ram_identifier
-                        .mode
-                        .setNextKeyView(Some(&self.ram_identifier.choose_png));
-                    if preferences.identifiers.ram.png.is_some() {
-                        self.ram_identifier
-                            .choose_png
-                            .setNextKeyView(Some(&self.ram_identifier.remove));
-                        self.ram_identifier
-                            .remove
-                            .setNextKeyView(Some(&self.reset_identifiers));
-                    } else {
-                        self.ram_identifier
-                            .choose_png
-                            .setNextKeyView(Some(&self.reset_identifiers));
-                    }
-                }
+            };
+            let identifier_focus_order = identifier_editing.focus_order(
+                preferences.identifiers.cpu.png.is_some(),
+                preferences.identifiers.ram.png.is_some(),
+            );
+            for link in identifier_focus_order.windows(2) {
+                identifier_control(link[0]).setNextKeyView(Some(identifier_control(link[1])));
             }
             self.reset_identifiers
                 .setNextKeyView(Some(&self.labels_visible));
@@ -2362,6 +2430,7 @@ fn configure_actions(
     ram_mode: &NSSegmentedControl,
     cpu_identifier: &MetricIdentifierControls,
     ram_identifier: &MetricIdentifierControls,
+    system_symbol_size: &NSSlider,
     reset_identifiers: &NSButton,
     labels_visible: &NSButton,
     cpu_label_field: &NSTextField,
@@ -2406,6 +2475,10 @@ fn configure_actions(
             (
                 &*ram_identifier.symbol as &objc2_app_kit::NSControl,
                 sel!(changeRamSystemSymbol:),
+            ),
+            (
+                &**system_symbol_size as &objc2_app_kit::NSControl,
+                sel!(changeSystemSymbolSize:),
             ),
             (
                 &*cpu_identifier.choose_png as &objc2_app_kit::NSControl,

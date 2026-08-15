@@ -8,7 +8,7 @@ use crate::indicator_preferences::{
     IndicatorAppearance, IndicatorLabel, IndicatorPreferenceGroup, IndicatorPreferences,
     LabelColorMode, LabelSpacing, MetricColorMode, MetricColorPreferences, MetricIdentifierMode,
     MetricIdentifierPreferences, MetricKind, MetricsRefreshInterval, PngIconMetadata, SrgbColor,
-    SystemSymbolName,
+    SystemSymbolName, SystemSymbolSize,
 };
 use crate::mole::MoleStatus;
 use crate::system_usage::SystemUsageSection;
@@ -225,6 +225,7 @@ pub enum IndicatorPreferenceChange {
         metric: MetricKind,
         symbol: SystemSymbolName,
     },
+    SetSystemSymbolSize(SystemSymbolSize),
     SetMetricPngMetadata {
         metric: MetricKind,
         png: Option<PngIconMetadata>,
@@ -1012,6 +1013,9 @@ impl IndicatorPreferenceChange {
                 &mut metric_identifier(indicator, metric).system_symbol,
                 symbol,
             ),
+            Self::SetSystemSymbolSize(size) => {
+                replace_if_changed(&mut indicator.identifiers.system_symbol_size, size)
+            }
             Self::SetMetricPngMetadata { metric, png } => {
                 replace_if_changed(&mut metric_identifier(indicator, metric).png, png)
             }

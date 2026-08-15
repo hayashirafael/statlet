@@ -1,5 +1,6 @@
 use statlet::indicator::{
-    measure_stable_layout, measure_stable_layout_with_prefixes, TextMeasurer,
+    measure_stable_layout, measure_stable_layout_with_prefix_widths,
+    measure_stable_layout_with_prefixes, TextMeasurer,
 };
 
 struct FakeMeasurer;
@@ -14,6 +15,23 @@ impl TextMeasurer for FakeMeasurer {
     fn content_height(&self) -> f64 {
         18.0
     }
+}
+
+#[test]
+fn optical_symbol_prefix_width_reserves_one_space_for_every_percentage_width() {
+    let prefix_width = 10.0 + FakeMeasurer.width(" ");
+    let layout = measure_stable_layout_with_prefix_widths(
+        &FakeMeasurer,
+        Some(prefix_width),
+        Some(prefix_width),
+        40.0,
+    );
+
+    for value in ["0%", "9%", "10%", "99%", "100%"] {
+        assert!(prefix_width + FakeMeasurer.width(value) <= layout.cpu_width);
+        assert!(prefix_width + FakeMeasurer.width(value) <= layout.ram_width);
+    }
+    assert_eq!(layout.cpu_width, prefix_width + FakeMeasurer.width("100%"));
 }
 
 #[test]

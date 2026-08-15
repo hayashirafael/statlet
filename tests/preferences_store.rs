@@ -3,7 +3,7 @@ use std::fs;
 use statlet::core::{Preferences, WarningThreshold};
 use statlet::indicator_preferences::{
     FontFamilyPreference, IndicatorLabel, IndicatorPreferences, LabelSpacing,
-    MetricsRefreshInterval,
+    MetricsRefreshInterval, SystemSymbolSize,
 };
 use statlet::preferences::PreferencesStore;
 use tempfile::tempdir;
@@ -46,6 +46,7 @@ fn version_two_round_trip_preserves_nested_indicator_preferences() {
     let mut expected = Preferences::default();
     expected.indicator.refresh_interval = MetricsRefreshInterval::try_from(17).unwrap();
     expected.indicator.typography.family = FontFamilyPreference::named("Avenir Next").unwrap();
+    expected.indicator.identifiers.system_symbol_size = SystemSymbolSize::try_from(14).unwrap();
 
     store.save(expected.clone()).unwrap();
 
@@ -53,10 +54,53 @@ fn version_two_round_trip_preserves_nested_indicator_preferences() {
     let saved =
         serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path).unwrap()).unwrap();
     assert_eq!(saved["version"], 2);
+    assert_eq!(saved["indicator"]["identifiers"]["systemSymbolSize"], 14);
     assert_eq!(
         saved["indicator"]["typography"]["family"],
         serde_json::json!({ "named": "Avenir Next" })
     );
+}
+
+#[test]
+fn version_two_without_system_symbol_size_keeps_the_compatible_twelve_point_default() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("preferences.json");
+    let store = PreferencesStore::new(path.clone());
+    store.save(Preferences::default()).unwrap();
+    let mut payload =
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path).unwrap()).unwrap();
+    payload["indicator"]["identifiers"]
+        .as_object_mut()
+        .unwrap()
+        .remove("systemSymbolSize");
+    fs::write(&path, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+    assert_eq!(
+        store
+            .load()
+            .indicator
+            .identifiers
+            .system_symbol_size
+            .points(),
+        12
+    );
+}
+
+#[test]
+fn version_two_rejects_system_symbol_size_outside_the_safe_range() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("preferences.json");
+    let store = PreferencesStore::new(path.clone());
+    store.save(Preferences::default()).unwrap();
+
+    for invalid in [7, 15] {
+        let mut payload =
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path).unwrap()).unwrap();
+        payload["indicator"]["identifiers"]["systemSymbolSize"] = serde_json::json!(invalid);
+        fs::write(&path, serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(store.load(), Preferences::default(), "invalid {invalid}");
+        store.save(Preferences::default()).unwrap();
+    }
 }
 
 #[test]
@@ -242,6 +286,7 @@ fn valid_versioned_preferences_round_trip_with_atomic_replacement() {
                     }
                 },
                 "identifiers": {
+                    "systemSymbolSize": 12,
                     "cpu": {
                         "mode": "text",
                         "systemSymbol": "cpu",

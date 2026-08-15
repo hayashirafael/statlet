@@ -240,6 +240,18 @@ pub(super) const fn font_size_slider_contract() -> DiscreteSliderContract {
     )
 }
 
+pub(super) const fn system_symbol_size_slider_contract() -> DiscreteSliderContract {
+    DiscreteSliderContract::new(
+        8,
+        14,
+        1,
+        7,
+        "indicator.identifiers.system-symbol-size",
+        "Tamanho do ícone",
+        "Ajusta o tamanho compartilhado dos ícones do macOS de CPU e RAM.",
+    )
+}
+
 pub(super) const fn disk_threshold_slider_contract() -> DiscreteSliderContract {
     DiscreteSliderContract::new(
         70,
@@ -1292,8 +1304,8 @@ mod tests {
     use super::{
         deactivate_inactive_color_wells, disk_threshold_slider_contract, font_size_slider_contract,
         get_or_create_window, label_spacing_slider_contract, select_visible_area,
-        warning_threshold_from_slider_value, PreferencesArea, PreferencesAreaState,
-        PreferencesRegion, PreferencesShellContract, RegionPlacement,
+        system_symbol_size_slider_contract, warning_threshold_from_slider_value, PreferencesArea,
+        PreferencesAreaState, PreferencesRegion, PreferencesShellContract, RegionPlacement,
     };
     use statlet::core::PreferencesSaveStatus;
     use statlet::preferences_view::PreferencesShellPresentation;
@@ -1333,6 +1345,16 @@ mod tests {
         );
         assert_eq!(font.identifier(), "indicator.font.size");
 
+        let symbol = system_symbol_size_slider_contract();
+        assert_eq!(
+            (symbol.min(), symbol.max(), symbol.step(), symbol.ticks()),
+            (8, 14, 1, 7)
+        );
+        assert_eq!(
+            symbol.identifier(),
+            "indicator.identifiers.system-symbol-size"
+        );
+
         let disk = disk_threshold_slider_contract();
         assert_eq!(
             (disk.min(), disk.max(), disk.step(), disk.ticks()),
@@ -1340,7 +1362,7 @@ mod tests {
         );
         assert_eq!(disk.identifier(), "disk.warning.threshold");
 
-        for contract in [spacing, font, disk] {
+        for contract in [spacing, font, symbol, disk] {
             assert!(contract.continuous());
             assert!(contract.tick_values_only());
             assert!(!contract.accessibility_label().is_empty());

@@ -56,6 +56,39 @@ pub struct SystemSymbolName(String);
 pub struct InvalidSystemSymbolName;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SystemSymbolSize(u8);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidSystemSymbolSize;
+
+impl TryFrom<u8> for SystemSymbolSize {
+    type Error = InvalidSystemSymbolSize;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if (Self::MIN_POINTS..=Self::MAX_POINTS).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(InvalidSystemSymbolSize)
+        }
+    }
+}
+
+impl SystemSymbolSize {
+    pub const MIN_POINTS: u8 = 8;
+    pub const MAX_POINTS: u8 = 14;
+
+    pub const fn points(self) -> u8 {
+        self.0
+    }
+}
+
+impl Default for SystemSymbolSize {
+    fn default() -> Self {
+        Self(12)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CuratedSystemSymbol {
     name: &'static str,
     label_pt_br: &'static str,
@@ -241,6 +274,7 @@ pub struct MetricIdentifierPreferences {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdentifierPreferences {
+    pub system_symbol_size: SystemSymbolSize,
     pub cpu: MetricIdentifierPreferences,
     pub ram: MetricIdentifierPreferences,
 }
@@ -248,6 +282,7 @@ pub struct IdentifierPreferences {
 impl Default for IdentifierPreferences {
     fn default() -> Self {
         Self {
+            system_symbol_size: SystemSymbolSize::default(),
             cpu: MetricIdentifierPreferences {
                 mode: MetricIdentifierMode::Text,
                 system_symbol: SystemSymbolName("cpu".to_owned()),

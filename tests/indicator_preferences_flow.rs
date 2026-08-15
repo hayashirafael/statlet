@@ -4,7 +4,7 @@ use statlet::core::{
 use statlet::indicator_preferences::{
     FontFamilyPreference, FontSize, FontWeight, IndicatorAppearance, IndicatorPreferenceGroup,
     IndicatorPreferences, LabelColorMode, MetricColorMode, MetricKind, MetricsRefreshInterval,
-    SrgbColor,
+    SrgbColor, SystemSymbolSize,
 };
 
 fn customized_app(mole_enabled: bool) -> StatletCore {
@@ -77,6 +77,65 @@ fn repeated_visual_change_emits_no_effect() {
     app.handle(AppEvent::UpdateIndicator(change.clone()));
 
     assert!(app.handle(AppEvent::UpdateIndicator(change)).is_empty());
+}
+
+#[test]
+fn system_symbol_size_change_redraws_saves_and_deduplicates() {
+    let mut app = StatletCore::new();
+    let size = SystemSymbolSize::try_from(14).unwrap();
+    let change = IndicatorPreferenceChange::SetSystemSymbolSize(size);
+
+    let effects = app.handle(AppEvent::UpdateIndicator(change.clone()));
+
+    assert_eq!(
+        app.state()
+            .preferences
+            .indicator
+            .identifiers
+            .system_symbol_size,
+        size
+    );
+    assert_redraw_then_save(effects, &app);
+    assert!(app.handle(AppEvent::UpdateIndicator(change)).is_empty());
+}
+
+#[test]
+fn identifier_reset_and_global_undo_restore_the_expected_symbol_sizes() {
+    let mut indicator = IndicatorPreferences::default();
+    indicator.identifiers.system_symbol_size = SystemSymbolSize::try_from(14).unwrap();
+    let mut app = StatletCore::with_preferences(Preferences {
+        indicator,
+        ..Preferences::default()
+    })
+    .0;
+
+    app.handle(AppEvent::ResetIndicatorGroup(
+        IndicatorPreferenceGroup::Identifiers,
+    ));
+    assert_eq!(
+        app.state()
+            .preferences
+            .indicator
+            .identifiers
+            .system_symbol_size
+            .points(),
+        12
+    );
+
+    app.handle(AppEvent::UpdateIndicator(
+        IndicatorPreferenceChange::SetSystemSymbolSize(SystemSymbolSize::try_from(14).unwrap()),
+    ));
+    app.handle(AppEvent::ResetIndicatorConfirmed);
+    app.handle(AppEvent::UndoIndicatorReset);
+    assert_eq!(
+        app.state()
+            .preferences
+            .indicator
+            .identifiers
+            .system_symbol_size
+            .points(),
+        14
+    );
 }
 
 #[test]

@@ -1,6 +1,7 @@
 use statlet::indicator_preferences::{
     FontFamilyPreference, FontSize, IndicatorAppearance, IndicatorPreferenceGroup,
     IndicatorPreferences, LabelColorMode, MetricIdentifierMode, MetricsRefreshInterval, SrgbColor,
+    SystemSymbolSize,
 };
 
 #[test]
@@ -35,6 +36,15 @@ fn bounded_values_accept_only_the_approved_ranges() {
 }
 
 #[test]
+fn system_symbol_size_accepts_every_whole_point_from_eight_through_fourteen() {
+    assert!(SystemSymbolSize::try_from(7).is_err());
+    for points in 8..=14 {
+        assert_eq!(SystemSymbolSize::try_from(points).unwrap().points(), points);
+    }
+    assert!(SystemSymbolSize::try_from(15).is_err());
+}
+
+#[test]
 fn refresh_interval_exposes_its_canonical_limits() {
     assert_eq!(MetricsRefreshInterval::MIN_SECONDS, 1);
     assert_eq!(MetricsRefreshInterval::MAX_SECONDS, 60);
@@ -46,8 +56,21 @@ fn defaults_exactly_match_the_v1_indicator() {
     assert!(value.labels.visible);
     assert_eq!(value.typography.size.points(), 12);
     assert_eq!(value.refresh_interval.seconds(), 2);
+    assert_eq!(value.identifiers.system_symbol_size.points(), 12);
     assert!(value.cpu_color.is_dynamic());
     assert!(value.ram_color.is_dynamic());
+}
+
+#[test]
+fn identifier_reset_restores_symbol_size_without_touching_typography() {
+    let mut value = IndicatorPreferences::default();
+    value.identifiers.system_symbol_size = SystemSymbolSize::try_from(14).unwrap();
+    value.typography.size = FontSize::try_from(13).unwrap();
+
+    value.reset(IndicatorPreferenceGroup::Identifiers);
+
+    assert_eq!(value.identifiers.system_symbol_size.points(), 12);
+    assert_eq!(value.typography.size.points(), 13);
 }
 
 #[test]

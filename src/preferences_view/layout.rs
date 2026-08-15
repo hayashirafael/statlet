@@ -200,6 +200,7 @@ pub struct IndicatorControlsLayout {
     ram_identifier_row: RowSlot,
     ram_identifier_detail: VerticalSlot,
     ram_identifier_error: Option<VerticalSlot>,
+    system_symbol_size_row: RowSlot,
     identifiers_reset: ControlSlot,
     labels_heading: VerticalSlot,
     labels_reset: ControlSlot,
@@ -253,6 +254,8 @@ impl IndicatorControlsLayout {
             MessageLayout::identifier_transaction_error().height(),
         );
         cursor += INLINE_GAP;
+        let system_symbol_size_row = row(&mut cursor);
+        cursor += INLINE_GAP;
         let identifiers_reset = control(vertical(&mut cursor, ROW_HEIGHT), 350.0, 200.0);
 
         cursor += GROUP_GAP;
@@ -300,6 +303,7 @@ impl IndicatorControlsLayout {
             ram_identifier_row,
             ram_identifier_detail,
             ram_identifier_error,
+            system_symbol_size_row,
             identifiers_reset,
             labels_heading,
             labels_reset,
@@ -358,6 +362,9 @@ impl IndicatorControlsLayout {
     }
     pub const fn ram_identifier_error(self) -> Option<VerticalSlot> {
         self.ram_identifier_error
+    }
+    pub const fn system_symbol_size_row(self) -> RowSlot {
+        self.system_symbol_size_row
     }
     pub const fn identifiers_reset(self) -> ControlSlot {
         self.identifiers_reset
@@ -615,6 +622,7 @@ mod tests {
                 Some(layout.ram_identifier_row().vertical()),
                 Some(layout.ram_identifier_detail()),
                 layout.ram_identifier_error(),
+                Some(layout.system_symbol_size_row().vertical()),
                 Some(layout.identifiers_reset().vertical()),
                 Some(layout.labels_heading()),
                 Some(layout.labels_visibility_row().vertical()),
