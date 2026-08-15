@@ -219,12 +219,12 @@ impl DiscreteSliderContract {
 pub(super) const fn label_spacing_slider_contract() -> DiscreteSliderContract {
     DiscreteSliderContract::new(
         0,
-        4,
+        10,
         1,
-        5,
+        11,
         "indicator.labels.spacing",
         "Espaçamento entre rótulo e percentual",
-        "Escolha de zero a quatro espaços.",
+        "Escolha de zero a um espaço, em décimos.",
     )
 }
 
@@ -1334,7 +1334,7 @@ mod tests {
                 spacing.step(),
                 spacing.ticks()
             ),
-            (0, 4, 1, 5)
+            (0, 10, 1, 11)
         );
         assert_eq!(spacing.identifier(), "indicator.labels.spacing");
 

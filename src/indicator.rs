@@ -25,6 +25,7 @@ pub enum SegmentColor {
 pub struct IndicatorRun {
     pub text: String,
     pub color: SegmentColor,
+    pub trailing_spacing_level: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,10 +155,12 @@ pub fn compose_indicator(
             DiskBadge::Warning => IndicatorRun {
                 text: " !".to_owned(),
                 color: SegmentColor::Semantic(SemanticColor::DiskWarning),
+                trailing_spacing_level: 0,
             },
             DiskBadge::Error => IndicatorRun {
                 text: " ×".to_owned(),
                 color: SegmentColor::Semantic(SemanticColor::DiskError),
+                trailing_spacing_level: 0,
             },
         }),
         accessibility_label: status.accessibility_label.clone(),
@@ -269,7 +272,14 @@ fn resolve_metric_identifier_fallback(
             ..
         } => (fallback_text, fallback_color),
     };
-    runs.insert(0, IndicatorRun { text, color });
+    runs.insert(
+        0,
+        IndicatorRun {
+            text,
+            color,
+            trailing_spacing_level: 0,
+        },
+    );
     true
 }
 
@@ -423,13 +433,15 @@ fn metric_runs(
             }
         };
         runs.push(IndicatorRun {
-            text: format!("{label}{}", " ".repeat(preferences.labels.spacing.spaces())),
+            text: label.to_owned(),
             color,
+            trailing_spacing_level: preferences.labels.spacing.level(),
         });
     }
     runs.push(IndicatorRun {
         text: format!("{}%", metric.percent),
         color: metric_color,
+        trailing_spacing_level: 0,
     });
     runs
 }
@@ -458,6 +470,7 @@ fn metric_presentation(
     let value_run = IndicatorRun {
         text: format!("{}%", metric.percent),
         color: metric_color,
+        trailing_spacing_level: 0,
     };
     match identifier.mode {
         MetricIdentifierMode::Text => unreachable!("text mode returned above"),
@@ -486,6 +499,7 @@ fn metric_presentation(
                     IndicatorRun {
                         text: fallback_text,
                         color: label_color,
+                        trailing_spacing_level: 0,
                     },
                     value_run,
                 ],
@@ -601,8 +615,58 @@ pub fn measure_stable_layout_with_prefix_widths(
     ram_prefix_width: Option<f64>,
     default_width: f64,
 ) -> StableLayout {
-    let cpu_width = widest_metric_width_with_prefix(measurer, cpu_prefix_width.unwrap_or(0.0));
-    let ram_width = widest_metric_width_with_prefix(measurer, ram_prefix_width.unwrap_or(0.0));
+    measure_stable_layout_with_prefix_widths_and_spacing(
+        measurer,
+        cpu_prefix_width,
+        ram_prefix_width,
+        0.0,
+        0.0,
+        default_width,
+    )
+}
+
+pub fn measure_stable_layout_with_prefixes_and_spacing(
+    measurer: &impl TextMeasurer,
+    cpu_prefix: Option<&str>,
+    ram_prefix: Option<&str>,
+    cpu_spacing_level: u8,
+    ram_spacing_level: u8,
+    default_width: f64,
+) -> StableLayout {
+    let cpu_prefix_width = cpu_prefix.map(|prefix| measurer.width(prefix));
+    let ram_prefix_width = ram_prefix.map(|prefix| measurer.width(prefix));
+    let cpu_spacing_width = cpu_prefix.map_or(0.0, |prefix| {
+        trailing_spacing_width(measurer, prefix, cpu_spacing_level)
+    });
+    let ram_spacing_width = ram_prefix.map_or(0.0, |prefix| {
+        trailing_spacing_width(measurer, prefix, ram_spacing_level)
+    });
+    measure_stable_layout_with_prefix_widths_and_spacing(
+        measurer,
+        cpu_prefix_width,
+        ram_prefix_width,
+        cpu_spacing_width,
+        ram_spacing_width,
+        default_width,
+    )
+}
+
+pub fn measure_stable_layout_with_prefix_widths_and_spacing(
+    measurer: &impl TextMeasurer,
+    cpu_prefix_width: Option<f64>,
+    ram_prefix_width: Option<f64>,
+    cpu_spacing_width: f64,
+    ram_spacing_width: f64,
+    default_width: f64,
+) -> StableLayout {
+    let cpu_width = widest_metric_width_with_prefix(
+        measurer,
+        cpu_prefix_width.unwrap_or(0.0) + cpu_spacing_width,
+    );
+    let ram_width = widest_metric_width_with_prefix(
+        measurer,
+        ram_prefix_width.unwrap_or(0.0) + ram_spacing_width,
+    );
     let base_width = cpu_width.max(ram_width);
 
     StableLayout {
@@ -632,6 +696,14 @@ fn widest_metric_width_with_prefix(measurer: &impl TextMeasurer, prefix_width: f
         .fold(0.0, f64::max)
 }
 
+pub fn trailing_spacing_width(
+    measurer: &impl TextMeasurer,
+    prefix: &str,
+    spacing_level: u8,
+) -> f64 {
+    let prefix_with_space = format!("{prefix} ");
+    (measurer.width(&prefix_with_space) - measurer.width(prefix)) * f64::from(spacing_level) / 10.0
+}
 #[cfg(test)]
 mod tests {
     use super::{has_low_text_contrast, PreviewBackground};

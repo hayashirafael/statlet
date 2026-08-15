@@ -394,21 +394,21 @@ impl TryFrom<u8> for LabelSpacing {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0..=4 => Ok(Self(value)),
+            0..=10 => Ok(Self(value)),
             _ => Err(InvalidLabelSpacing),
         }
     }
 }
 
 impl LabelSpacing {
-    pub const fn spaces(self) -> usize {
-        self.0 as usize
+    pub const fn level(self) -> u8 {
+        self.0
     }
 }
 
 impl Default for LabelSpacing {
     fn default() -> Self {
-        Self(1)
+        Self(10)
     }
 }
 

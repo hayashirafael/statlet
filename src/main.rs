@@ -4179,10 +4179,12 @@ mod tests {
             top: vec![IndicatorRun {
                 text: "C 42%".into(),
                 color: gray,
+                trailing_spacing_level: 0,
             }],
             bottom: vec![IndicatorRun {
                 text: "R 68%".into(),
                 color: gray,
+                trailing_spacing_level: 0,
             }],
             top_identifier: None,
             bottom_identifier: None,
@@ -4203,10 +4205,12 @@ mod tests {
             top: vec![IndicatorRun {
                 text: "C 42%".into(),
                 color: warning,
+                trailing_spacing_level: 0,
             }],
             bottom: vec![IndicatorRun {
                 text: "R 68%".into(),
                 color: warning,
+                trailing_spacing_level: 0,
             }],
             top_identifier: None,
             bottom_identifier: None,

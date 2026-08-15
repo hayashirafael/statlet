@@ -37,7 +37,8 @@ fn dynamic_metrics_and_neutral_labels_create_unpadded_runs() {
         IndicatorAppearance::Light,
     );
 
-    assert_eq!(scene.top[0].text, "C ");
+    assert_eq!(scene.top[0].text, "C");
+    assert_eq!(scene.top[0].trailing_spacing_level, 10);
     assert_eq!(
         scene.top[0].color,
         SegmentColor::Semantic(SemanticColor::Neutral)
@@ -47,7 +48,8 @@ fn dynamic_metrics_and_neutral_labels_create_unpadded_runs() {
         scene.top[1].color,
         SegmentColor::Semantic(SemanticColor::Warning)
     );
-    assert_eq!(scene.bottom[0].text, "R ");
+    assert_eq!(scene.bottom[0].text, "R");
+    assert_eq!(scene.bottom[0].trailing_spacing_level, 10);
     assert_eq!(
         scene.bottom[0].color,
         SegmentColor::Semantic(SemanticColor::Neutral)

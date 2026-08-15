@@ -40,8 +40,35 @@ fn label_changes_redraw_and_persist_then_render_their_independent_text_and_spaci
         &app.state().preferences.indicator,
         IndicatorAppearance::Light,
     );
-    assert_eq!(scene.top[0].text, "CPU uso  ");
-    assert_eq!(scene.bottom[0].text, "Memória  ");
+    assert_eq!(scene.top[0].text, "CPU uso");
+    assert_eq!(scene.bottom[0].text, "Memória");
+    assert_eq!(scene.top[0].trailing_spacing_level, 2);
+    assert_eq!(scene.bottom[0].trailing_spacing_level, 2);
+}
+
+#[test]
+fn spacing_level_ten_keeps_the_legacy_single_space_width_without_literal_label_padding() {
+    let mut preferences = IndicatorPreferences::default();
+    preferences.labels.cpu = IndicatorLabel::new("CPU uso").unwrap();
+    preferences.labels.spacing = LabelSpacing::try_from(10).unwrap();
+
+    let scene = compose_indicator(
+        &StatletCore::new().state().status,
+        &preferences,
+        IndicatorAppearance::Light,
+    );
+
+    assert_eq!(scene.top[0].text, "CPU uso");
+    assert_eq!(scene.top[0].trailing_spacing_level, 10);
+}
+
+#[test]
+fn spacing_accepts_every_decimal_level_and_rejects_values_above_one_space() {
+    for level in 0..=10 {
+        assert_eq!(LabelSpacing::try_from(level).unwrap().level(), level);
+    }
+
+    assert!(LabelSpacing::try_from(11).is_err());
 }
 
 #[test]
@@ -55,7 +82,7 @@ fn label_group_reset_restores_compact_c_and_r_defaults() {
 
     assert_eq!(preferences.labels.cpu.as_str(), "C");
     assert_eq!(preferences.labels.ram.as_str(), "R");
-    assert_eq!(preferences.labels.spacing.spaces(), 1);
+    assert_eq!(preferences.labels.spacing.level(), 10);
 }
 
 #[test]

@@ -65,6 +65,7 @@ fn composed_system_symbols_carry_the_shared_size_without_changing_png_or_text() 
         vec![statlet::indicator::IndicatorRun {
             text: "42%".to_owned(),
             color: SegmentColor::Semantic(SemanticColor::Warning),
+            trailing_spacing_level: 0,
         }]
     );
 }
@@ -265,7 +266,7 @@ fn identifier_round_trip_preserves_symbol_and_png_metadata() {
     assert_eq!(store.load(), expected);
     let saved: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(saved["version"], 2);
+    assert_eq!(saved["version"], 3);
     assert_eq!(
         saved["indicator"]["identifiers"]["cpu"]["mode"],
         "systemSymbol"
@@ -307,7 +308,8 @@ fn system_symbol_replaces_only_the_cpu_text_identifier_in_the_surface_spec() {
             .collect::<String>(),
         "42%"
     );
-    assert_eq!(surface.bottom.runs[0].text, "R ");
+    assert_eq!(surface.bottom.runs[0].text, "R");
+    assert_eq!(surface.bottom.runs[0].trailing_spacing_level, 10);
     assert_eq!(
         surface.top.identifier,
         Some(MetricIdentifierVisual::SystemSymbol {
