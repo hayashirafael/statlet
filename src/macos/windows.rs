@@ -852,6 +852,13 @@ impl WindowManager {
         }
     }
 
+    pub fn close_key_window(&self) {
+        let mtm = MainThreadMarker::new().expect("native window actions run on the main thread");
+        if let Some(window) = NSApplication::sharedApplication(mtm).keyWindow() {
+            window.performClose(None);
+        }
+    }
+
     pub fn show(&mut self, kind: WindowKind, state: &AppState, history: &History) {
         let shows_system_usage = kind == WindowKind::SystemUsage;
         let mtm = MainThreadMarker::new().expect("native window actions run on the main thread");
@@ -1342,7 +1349,7 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
     }
     process_scroll.setDocumentView(Some(&process_table));
 
-    let [ram_key, gpu_key, close_key] = system_usage_shortcut_keys();
+    let [ram_key, gpu_key] = system_usage_shortcut_keys();
     let ram_shortcut = shortcut_button(
         mtm,
         target as &AnyObject,
@@ -1355,8 +1362,6 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
         gpu_key,
         sel!(selectSystemUsageGpu:),
     );
-    let close_shortcut =
-        shortcut_button(mtm, &*window as &AnyObject, close_key, sel!(performClose:));
 
     content.addSubview(&segmented_control);
     content.addSubview(&primary_value);
@@ -1370,7 +1375,6 @@ fn create_system_usage_window(mtm: MainThreadMarker, target: &ControlTarget) -> 
     content.addSubview(&process_scroll);
     content.addSubview(&ram_shortcut);
     content.addSubview(&gpu_shortcut);
-    content.addSubview(&close_shortcut);
     window.setInitialFirstResponder(Some(&segmented_control));
 
     SystemUsageWindow {
@@ -1413,8 +1417,8 @@ fn shortcut_button(
     button
 }
 
-fn system_usage_shortcut_keys() -> [&'static str; 3] {
-    ["1", "2", "w"]
+fn system_usage_shortcut_keys() -> [&'static str; 2] {
+    ["1", "2"]
 }
 
 #[cfg(test)]
@@ -1462,8 +1466,8 @@ mod tests {
     }
 
     #[test]
-    fn system_usage_shortcuts_include_the_native_close_command() {
-        assert_eq!(super::system_usage_shortcut_keys(), ["1", "2", "w"]);
+    fn system_usage_keeps_section_shortcuts_without_shadowing_native_close() {
+        assert_eq!(super::system_usage_shortcut_keys(), ["1", "2"]);
     }
 
     #[derive(Default)]

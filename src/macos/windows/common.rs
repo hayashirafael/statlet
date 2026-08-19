@@ -58,6 +58,13 @@ define_class!(
     }
 
     impl ControlTarget {
+        #[unsafe(method(toggleMenuBarVisibility:))]
+        fn toggle_menu_bar_visibility(&self, sender: &NSButton) {
+            self.send_app_event(menu_bar_visibility_event(
+                sender.state() == NSControlStateValueOn,
+            ));
+        }
+
         #[unsafe(method(toggleMoleIntegration:))]
         fn toggle_mole_integration(&self, sender: &NSButton) {
             let enabled = sender.state() == NSControlStateValueOn;
@@ -210,6 +217,10 @@ impl ControlTarget {
     }
 }
 
+fn menu_bar_visibility_event(visible: bool) -> AppEvent {
+    AppEvent::SetMenuBarVisibility(visible)
+}
+
 pub(super) struct PreferencesWindowHostIvars {
     proxy: EventLoopProxy<RuntimeEvent>,
     can_undo_indicator_reset: Cell<bool>,
@@ -331,7 +342,20 @@ pub(super) fn threshold_title(threshold: WarningThreshold) -> Retained<objc2_fou
 
 #[cfg(test)]
 mod tests {
-    use super::indicator_reset_confirmation;
+    use super::{indicator_reset_confirmation, menu_bar_visibility_event};
+    use statlet::core::AppEvent;
+
+    #[test]
+    fn native_checkbox_state_maps_to_the_visibility_domain_event() {
+        assert_eq!(
+            menu_bar_visibility_event(true),
+            AppEvent::SetMenuBarVisibility(true)
+        );
+        assert_eq!(
+            menu_bar_visibility_event(false),
+            AppEvent::SetMenuBarVisibility(false)
+        );
+    }
 
     #[test]
     fn global_reset_confirmation_summarizes_every_indicator_group_and_safety_boundary() {

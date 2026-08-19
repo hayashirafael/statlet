@@ -266,7 +266,7 @@ fn identifier_round_trip_preserves_symbol_and_png_metadata() {
     assert_eq!(store.load(), expected);
     let saved: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(saved["version"], 3);
+    assert_eq!(saved["version"], 4);
     assert_eq!(
         saved["indicator"]["identifiers"]["cpu"]["mode"],
         "systemSymbol"

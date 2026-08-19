@@ -36,6 +36,7 @@ fn bundle_string(bundle: &NSBundle, key: &str) -> Option<String> {
 #[derive(Debug)]
 pub enum RuntimeEvent {
     App(AppEvent),
+    CloseKeyWindow,
     MetricPngPrepared {
         metric: MetricKind,
         generation: u64,

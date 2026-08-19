@@ -113,6 +113,7 @@ pub enum AppEvent {
     OpenSystemUsage,
     SelectSystemUsageSection(SystemUsageSection),
     Quit,
+    SetMenuBarVisibility(bool),
     SetMoleIntegrationEnabled(bool),
     SetWarningThreshold(WarningThreshold),
     DiskObserved(DiskObservation),
@@ -275,6 +276,7 @@ pub enum WindowKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppEffect {
     RequestIndicatorRedraw,
+    SetMenuBarVisible(bool),
     SetMetricsSamplingInterval(MetricsRefreshInterval),
     ShowWindow(WindowKind),
     QueuePreferencesSave(Preferences),
@@ -320,11 +322,23 @@ pub enum AppEffect {
     Quit,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Preferences {
+    pub show_in_menu_bar: bool,
     pub mole_integration_enabled: bool,
     pub warning_threshold: WarningThreshold,
     pub indicator: IndicatorPreferences,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            show_in_menu_bar: true,
+            mole_integration_enabled: false,
+            warning_threshold: WarningThreshold::default(),
+            indicator: IndicatorPreferences::default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -372,6 +386,7 @@ impl StatletCore {
     }
 
     pub fn with_preferences(preferences: Preferences) -> (Self, Vec<AppEffect>) {
+        let show_in_menu_bar = preferences.show_in_menu_bar;
         let disk_sampling_enabled = preferences.mole_integration_enabled;
         let system_snapshot = SystemSnapshot {
             cpu_percent: 0.0,
@@ -397,7 +412,10 @@ impl StatletCore {
             monitoring_failure_active: false,
             indicator_reset_undo: None,
         };
-        let mut effects = vec![AppEffect::SetDiskSamplingEnabled(disk_sampling_enabled)];
+        let mut effects = vec![
+            AppEffect::SetMenuBarVisible(show_in_menu_bar),
+            AppEffect::SetDiskSamplingEnabled(disk_sampling_enabled),
+        ];
         if disk_sampling_enabled {
             effects.push(AppEffect::CheckMoleCompatibility);
         }
@@ -451,6 +469,16 @@ impl StatletCore {
                 AppEffect::FlushPreferences(self.state.preferences.clone()),
                 AppEffect::Quit,
             ],
+            AppEvent::SetMenuBarVisibility(visible) => {
+                if self.state.preferences.show_in_menu_bar == visible {
+                    return Vec::new();
+                }
+                self.state.preferences.show_in_menu_bar = visible;
+                vec![
+                    AppEffect::SetMenuBarVisible(visible),
+                    AppEffect::QueuePreferencesSave(self.state.preferences.clone()),
+                ]
+            }
             AppEvent::SetMoleIntegrationEnabled(enabled) => {
                 if self.state.preferences.mole_integration_enabled == enabled {
                     return Vec::new();

@@ -13,6 +13,90 @@ pub use layout::{
 
 const SYSTEM_MONOSPACED_LABEL: &str = "System Monospaced";
 const PREFERENCES_SAVE_ERROR: &str = "Não foi possível salvar as preferências.";
+const GENERAL_TITLE: &str = "Geral";
+const SHOW_IN_MENU_BAR_LABEL: &str = "Mostrar o Statlet na barra de menus";
+const SHOW_IN_MENU_BAR_IDENTIFIER: &str = "general.show-in-menu-bar";
+const MENU_BAR_RECOVERY_HELP: &str =
+    "Se ocultar o Statlet, abra-o pelo Finder ou Spotlight para voltar às Preferências.";
+pub const GENERAL_RECOVERY_MAX_LINES: usize = 2;
+pub const GENERAL_RECOVERY_LAYOUT_WIDTH: f64 = 400.0;
+pub const GENERAL_RECOVERY_LAYOUT_HEIGHT: f64 = 44.0;
+pub const fn general_recovery_layout() -> (f64, f64, usize) {
+    (
+        GENERAL_RECOVERY_LAYOUT_WIDTH,
+        GENERAL_RECOVERY_LAYOUT_HEIGHT,
+        GENERAL_RECOVERY_MAX_LINES,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreferencesNavigationArea {
+    #[default]
+    General,
+    Colors,
+    Labels,
+    Typography,
+    Refresh,
+    DiskAndMole,
+}
+
+impl PreferencesNavigationArea {
+    pub const fn from_sidebar_row(row: isize) -> Option<Self> {
+        match row {
+            0 => Some(Self::General),
+            1 => Some(Self::Colors),
+            2 => Some(Self::Labels),
+            3 => Some(Self::Typography),
+            4 => Some(Self::Refresh),
+            5 => Some(Self::DiskAndMole),
+            _ => None,
+        }
+    }
+
+    pub const fn sidebar_label(self) -> &'static str {
+        match self {
+            Self::General => "Geral",
+            Self::Colors => "Cores",
+            Self::Labels => "Rótulos",
+            Self::Typography => "Tipografia",
+            Self::Refresh => "Atualização",
+            Self::DiskAndMole => "Disco e Mole",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GeneralPreferencesPresentation {
+    show_in_menu_bar: bool,
+}
+
+impl GeneralPreferencesPresentation {
+    pub const fn from_preferences(preferences: &Preferences) -> Self {
+        Self {
+            show_in_menu_bar: preferences.show_in_menu_bar,
+        }
+    }
+
+    pub const fn show_in_menu_bar(self) -> bool {
+        self.show_in_menu_bar
+    }
+
+    pub const fn title(self) -> &'static str {
+        GENERAL_TITLE
+    }
+
+    pub const fn toggle_label(self) -> &'static str {
+        SHOW_IN_MENU_BAR_LABEL
+    }
+
+    pub const fn toggle_identifier(self) -> &'static str {
+        SHOW_IN_MENU_BAR_IDENTIFIER
+    }
+
+    pub const fn recovery_help(self) -> &'static str {
+        MENU_BAR_RECOVERY_HELP
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PreferencesArea {
@@ -125,7 +209,7 @@ pub struct PreferencesNavigationPolicy {
 }
 
 impl PreferencesNavigationPolicy {
-    pub fn between(current: PreferencesArea, selected: PreferencesArea) -> Self {
+    pub fn between<T: PartialEq>(current: T, selected: T) -> Self {
         Self {
             area_changed: current != selected,
         }

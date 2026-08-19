@@ -84,7 +84,7 @@ else
     digest="$(printf '%s' "$worktree" | shasum -a 256 | awk '{print substr($1, 1, 12)}')"
 fi
 
-slug="$(printf '%s' "$readable_seed" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//' | cut -c1-24)"
+slug="$(printf '%s' "$readable_seed" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//' | cut -c1-24 | sed 's/-*$//')"
 if [[ -z "$slug" ]]; then
     echo "Instance seed does not contain a usable ASCII slug" >&2
     exit 1

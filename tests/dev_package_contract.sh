@@ -44,8 +44,11 @@ fi
 identity_a="$($repo_root/scripts/package-dev.sh --instance task-a --label "Task A" --print-identity)"
 identity_a_again="$($repo_root/scripts/package-dev.sh --instance task-a --label "Changed label" --print-identity)"
 identity_b="$($repo_root/scripts/package-dev.sh --instance task-b --label "Task B" --print-identity)"
+identity_long="$($repo_root/scripts/package-dev.sh --instance ux-review-macos-2026-08-19 --label "Long seed" --print-identity)"
 test "$identity_a" = "$identity_a_again"
 test "$identity_a" != "$identity_b"
+[[ "$identity_long" =~ ^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?-[0-9a-f]{12}$ ]]
+[[ "$identity_long" != *--* ]]
 
 identity_env="$(STATLET_DEV_INSTANCE=env-instance "$repo_root/scripts/package-dev.sh" --task ignored-task --label "Task A" --print-identity)"
 identity_env_alone="$(STATLET_DEV_INSTANCE=env-instance "$repo_root/scripts/package-dev.sh" --label "Task A" --print-identity)"

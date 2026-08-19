@@ -11,6 +11,7 @@ fn customized_app(mole_enabled: bool) -> StatletCore {
     let mut indicator = IndicatorPreferences::default();
     indicator.typography.size = FontSize::try_from(14).unwrap();
     let preferences = Preferences {
+        show_in_menu_bar: true,
         mole_integration_enabled: mole_enabled,
         warning_threshold: WarningThreshold::try_from(80).unwrap(),
         indicator,

@@ -17,6 +17,25 @@ fn missing_preferences_load_safe_defaults() {
 }
 
 #[test]
+fn menu_bar_visibility_round_trips_in_the_current_document() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("preferences.json");
+    let store = PreferencesStore::new(path.clone());
+    let expected = Preferences {
+        show_in_menu_bar: false,
+        ..Preferences::default()
+    };
+
+    store.save(expected.clone()).unwrap();
+
+    assert_eq!(store.load(), expected);
+    let saved =
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(saved["version"], 4);
+    assert_eq!(saved["showInMenuBar"], false);
+}
+
+#[test]
 fn version_one_migrates_disk_values_and_defaults_the_indicator() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("preferences.json");
@@ -30,6 +49,7 @@ fn version_one_migrates_disk_values_and_defaults_the_indicator() {
 
     let loaded = store.load();
 
+    assert!(loaded.show_in_menu_bar);
     assert!(loaded.mole_integration_enabled);
     assert_eq!(loaded.warning_threshold.get(), 95);
     assert_eq!(loaded.indicator, IndicatorPreferences::default());
@@ -39,7 +59,35 @@ fn version_one_migrates_disk_values_and_defaults_the_indicator() {
 }
 
 #[test]
-fn version_three_round_trip_preserves_nested_indicator_preferences() {
+fn version_three_defaults_visibility_without_losing_existing_configuration() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("preferences.json");
+    let store = PreferencesStore::new(path.clone());
+    let mut expected = Preferences {
+        show_in_menu_bar: true,
+        mole_integration_enabled: true,
+        warning_threshold: WarningThreshold::try_from(85).unwrap(),
+        ..Preferences::default()
+    };
+    expected.indicator.refresh_interval = MetricsRefreshInterval::try_from(17).unwrap();
+    expected.indicator.labels.cpu = IndicatorLabel::new("CPU uso").unwrap();
+    expected.indicator.labels.spacing = LabelSpacing::try_from(3).unwrap();
+    let persisted = Preferences {
+        show_in_menu_bar: false,
+        ..expected.clone()
+    };
+    store.save(persisted).unwrap();
+    let mut payload =
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path).unwrap()).unwrap();
+    payload["version"] = serde_json::json!(3);
+    payload.as_object_mut().unwrap().remove("showInMenuBar");
+    fs::write(&path, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+    assert_eq!(store.load(), expected);
+}
+
+#[test]
+fn version_four_round_trip_preserves_nested_indicator_preferences() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("preferences.json");
     let store = PreferencesStore::new(path.clone());
@@ -53,7 +101,8 @@ fn version_three_round_trip_preserves_nested_indicator_preferences() {
     assert_eq!(store.load(), expected);
     let saved =
         serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(saved["version"], 3);
+    assert_eq!(saved["version"], 4);
+    assert_eq!(saved["showInMenuBar"], true);
     assert_eq!(saved["indicator"]["identifiers"]["systemSymbolSize"], 14);
     assert_eq!(
         saved["indicator"]["typography"]["family"],
@@ -62,7 +111,7 @@ fn version_three_round_trip_preserves_nested_indicator_preferences() {
 }
 
 #[test]
-fn version_three_without_system_symbol_size_keeps_the_compatible_twelve_point_default() {
+fn version_four_without_system_symbol_size_keeps_the_compatible_twelve_point_default() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("preferences.json");
     let store = PreferencesStore::new(path.clone());
@@ -87,7 +136,7 @@ fn version_three_without_system_symbol_size_keeps_the_compatible_twelve_point_de
 }
 
 #[test]
-fn version_three_rejects_system_symbol_size_outside_the_safe_range() {
+fn version_four_rejects_system_symbol_size_outside_the_safe_range() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("preferences.json");
     let store = PreferencesStore::new(path.clone());
@@ -104,7 +153,7 @@ fn version_three_rejects_system_symbol_size_outside_the_safe_range() {
 }
 
 #[test]
-fn version_three_round_trip_preserves_custom_labels_and_spacing() {
+fn version_four_round_trip_preserves_custom_labels_and_spacing() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("preferences.json");
     let store = PreferencesStore::new(path.clone());
@@ -129,21 +178,29 @@ fn version_two_spacing_migrates_legacy_spaces_to_decimal_levels() {
     let path = directory.path().join("preferences.json");
     let store = PreferencesStore::new(path.clone());
 
-    store.save(Preferences::default()).unwrap();
+    let mut expected = Preferences {
+        mole_integration_enabled: true,
+        warning_threshold: WarningThreshold::try_from(85).unwrap(),
+        ..Preferences::default()
+    };
+    expected.indicator.labels.cpu = IndicatorLabel::new("CPU uso").unwrap();
+    expected.indicator.refresh_interval = MetricsRefreshInterval::try_from(17).unwrap();
+    store.save(expected.clone()).unwrap();
     let stored =
         serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path).unwrap()).unwrap();
 
-    for (legacy, expected) in [(0, 0), (1, 10), (4, 10)] {
+    for (legacy, expected_spacing) in [(0, 0), (1, 10), (4, 10)] {
         let mut v2 = stored.clone();
         v2["version"] = serde_json::json!(2);
+        v2.as_object_mut().unwrap().remove("showInMenuBar");
         v2["indicator"]["labels"]["spacing"] = serde_json::json!(legacy);
         fs::write(&path, serde_json::to_vec(&v2).unwrap()).unwrap();
 
-        assert_eq!(
-            store.load().indicator.labels.spacing,
-            LabelSpacing::try_from(expected).unwrap(),
-            "legacy spacing {legacy}"
-        );
+        let loaded = store.load();
+        assert!(loaded.show_in_menu_bar);
+        let mut expected = expected.clone();
+        expected.indicator.labels.spacing = LabelSpacing::try_from(expected_spacing).unwrap();
+        assert_eq!(loaded, expected, "legacy spacing {legacy}");
     }
 }
 
@@ -157,6 +214,7 @@ fn version_two_spacing_above_the_legacy_range_loads_safe_defaults() {
     let mut stored =
         serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path).unwrap()).unwrap();
     stored["version"] = serde_json::json!(2);
+    stored.as_object_mut().unwrap().remove("showInMenuBar");
     stored["moleIntegrationEnabled"] = serde_json::json!(true);
     stored["indicator"]["labels"]["spacing"] = serde_json::json!(5);
     fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
@@ -262,7 +320,7 @@ fn invalid_nested_version_two_values_load_safe_defaults() {
             "/indicator/typography/family",
             serde_json::json!({ "named": "   " }),
         ),
-        ("unsupported version", "/version", serde_json::json!(4)),
+        ("unsupported version", "/version", serde_json::json!(5)),
     ];
 
     for (case, pointer, invalid_value) in invalid_values {
@@ -306,7 +364,8 @@ fn valid_versioned_preferences_round_trip_with_atomic_replacement() {
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&json).unwrap(),
         serde_json::json!({
-            "version": 3,
+            "version": 4,
+            "showInMenuBar": true,
             "moleIntegrationEnabled": false,
             "warningThreshold": 95,
             "indicator": {

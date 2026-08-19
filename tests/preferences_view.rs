@@ -4,13 +4,73 @@ use statlet::indicator_preferences::{
 };
 use statlet::preferences_view::{
     color_well_configuration, filter_font_families, ColorEditorFocusTarget, ColorEditorRows,
-    ColorEditorState, ColorWellPresentation, FontPickerInteraction, FontRow, HexDraft,
-    HexDraftError, HexEdit, IdentifierEditingFocusTarget, IdentifierEditingPresentation,
-    IndicatorControlsLayout, IndicatorControlsVisibility, IntervalDraft, IntervalFieldFormat,
-    LabelEditingFocusTarget, LabelEditingPresentation, MessageLayout, PreferencesArea,
-    PreferencesNavigationPolicy, PreferencesShellFocusTarget, PreferencesShellPresentation,
-    TypographyWarningKind,
+    ColorEditorState, ColorWellPresentation, FontPickerInteraction, FontRow,
+    GeneralPreferencesPresentation, HexDraft, HexDraftError, HexEdit, IdentifierEditingFocusTarget,
+    IdentifierEditingPresentation, IndicatorControlsLayout, IndicatorControlsVisibility,
+    IntervalDraft, IntervalFieldFormat, LabelEditingFocusTarget, LabelEditingPresentation,
+    MessageLayout, PreferencesArea, PreferencesNavigationArea, PreferencesNavigationPolicy,
+    PreferencesShellFocusTarget, PreferencesShellPresentation, TypographyWarningKind,
 };
+
+#[test]
+fn general_recovery_layout_wraps_complete_help_in_two_lines() {
+    let (width, height, max_lines) = statlet::preferences_view::general_recovery_layout();
+    assert_eq!((width, height, max_lines), (400.0, 44.0, 2));
+    let help =
+        GeneralPreferencesPresentation::from_preferences(&statlet::core::Preferences::default())
+            .recovery_help();
+    assert!(help.contains("voltar às Preferências."));
+    assert!(help.len() > 24);
+}
+
+#[test]
+fn general_area_leads_the_navigation_with_recoverable_menu_bar_copy() {
+    use statlet::core::Preferences;
+
+    let areas = (0..=5)
+        .map(|row| PreferencesNavigationArea::from_sidebar_row(row).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        areas,
+        vec![
+            PreferencesNavigationArea::General,
+            PreferencesNavigationArea::Colors,
+            PreferencesNavigationArea::Labels,
+            PreferencesNavigationArea::Typography,
+            PreferencesNavigationArea::Refresh,
+            PreferencesNavigationArea::DiskAndMole,
+        ]
+    );
+    assert_eq!(
+        PreferencesNavigationArea::default(),
+        PreferencesNavigationArea::General
+    );
+    assert_eq!(PreferencesNavigationArea::General.sidebar_label(), "Geral");
+    let switched = PreferencesNavigationPolicy::between(
+        PreferencesNavigationArea::General,
+        PreferencesNavigationArea::Colors,
+    );
+    assert_eq!(switched.scroll_origin_y(180.0, 344.0, 648.0, 820.0), 476.0);
+
+    let presentation = GeneralPreferencesPresentation::from_preferences(&Preferences::default());
+    assert_eq!(presentation.title(), "Geral");
+    assert_eq!(presentation.toggle_identifier(), "general.show-in-menu-bar");
+    assert!(presentation.show_in_menu_bar());
+    assert_eq!(
+        presentation.toggle_label(),
+        "Mostrar o Statlet na barra de menus"
+    );
+    assert_eq!(
+        presentation.recovery_help(),
+        "Se ocultar o Statlet, abra-o pelo Finder ou Spotlight para voltar às Preferências."
+    );
+
+    let hidden = GeneralPreferencesPresentation::from_preferences(&Preferences {
+        show_in_menu_bar: false,
+        ..Preferences::default()
+    });
+    assert!(!hidden.show_in_menu_bar());
+}
 
 #[test]
 fn font_filter_is_case_insensitive_sorted_and_keeps_missing_selection_visible() {

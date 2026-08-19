@@ -39,6 +39,7 @@ fn restored_opt_in_checks_mole_without_reprompting_for_notifications() {
     assert_eq!(
         effects,
         vec![
+            AppEffect::SetMenuBarVisible(true),
             AppEffect::SetDiskSamplingEnabled(true),
             AppEffect::CheckMoleCompatibility,
         ]

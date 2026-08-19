@@ -22,6 +22,7 @@ fn defaults_keep_disk_sampling_inactive() {
     let app = StatletCore::new();
 
     assert_eq!(app.state().preferences, Preferences::default());
+    assert!(app.state().preferences.show_in_menu_bar);
     assert!(!app.state().preferences.mole_integration_enabled);
     assert_eq!(
         app.state().preferences.warning_threshold,
@@ -93,6 +94,30 @@ fn changing_the_threshold_saves_the_validated_preference() {
 }
 
 #[test]
+fn changing_menu_bar_visibility_applies_and_saves_without_extra_work() {
+    let mut app = StatletCore::new();
+
+    let effects = app.handle(AppEvent::SetMenuBarVisibility(false));
+
+    let expected = Preferences {
+        show_in_menu_bar: false,
+        ..Preferences::default()
+    };
+    assert_eq!(app.state().preferences, expected);
+    assert_eq!(
+        effects,
+        vec![
+            AppEffect::SetMenuBarVisible(false),
+            AppEffect::QueuePreferencesSave(expected),
+        ]
+    );
+    assert_eq!(
+        app.handle(AppEvent::SetMenuBarVisibility(false)),
+        Vec::<AppEffect>::new()
+    );
+}
+
+#[test]
 fn startup_preferences_control_disk_sampling_without_rewriting_the_file() {
     let preferences = Preferences {
         mole_integration_enabled: true,
@@ -106,8 +131,28 @@ fn startup_preferences_control_disk_sampling_without_rewriting_the_file() {
     assert_eq!(
         effects,
         vec![
+            AppEffect::SetMenuBarVisible(true),
             AppEffect::SetDiskSamplingEnabled(true),
             AppEffect::CheckMoleCompatibility,
+        ]
+    );
+}
+
+#[test]
+fn startup_applies_persisted_menu_bar_visibility_without_rewriting_preferences() {
+    let preferences = Preferences {
+        show_in_menu_bar: false,
+        ..Preferences::default()
+    };
+
+    let (app, effects) = StatletCore::with_preferences(preferences.clone());
+
+    assert_eq!(app.state().preferences, preferences);
+    assert_eq!(
+        effects,
+        vec![
+            AppEffect::SetMenuBarVisible(false),
+            AppEffect::SetDiskSamplingEnabled(false),
         ]
     );
 }
@@ -118,7 +163,10 @@ fn disabled_startup_and_enabled_to_disabled_transition_stop_disk_sampling() {
 
     assert_eq!(
         startup_effects,
-        vec![AppEffect::SetDiskSamplingEnabled(false)]
+        vec![
+            AppEffect::SetMenuBarVisible(true),
+            AppEffect::SetDiskSamplingEnabled(false),
+        ]
     );
 
     app.handle(AppEvent::SetMoleIntegrationEnabled(true));

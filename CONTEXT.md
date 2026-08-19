@@ -5,8 +5,12 @@ Linguagem comum do produto Statlet. Este arquivo define os termos do domínio, s
 ## Language
 
 **Indicador compacto**:
-Representação permanente de CPU e RAM em duas linhas dentro de um único item da menu bar.
+Representação de CPU e RAM em duas linhas dentro de um único item da menu bar, visível por padrão e ocultável explicitamente nas Preferências.
 _Avoid_: Widget, dashboard, preset completo
+
+**Visibilidade do indicador**:
+Preferência que controla somente a presença do indicador compacto na menu bar. Ocultá-lo não encerra o Statlet; reabrir o app pelo Finder ou Spotlight recupera Preferências para que a pessoa possa mostrá-lo novamente.
+_Avoid_: Encerrar o app, remover o monitoramento, estado irrecuperável
 
 **Integração com o Mole**:
 Opção ativada pela pessoa que conecta os avisos de disco do Statlet ao fluxo de manutenção oferecido pelo Mole.

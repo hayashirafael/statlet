@@ -13,7 +13,7 @@ use crate::indicator_preferences::{
     SystemSymbolName, SystemSymbolSize, TypographyPreferences,
 };
 
-const CURRENT_VERSION: u8 = 3;
+const CURRENT_VERSION: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreferencesCommitState {
@@ -144,7 +144,7 @@ impl PreferencesStore {
             .write(true)
             .open(temporary_path)
             .map_err(PreferencesSaveError::not_committed)?;
-        let stored = StoredPreferencesV3::from(preferences);
+        let stored = StoredPreferencesV4::from(preferences);
         serde_json::to_writer_pretty(&mut file, &stored)
             .map_err(io::Error::other)
             .map_err(PreferencesSaveError::not_committed)?;
@@ -247,6 +247,9 @@ fn decode(bytes: &[u8]) -> Option<Preferences> {
         3 => serde_json::from_slice::<StoredPreferencesV3>(bytes)
             .ok()?
             .into_preferences(),
+        4 => serde_json::from_slice::<StoredPreferencesV4>(bytes)
+            .ok()?
+            .into_preferences(),
         _ => None,
     }
 }
@@ -289,6 +292,7 @@ impl StoredPreferencesV2 {
         }
 
         Some(Preferences {
+            show_in_menu_bar: true,
             mole_integration_enabled: self.mole_integration_enabled,
             warning_threshold: WarningThreshold::try_from(self.warning_threshold).ok()?,
             indicator: self.indicator.into_preferences(true)?,
@@ -305,10 +309,36 @@ struct StoredPreferencesV3 {
     indicator: StoredIndicatorPreferences,
 }
 
-impl From<Preferences> for StoredPreferencesV3 {
+impl StoredPreferencesV3 {
+    fn into_preferences(self) -> Option<Preferences> {
+        if self.version != 3 {
+            return None;
+        }
+
+        Some(Preferences {
+            show_in_menu_bar: true,
+            mole_integration_enabled: self.mole_integration_enabled,
+            warning_threshold: WarningThreshold::try_from(self.warning_threshold).ok()?,
+            indicator: self.indicator.into_preferences(false)?,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredPreferencesV4 {
+    version: u8,
+    show_in_menu_bar: bool,
+    mole_integration_enabled: bool,
+    warning_threshold: u8,
+    indicator: StoredIndicatorPreferences,
+}
+
+impl From<Preferences> for StoredPreferencesV4 {
     fn from(preferences: Preferences) -> Self {
         Self {
             version: CURRENT_VERSION,
+            show_in_menu_bar: preferences.show_in_menu_bar,
             mole_integration_enabled: preferences.mole_integration_enabled,
             warning_threshold: preferences.warning_threshold.get(),
             indicator: preferences.indicator.into(),
@@ -316,13 +346,14 @@ impl From<Preferences> for StoredPreferencesV3 {
     }
 }
 
-impl StoredPreferencesV3 {
+impl StoredPreferencesV4 {
     fn into_preferences(self) -> Option<Preferences> {
         if self.version != CURRENT_VERSION {
             return None;
         }
 
         Some(Preferences {
+            show_in_menu_bar: self.show_in_menu_bar,
             mole_integration_enabled: self.mole_integration_enabled,
             warning_threshold: WarningThreshold::try_from(self.warning_threshold).ok()?,
             indicator: self.indicator.into_preferences(false)?,

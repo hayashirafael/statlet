@@ -4,6 +4,8 @@ Checklist da v1 para os comportamentos que dependem de AppKit, configurações d
 
 Este documento preserva a evidência da v1.0.0. A personalização posterior do indicador possui um checklist separado, em [`indicator-customization.md`](indicator-customization.md); itens manuais desse novo fluxo não herdam o estado concluído da validação v1.
 
+A rodada de 19 de agosto de 2026 validou, em bundle Dev isolado, o novo menu, a preferência de visibilidade, a recuperação por Launch Services e os atalhos nativos. A evidência e os gates que continuam abertos estão em [`ux-menu-visibility-2026-08-19.md`](ux-menu-visibility-2026-08-19.md) e na [issue #23](https://github.com/hayashirafael/statlet/issues/23).
+
 ## Cobertura automatizada
 
 - [x] Launch direto pede ao core uma janela útil de Preferências.

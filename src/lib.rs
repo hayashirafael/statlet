@@ -11,4 +11,5 @@ pub mod preferences;
 pub mod preferences_view;
 pub mod runtime_profile;
 pub mod runtime_schedule;
+pub mod status_menu;
 pub mod system_usage;

@@ -17,7 +17,8 @@ use statlet::core::{AppEvent, AppState, WarningThreshold};
 use statlet::icon_assets::IconAssetStore;
 use statlet::indicator_preferences::IndicatorPreferences;
 use statlet::preferences_view::{
-    preserve_scroll_origin_from_top, MessageLayout, PreferencesArea, PreferencesControlsCache,
+    general_recovery_layout, preserve_scroll_origin_from_top, GeneralPreferencesPresentation,
+    MessageLayout, PreferencesArea, PreferencesControlsCache, PreferencesNavigationArea,
     PreferencesNavigationPolicy, PreferencesShellFocusTarget, PreferencesShellPresentation,
 };
 use statlet::runtime_profile::RuntimePresentation;
@@ -36,7 +37,7 @@ use preview::PreviewPane;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct PreferencesAreaState {
-    visible: PreferencesArea,
+    visible: PreferencesNavigationArea,
 }
 
 impl PreferencesAreaState {
@@ -44,21 +45,31 @@ impl PreferencesAreaState {
         Self::default()
     }
 
-    pub(super) fn visible(self) -> PreferencesArea {
+    pub(super) fn visible(self) -> PreferencesNavigationArea {
         self.visible
     }
 
-    pub(super) fn select(self, visible: PreferencesArea) -> Self {
+    pub(super) fn select(self, visible: PreferencesNavigationArea) -> Self {
         Self { visible }
     }
 }
 
 fn select_visible_area(
     state: &RefCell<PreferencesAreaState>,
-    select_area: impl FnOnce(PreferencesArea),
+    select_area: impl FnOnce(PreferencesNavigationArea),
 ) {
     let area = state.borrow().visible();
     select_area(area);
+}
+
+fn indicator_area(area: PreferencesNavigationArea) -> Option<PreferencesArea> {
+    match area {
+        PreferencesNavigationArea::General | PreferencesNavigationArea::DiskAndMole => None,
+        PreferencesNavigationArea::Colors => Some(PreferencesArea::Colors),
+        PreferencesNavigationArea::Labels => Some(PreferencesArea::Labels),
+        PreferencesNavigationArea::Typography => Some(PreferencesArea::Typography),
+        PreferencesNavigationArea::Refresh => Some(PreferencesArea::Refresh),
+    }
 }
 
 fn deactivate_inactive_color_wells<T>(
@@ -370,26 +381,31 @@ pub(super) fn get_or_create_window<T>(slot: &mut Option<T>, create: impl FnOnce(
 }
 
 struct PreferencesControlTargetInput {
+    general: Retained<NSView>,
     indicator: Retained<NSView>,
     disk_and_mole: Retained<NSView>,
     indicator_scroll: Retained<NSScrollView>,
     indicator_document: Retained<NSView>,
     indicator_area_views: IndicatorAreaViews,
     indicator_first_keys: [Retained<NSView>; 4],
+    general_first_key: Retained<NSButton>,
     disk_and_mole_first_key: Retained<NSButton>,
     color_wells: Vec<Retained<NSColorWell>>,
 }
 
 struct PreferencesControlTargetIvars {
     state: RefCell<PreferencesAreaState>,
+    general: Retained<NSView>,
     indicator: Retained<NSView>,
     disk_and_mole: Retained<NSView>,
     indicator_scroll: Retained<NSScrollView>,
     indicator_document: Retained<NSView>,
     indicator_area_views: IndicatorAreaViews,
     indicator_first_keys: [Retained<NSView>; 4],
+    general_first_key: Retained<NSButton>,
     disk_and_mole_first_key: Retained<NSButton>,
     sidebar: RefCell<Option<Retained<NSTableView>>>,
+    indicator_footer: RefCell<Option<Retained<NSView>>>,
     color_wells: Vec<Retained<NSColorWell>>,
 }
 
@@ -405,25 +421,30 @@ define_class!(
 impl PreferencesControlTarget {
     fn new(mtm: MainThreadMarker, input: PreferencesControlTargetInput) -> Retained<Self> {
         let PreferencesControlTargetInput {
+            general,
             indicator,
             disk_and_mole,
             indicator_scroll,
             indicator_document,
             indicator_area_views,
             indicator_first_keys,
+            general_first_key,
             disk_and_mole_first_key,
             color_wells,
         } = input;
         let this = Self::alloc(mtm).set_ivars(PreferencesControlTargetIvars {
             state: RefCell::new(PreferencesAreaState::new()),
+            general,
             indicator,
             disk_and_mole,
             indicator_scroll,
             indicator_document,
             indicator_area_views,
             indicator_first_keys,
+            general_first_key,
             disk_and_mole_first_key,
             sidebar: RefCell::new(None),
+            indicator_footer: RefCell::new(None),
             color_wells,
         });
         unsafe { msg_send![super(this), init] }
@@ -434,19 +455,34 @@ impl PreferencesControlTarget {
         select_visible_area(&self.ivars().state, |area| self.select_area(area));
     }
 
-    fn select_area(&self, area: PreferencesArea) {
+    fn set_indicator_footer(&self, footer: Retained<NSView>) {
+        self.ivars().indicator_footer.replace(Some(footer));
+        self.refresh_selected_area();
+    }
+
+    fn select_area(&self, area: PreferencesNavigationArea) {
         let current = self.ivars().state.borrow().visible();
         let navigation = PreferencesNavigationPolicy::between(current, area);
         let state = self.ivars().state.borrow().select(area);
         self.ivars().state.replace(state);
         let visible = state.visible();
-        self.ivars().indicator_area_views.set_visible_area(visible);
+        if let Some(indicator_area) = indicator_area(visible) {
+            self.ivars()
+                .indicator_area_views
+                .set_visible_area(indicator_area);
+        }
+        self.ivars()
+            .general
+            .setHidden(visible != PreferencesNavigationArea::General);
         self.ivars()
             .indicator
-            .setHidden(visible == PreferencesArea::DiskAndMole);
+            .setHidden(indicator_area(visible).is_none());
         self.ivars()
             .disk_and_mole
-            .setHidden(visible != PreferencesArea::DiskAndMole);
+            .setHidden(visible != PreferencesNavigationArea::DiskAndMole);
+        if let Some(footer) = self.ivars().indicator_footer.borrow().as_deref() {
+            footer.setHidden(indicator_area(visible).is_none());
+        }
         let clip_view = self.ivars().indicator_scroll.contentView();
         let bounds = clip_view.bounds();
         let document_height = self.ivars().indicator_document.frame().size.height;
@@ -467,8 +503,12 @@ impl PreferencesControlTarget {
         );
         if let Some(sidebar) = self.ivars().sidebar.borrow().as_deref() {
             unsafe {
-                if let Some(index) = visible.indicator_index() {
+                if let Some(index) =
+                    indicator_area(visible).and_then(PreferencesArea::indicator_index)
+                {
                     sidebar.setNextKeyView(Some(&self.ivars().indicator_first_keys[index]));
+                } else if visible == PreferencesNavigationArea::General {
+                    sidebar.setNextKeyView(Some(&self.ivars().general_first_key));
                 } else {
                     sidebar.setNextKeyView(Some(&self.ivars().disk_and_mole_first_key));
                 }
@@ -492,7 +532,7 @@ define_class!(
     unsafe impl NSTableViewDataSource for PreferencesSidebarDataSource {
         #[unsafe(method(numberOfRowsInTableView:))]
         fn number_of_rows_in_table_view(&self, _table: &NSTableView) -> NSInteger {
-            5
+            6
         }
     }
 );
@@ -526,7 +566,7 @@ define_class!(
             _column: Option<&NSTableColumn>,
             row: NSInteger,
         ) -> Option<Retained<NSView>> {
-            let area = PreferencesArea::from_sidebar_row(row)
+            let area = PreferencesNavigationArea::from_sidebar_row(row)
                 .expect("preferences sidebar requested a known destination row");
             let label = NSTextField::labelWithString(
                 &objc2_foundation::NSString::from_str(area.sidebar_label()),
@@ -544,7 +584,8 @@ define_class!(
 
         #[unsafe(method(tableViewSelectionDidChange:))]
         fn table_view_selection_did_change(&self, _notification: &NSNotification) {
-            let Some(area) = PreferencesArea::from_sidebar_row(self.ivars().table.selectedRow())
+            let Some(area) =
+                PreferencesNavigationArea::from_sidebar_row(self.ivars().table.selectedRow())
             else {
                 return;
             };
@@ -685,8 +726,13 @@ struct DiskAndMolePage {
     warning_threshold_target: Retained<DiskThresholdTarget>,
 }
 
+struct GeneralPage {
+    root: Retained<NSView>,
+    show_in_menu_bar: Retained<NSButton>,
+}
+
 struct PreferencesFooter {
-    _indicator_view: Retained<NSView>,
+    indicator_view: Retained<NSView>,
     _save_recovery_view: Retained<NSView>,
     reset_all: Retained<NSButton>,
     undo: Retained<NSButton>,
@@ -723,6 +769,7 @@ pub(super) struct PreferencesWindow {
     pub(super) window: Retained<NSWindow>,
     _host: Retained<PreferencesWindowHost>,
     _sidebar: PreferencesSidebar,
+    general: GeneralPage,
     indicator: IndicatorPage,
     disk_and_mole: DiskAndMolePage,
     _footer: PreferencesFooter,
@@ -751,6 +798,7 @@ impl PreferencesWindow {
             .contentView()
             .expect("preferences window content view");
 
+        let general = create_general_page(mtm, contract, target);
         let indicator = create_indicator_page(
             mtm,
             contract,
@@ -759,13 +807,16 @@ impl PreferencesWindow {
             icon_asset_store,
         );
         let disk_and_mole = create_disk_and_mole_page(mtm, contract, target);
+        indicator.root.setHidden(true);
         disk_and_mole.root.setHidden(true);
+        content.addSubview(&general.root);
         content.addSubview(&indicator.root);
         content.addSubview(&disk_and_mole.root);
 
         let area_target = PreferencesControlTarget::new(
             mtm,
             PreferencesControlTargetInput {
+                general: general.root.clone(),
                 indicator: indicator.root.clone(),
                 disk_and_mole: disk_and_mole.root.clone(),
                 indicator_scroll: indicator.groups_scroll.clone(),
@@ -789,6 +840,7 @@ impl PreferencesWindow {
                         .first_key_view_for(PreferencesArea::Refresh)
                         .retain(),
                 ],
+                general_first_key: general.show_in_menu_bar.clone(),
                 disk_and_mole_first_key: disk_and_mole.mole_checkbox.clone(),
                 color_wells: indicator.controls.wells(),
             },
@@ -798,12 +850,11 @@ impl PreferencesWindow {
         content.addSubview(sidebar.view());
 
         let footer = create_footer(mtm, contract, &indicator.root, &content, target);
+        area_target.set_indicator_footer(footer.indicator_view.clone());
         unsafe {
-            sidebar.table().setNextKeyView(Some(
-                indicator
-                    .controls
-                    .first_key_view_for(PreferencesArea::Colors),
-            ));
+            sidebar
+                .table()
+                .setNextKeyView(Some(&general.show_in_menu_bar));
         }
         window.setInitialFirstResponder(Some(sidebar.table()));
         let delegate =
@@ -814,6 +865,7 @@ impl PreferencesWindow {
             window,
             _host: host,
             _sidebar: sidebar,
+            general,
             indicator,
             disk_and_mole,
             _footer: footer,
@@ -828,6 +880,14 @@ impl PreferencesWindow {
             return;
         }
 
+        let general = GeneralPreferencesPresentation::from_preferences(&state.preferences);
+        self.general
+            .show_in_menu_bar
+            .setState(if general.show_in_menu_bar() {
+                NSControlStateValueOn
+            } else {
+                0
+            });
         self.disk_and_mole
             .mole_checkbox
             .setState(if state.preferences.mole_integration_enabled {
@@ -858,6 +918,9 @@ impl PreferencesWindow {
         self._host
             .set_can_undo_indicator_reset(state.can_undo_indicator_reset);
         unsafe {
+            self.general
+                .show_in_menu_bar
+                .setNextKeyView(Some(self._sidebar.table()));
             for last in self.indicator.controls.last_key_views() {
                 last.setNextKeyView(Some(&self._footer.reset_all));
             }
@@ -1084,7 +1147,7 @@ fn create_footer(
     indicator_root.addSubview(&indicator_view);
     content.addSubview(&save_recovery_view);
     let footer = PreferencesFooter {
-        _indicator_view: indicator_view,
+        indicator_view,
         _save_recovery_view: save_recovery_view,
         reset_all,
         undo,
@@ -1189,6 +1252,80 @@ fn create_preferences_sidebar(
         table,
         _data_source: data_source,
         _delegate: delegate,
+    }
+}
+
+fn create_general_page(
+    mtm: MainThreadMarker,
+    contract: PreferencesShellContract,
+    target: &ControlTarget,
+) -> GeneralPage {
+    let page = GeneralPreferencesPresentation::from_preferences(&Default::default());
+    let root = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(
+            NSPoint::new(contract.sidebar_width(), 0.0),
+            NSSize::new(680.0, 640.0),
+        ),
+    );
+    let content = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(100.0, 220.0), NSSize::new(480.0, 190.0)),
+    );
+    let heading =
+        NSTextField::labelWithString(&objc2_foundation::NSString::from_str(page.title()), mtm);
+    heading.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(15.0)));
+    heading.setFrame(NSRect::new(
+        NSPoint::new(24.0, 136.0),
+        NSSize::new(420.0, 24.0),
+    ));
+
+    let checkbox = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            &objc2_foundation::NSString::from_str(page.toggle_label()),
+            Some(target as &AnyObject),
+            Some(sel!(toggleMenuBarVisibility:)),
+            mtm,
+        )
+    };
+    checkbox.setFrame(NSRect::new(
+        NSPoint::new(24.0, 94.0),
+        NSSize::new(420.0, 28.0),
+    ));
+    checkbox.setAccessibilityIdentifier(Some(&objc2_foundation::NSString::from_str(
+        page.toggle_identifier(),
+    )));
+    checkbox.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(
+        page.toggle_label(),
+    )));
+    checkbox.setAccessibilityHelp(Some(&objc2_foundation::NSString::from_str(
+        page.recovery_help(),
+    )));
+
+    let recovery = NSTextField::labelWithString(
+        &objc2_foundation::NSString::from_str(page.recovery_help()),
+        mtm,
+    );
+    recovery.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
+    recovery.setUsesSingleLineMode(false);
+    recovery.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByWordWrapping);
+    recovery.setMaximumNumberOfLines(general_recovery_layout().2 as isize);
+    recovery.setFrame(NSRect::new(
+        NSPoint::new(44.0, 42.0),
+        NSSize::new(general_recovery_layout().0, general_recovery_layout().1),
+    ));
+    recovery.setAccessibilityLabel(Some(&objc2_foundation::NSString::from_str(
+        page.recovery_help(),
+    )));
+
+    content.addSubview(&heading);
+    content.addSubview(&checkbox);
+    content.addSubview(&recovery);
+    root.addSubview(&content);
+
+    GeneralPage {
+        root,
+        show_in_menu_bar: checkbox,
     }
 }
 
@@ -1305,7 +1442,8 @@ mod tests {
         deactivate_inactive_color_wells, disk_threshold_slider_contract, font_size_slider_contract,
         get_or_create_window, label_spacing_slider_contract, select_visible_area,
         system_symbol_size_slider_contract, warning_threshold_from_slider_value, PreferencesArea,
-        PreferencesAreaState, PreferencesRegion, PreferencesShellContract, RegionPlacement,
+        PreferencesAreaState, PreferencesNavigationArea, PreferencesRegion,
+        PreferencesShellContract, RegionPlacement,
     };
     use statlet::core::PreferencesSaveStatus;
     use statlet::preferences_view::PreferencesShellPresentation;
@@ -1393,21 +1531,22 @@ mod tests {
             state.replace(next);
         });
 
-        assert_eq!(state.borrow().visible(), PreferencesArea::Colors);
+        assert_eq!(state.borrow().visible(), PreferencesNavigationArea::General);
     }
 
     #[test]
     fn selecting_an_area_shows_exactly_one_preferences_page() {
         let areas = [
-            PreferencesArea::Colors,
-            PreferencesArea::Labels,
-            PreferencesArea::Typography,
-            PreferencesArea::Refresh,
-            PreferencesArea::DiskAndMole,
+            PreferencesNavigationArea::General,
+            PreferencesNavigationArea::Colors,
+            PreferencesNavigationArea::Labels,
+            PreferencesNavigationArea::Typography,
+            PreferencesNavigationArea::Refresh,
+            PreferencesNavigationArea::DiskAndMole,
         ];
         let state = PreferencesAreaState::new();
 
-        assert_eq!(state.visible(), PreferencesArea::Colors);
+        assert_eq!(state.visible(), PreferencesNavigationArea::General);
         assert_eq!(
             areas
                 .iter()
@@ -1416,8 +1555,8 @@ mod tests {
             1
         );
 
-        let state = state.select(PreferencesArea::DiskAndMole);
-        assert_eq!(state.visible(), PreferencesArea::DiskAndMole);
+        let state = state.select(PreferencesNavigationArea::DiskAndMole);
+        assert_eq!(state.visible(), PreferencesNavigationArea::DiskAndMole);
         assert_eq!(
             areas
                 .iter()
@@ -1432,11 +1571,21 @@ mod tests {
         let contract = PreferencesShellContract::new();
 
         assert_eq!(contract.content_size(), (860.0, 700.0));
-        assert_eq!(PreferencesArea::Colors.sidebar_label(), "Cores");
-        assert_eq!(PreferencesArea::Labels.sidebar_label(), "Rótulos");
-        assert_eq!(PreferencesArea::Typography.sidebar_label(), "Tipografia");
-        assert_eq!(PreferencesArea::Refresh.sidebar_label(), "Atualização");
-        assert_eq!(PreferencesArea::DiskAndMole.sidebar_label(), "Disco e Mole");
+        assert_eq!(PreferencesNavigationArea::General.sidebar_label(), "Geral");
+        assert_eq!(PreferencesNavigationArea::Colors.sidebar_label(), "Cores");
+        assert_eq!(PreferencesNavigationArea::Labels.sidebar_label(), "Rótulos");
+        assert_eq!(
+            PreferencesNavigationArea::Typography.sidebar_label(),
+            "Tipografia"
+        );
+        assert_eq!(
+            PreferencesNavigationArea::Refresh.sidebar_label(),
+            "Atualização"
+        );
+        assert_eq!(
+            PreferencesNavigationArea::DiskAndMole.sidebar_label(),
+            "Disco e Mole"
+        );
     }
 
     #[test]
@@ -1446,36 +1595,50 @@ mod tests {
         assert_eq!(contract.content_size(), (860.0, 700.0));
         assert_eq!(contract.sidebar_width(), 180.0);
         assert!(!contract.sidebar_header_visible());
-        assert_eq!(PreferencesArea::Colors.sidebar_label(), "Cores");
-        assert_eq!(PreferencesArea::Labels.sidebar_label(), "Rótulos");
-        assert_eq!(PreferencesArea::Typography.sidebar_label(), "Tipografia");
-        assert_eq!(PreferencesArea::Refresh.sidebar_label(), "Atualização");
-        assert_eq!(PreferencesArea::DiskAndMole.sidebar_label(), "Disco e Mole");
+        assert_eq!(PreferencesNavigationArea::General.sidebar_label(), "Geral");
+        assert_eq!(PreferencesNavigationArea::Colors.sidebar_label(), "Cores");
+        assert_eq!(PreferencesNavigationArea::Labels.sidebar_label(), "Rótulos");
+        assert_eq!(
+            PreferencesNavigationArea::Typography.sidebar_label(),
+            "Tipografia"
+        );
+        assert_eq!(
+            PreferencesNavigationArea::Refresh.sidebar_label(),
+            "Atualização"
+        );
+        assert_eq!(
+            PreferencesNavigationArea::DiskAndMole.sidebar_label(),
+            "Disco e Mole"
+        );
         assert_eq!(
             contract.sidebar_accessibility_identifier(),
             "preferences.sidebar"
         );
         assert_eq!(
-            PreferencesArea::from_sidebar_row(0),
-            Some(PreferencesArea::Colors)
+            PreferencesNavigationArea::from_sidebar_row(0),
+            Some(PreferencesNavigationArea::General)
         );
         assert_eq!(
-            PreferencesArea::from_sidebar_row(1),
-            Some(PreferencesArea::Labels)
+            PreferencesNavigationArea::from_sidebar_row(1),
+            Some(PreferencesNavigationArea::Colors)
         );
         assert_eq!(
-            PreferencesArea::from_sidebar_row(2),
-            Some(PreferencesArea::Typography)
+            PreferencesNavigationArea::from_sidebar_row(2),
+            Some(PreferencesNavigationArea::Labels)
         );
         assert_eq!(
-            PreferencesArea::from_sidebar_row(3),
-            Some(PreferencesArea::Refresh)
+            PreferencesNavigationArea::from_sidebar_row(3),
+            Some(PreferencesNavigationArea::Typography)
         );
         assert_eq!(
-            PreferencesArea::from_sidebar_row(4),
-            Some(PreferencesArea::DiskAndMole)
+            PreferencesNavigationArea::from_sidebar_row(4),
+            Some(PreferencesNavigationArea::Refresh)
         );
-        assert_eq!(PreferencesArea::from_sidebar_row(5), None);
+        assert_eq!(
+            PreferencesNavigationArea::from_sidebar_row(5),
+            Some(PreferencesNavigationArea::DiskAndMole)
+        );
+        assert_eq!(PreferencesNavigationArea::from_sidebar_row(6), None);
     }
 
     #[test]

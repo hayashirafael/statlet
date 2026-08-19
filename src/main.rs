@@ -43,7 +43,10 @@ use statlet::runtime_schedule::{RedrawRequest, RuntimeSchedule};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+use tray_icon::menu::{
+    accelerator::{Accelerator, Code, Modifiers, CMD_OR_CTRL},
+    Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use macos::environment::{PreviewAppearanceName, VisualEnvironment, VisualEnvironmentObserver};
@@ -56,10 +59,538 @@ use macos::windows::{
     PreviewContrastWarnings, PreviewSummaries, WindowManager,
 };
 use macos::RuntimeEvent;
+use statlet::status_menu::{StatusMenuItemId, StatusMenuPresentation, StatusReading};
 use statlet::system_usage::{
     ProcessSampleRequest, ProcessStart, SamplingCycle, SurfaceObservation, SystemUsageCause,
     SystemUsagePresentation, SystemUsageSampling, SystemUsageSession, SystemUsageSurface,
 };
+
+#[derive(Clone, Copy, Debug)]
+struct StatusMenuReadings {
+    cpu: StatusReading<u8>,
+    ram: StatusReading<u8>,
+    disk: StatusReading<statlet::disk::DiskObservation>,
+}
+
+impl Default for StatusMenuReadings {
+    fn default() -> Self {
+        Self {
+            cpu: StatusReading::Unavailable,
+            ram: StatusReading::Unavailable,
+            disk: StatusReading::Unavailable,
+        }
+    }
+}
+
+impl StatusMenuReadings {
+    fn observe_metrics(&mut self, snapshot: Option<statlet::core::SystemSnapshot>) {
+        match snapshot {
+            Some(snapshot) => {
+                self.cpu =
+                    StatusReading::Current(snapshot.cpu_percent.clamp(0.0, 100.0).round() as u8);
+                self.ram =
+                    StatusReading::Current(snapshot.ram_percent.clamp(0.0, 100.0).round() as u8);
+            }
+            None => {
+                self.cpu = stale_or_unavailable(self.cpu);
+                self.ram = stale_or_unavailable(self.ram);
+            }
+        }
+    }
+
+    fn observe_disk(&mut self, observation: Option<statlet::disk::DiskObservation>) {
+        self.disk = match observation {
+            Some(observation) => StatusReading::Current(observation),
+            None => match self.disk {
+                StatusReading::Unavailable => StatusReading::Unavailable,
+                StatusReading::Current(observation) | StatusReading::Stale(observation) => {
+                    StatusReading::Stale(observation)
+                }
+            },
+        };
+    }
+
+    fn clear_disk(&mut self) {
+        self.disk = StatusReading::Unavailable;
+    }
+
+    fn presentation(self, mole_enabled: bool) -> StatusMenuPresentation {
+        StatusMenuPresentation::new(self.cpu, self.ram, self.disk, mole_enabled)
+    }
+}
+
+fn stale_or_unavailable(reading: StatusReading<u8>) -> StatusReading<u8> {
+    match reading {
+        StatusReading::Unavailable => StatusReading::Unavailable,
+        StatusReading::Current(value) | StatusReading::Stale(value) => StatusReading::Stale(value),
+    }
+}
+
+struct StatusItemSlot<T> {
+    item: Option<T>,
+}
+
+impl<T> Default for StatusItemSlot<T> {
+    fn default() -> Self {
+        Self { item: None }
+    }
+}
+
+impl<T> StatusItemSlot<T> {
+    fn is_visible(&self) -> bool {
+        self.item.is_some()
+    }
+
+    fn set_visible_with(&mut self, visible: bool, create: impl FnOnce() -> T) -> bool {
+        if visible == self.is_visible() {
+            return false;
+        }
+        self.item = visible.then(create);
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ApplicationMenuContract;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MenuShortcut {
+    modifiers: Modifiers,
+    key: Code,
+}
+
+impl MenuShortcut {
+    const fn command(key: Code) -> Self {
+        Self {
+            modifiers: CMD_OR_CTRL,
+            key,
+        }
+    }
+
+    fn accelerator(self) -> Accelerator {
+        Accelerator::new(Some(self.modifiers), self.key)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ApplicationMenuCommand {
+    title: &'static str,
+    shortcut: MenuShortcut,
+}
+
+impl ApplicationMenuCommand {
+    const fn new(title: &'static str, key: Code) -> Self {
+        Self {
+            title,
+            shortcut: MenuShortcut::command(key),
+        }
+    }
+
+    const fn title(self) -> &'static str {
+        self.title
+    }
+
+    fn accelerator(self) -> Accelerator {
+        self.shortcut.accelerator()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplicationMenuRole {
+    About,
+    Separator,
+    Preferences,
+    Services,
+    Hide,
+    HideOthers,
+    ShowAll,
+    Quit,
+    Close,
+}
+
+impl ApplicationMenuContract {
+    const fn new() -> Self {
+        Self
+    }
+
+    const fn preferences(self) -> ApplicationMenuCommand {
+        ApplicationMenuCommand::new("Preferências…", Code::Comma)
+    }
+
+    const fn quit(self) -> ApplicationMenuCommand {
+        ApplicationMenuCommand::new("Sair do Statlet", Code::KeyQ)
+    }
+
+    const fn close_window(self) -> ApplicationMenuCommand {
+        ApplicationMenuCommand::new("Fechar", Code::KeyW)
+    }
+
+    const fn top_level_titles(self) -> [&'static str; 2] {
+        ["Statlet", "Janela"]
+    }
+
+    const fn app_items(self) -> [ApplicationMenuRole; 11] {
+        use ApplicationMenuRole::*;
+        [
+            About,
+            Separator,
+            Preferences,
+            Separator,
+            Services,
+            Separator,
+            Hide,
+            HideOthers,
+            ShowAll,
+            Separator,
+            Quit,
+        ]
+    }
+
+    const fn window_items(self) -> [ApplicationMenuRole; 1] {
+        [ApplicationMenuRole::Close]
+    }
+
+    #[cfg(test)]
+    fn app_item_roles(self) -> [&'static str; 11] {
+        self.app_items().map(ApplicationMenuRole::name)
+    }
+
+    #[cfg(test)]
+    fn window_item_roles(self) -> [&'static str; 1] {
+        self.window_items().map(ApplicationMenuRole::name)
+    }
+
+    #[cfg(test)]
+    const fn localized_standard_titles(self) -> [&'static str; 5] {
+        [
+            self.localized_title(ApplicationMenuRole::About),
+            self.localized_title(ApplicationMenuRole::Services),
+            self.localized_title(ApplicationMenuRole::Hide),
+            self.localized_title(ApplicationMenuRole::HideOthers),
+            self.localized_title(ApplicationMenuRole::ShowAll),
+        ]
+    }
+
+    const fn localized_title(self, role: ApplicationMenuRole) -> &'static str {
+        match role {
+            ApplicationMenuRole::About => "Sobre o Statlet",
+            ApplicationMenuRole::Services => "Serviços",
+            ApplicationMenuRole::Hide => "Ocultar Statlet",
+            ApplicationMenuRole::HideOthers => "Ocultar Outros",
+            ApplicationMenuRole::ShowAll => "Mostrar Tudo",
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl ApplicationMenuRole {
+    #[cfg(test)]
+    const fn name(self) -> &'static str {
+        match self {
+            Self::About => "about",
+            Self::Separator => "separator",
+            Self::Preferences => "preferences",
+            Self::Services => "services",
+            Self::Hide => "hide",
+            Self::HideOthers => "hide-others",
+            Self::ShowAll => "show-all",
+            Self::Quit => "quit",
+            Self::Close => "close",
+        }
+    }
+}
+
+struct MenuCommandIds {
+    review_space: MenuId,
+    system_usage: MenuId,
+    status_preferences: MenuId,
+    main_preferences: MenuId,
+    history: MenuId,
+    status_quit: MenuId,
+    main_quit: MenuId,
+    main_close: MenuId,
+}
+
+struct StatusMenuSurface {
+    menu: Menu,
+    cpu_and_ram: MenuItem,
+    disk: MenuItem,
+    disk_attached: bool,
+    system_usage: MenuItem,
+    review_space: MenuItem,
+    preferences: MenuItem,
+    history: MenuItem,
+    quit: MenuItem,
+    _dev_identity: Option<MenuItem>,
+    status_item: StatusItemSlot<TrayIcon>,
+}
+
+impl StatusMenuSurface {
+    fn new(
+        presentation: StatusMenuPresentation,
+        dev_identity: Option<String>,
+    ) -> (Self, MenuCommandIds) {
+        let cpu_and_ram = menu_item_for(&presentation, StatusMenuItemId::CpuAndRam, "status.cpu");
+        let disk = presentation
+            .item(StatusMenuItemId::Disk)
+            .map(|item| MenuItem::with_id("status.disk", item.title(), false, None))
+            .unwrap_or_else(|| {
+                MenuItem::with_id("status.disk", "Disco — leitura indisponível", false, None)
+            });
+        let system_usage = menu_item_for(
+            &presentation,
+            StatusMenuItemId::OpenSystemUsage,
+            "status.system-usage",
+        );
+        let review_space = menu_item_for(
+            &presentation,
+            StatusMenuItemId::ReviewSpace,
+            "status.review-space",
+        );
+        let preferences = menu_item_for(
+            &presentation,
+            StatusMenuItemId::OpenPreferences,
+            "status.preferences",
+        );
+        let history = menu_item_for(
+            &presentation,
+            StatusMenuItemId::OpenHistory,
+            "status.history",
+        );
+        let quit = menu_item_for(&presentation, StatusMenuItemId::Quit, "status.quit");
+        let dev_identity = dev_identity.map(|identity| MenuItem::new(identity, false, None));
+        let menu = Menu::new();
+
+        for (group_index, group) in presentation.groups().iter().enumerate() {
+            if group_index > 0 {
+                menu.append(&PredefinedMenuItem::separator())
+                    .expect("separate status menu groups");
+            }
+            for item in group.items() {
+                let native: &dyn tray_icon::menu::IsMenuItem = match item.id() {
+                    StatusMenuItemId::CpuAndRam => &cpu_and_ram,
+                    StatusMenuItemId::Disk => &disk,
+                    StatusMenuItemId::OpenSystemUsage => &system_usage,
+                    StatusMenuItemId::ReviewSpace => &review_space,
+                    StatusMenuItemId::OpenPreferences => &preferences,
+                    StatusMenuItemId::OpenHistory => &history,
+                    StatusMenuItemId::Quit => &quit,
+                };
+                menu.append(native).expect("build ordered status menu");
+            }
+            if group.id() == statlet::status_menu::StatusMenuGroupId::Application {
+                if let Some(identity) = &dev_identity {
+                    menu.append(identity)
+                        .expect("append Dev identity in app group");
+                }
+            }
+        }
+
+        let ids = MenuCommandIds {
+            review_space: review_space.id().clone(),
+            system_usage: system_usage.id().clone(),
+            status_preferences: preferences.id().clone(),
+            main_preferences: MenuId::new("main.preferences"),
+            history: history.id().clone(),
+            status_quit: quit.id().clone(),
+            main_quit: MenuId::new("main.quit"),
+            main_close: MenuId::new("main.close"),
+        };
+        let disk_attached = presentation.item(StatusMenuItemId::Disk).is_some();
+        (
+            Self {
+                menu,
+                cpu_and_ram,
+                disk,
+                disk_attached,
+                system_usage,
+                review_space,
+                preferences,
+                history,
+                quit,
+                _dev_identity: dev_identity,
+                status_item: StatusItemSlot::default(),
+            },
+            ids,
+        )
+    }
+
+    fn update(&mut self, presentation: &StatusMenuPresentation) {
+        update_menu_item(
+            &self.cpu_and_ram,
+            presentation.item(StatusMenuItemId::CpuAndRam),
+        );
+        update_menu_item(
+            &self.system_usage,
+            presentation.item(StatusMenuItemId::OpenSystemUsage),
+        );
+        update_menu_item(
+            &self.review_space,
+            presentation.item(StatusMenuItemId::ReviewSpace),
+        );
+        update_menu_item(
+            &self.preferences,
+            presentation.item(StatusMenuItemId::OpenPreferences),
+        );
+        update_menu_item(
+            &self.history,
+            presentation.item(StatusMenuItemId::OpenHistory),
+        );
+        update_menu_item(&self.quit, presentation.item(StatusMenuItemId::Quit));
+
+        let disk = presentation.item(StatusMenuItemId::Disk);
+        if let Some(disk) = disk {
+            self.disk.set_text(disk.title());
+            self.disk.set_enabled(false);
+            if !self.disk_attached {
+                self.menu
+                    .insert(&self.disk, 1)
+                    .expect("insert Mole disk status line");
+                self.disk_attached = true;
+            }
+        } else if self.disk_attached {
+            self.menu
+                .remove(&self.disk)
+                .expect("remove disabled Mole disk status line");
+            self.disk_attached = false;
+        }
+    }
+
+    fn set_visible(&mut self, visible: bool) -> bool {
+        if visible == self.status_item.is_visible() {
+            return false;
+        }
+        if visible {
+            let menu = self.menu.clone();
+            match TrayIconBuilder::new().with_menu(Box::new(menu)).build() {
+                Ok(tray) => self.status_item.set_visible_with(true, || tray),
+                Err(error) => {
+                    eprintln!("Statlet could not create its status item: {error}");
+                    false
+                }
+            }
+        } else {
+            self.status_item.set_visible_with(false, || unreachable!())
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        self.status_item.is_visible()
+    }
+}
+
+fn menu_item_for(
+    presentation: &StatusMenuPresentation,
+    id: StatusMenuItemId,
+    native_id: &str,
+) -> MenuItem {
+    let item = presentation.item(id).expect("status menu contract item");
+    MenuItem::with_id(native_id, item.title(), item.is_enabled(), None)
+}
+
+fn update_menu_item(item: &MenuItem, presentation: Option<&statlet::status_menu::StatusMenuItem>) {
+    if let Some(presentation) = presentation {
+        item.set_text(presentation.title());
+        item.set_enabled(presentation.is_enabled());
+    }
+}
+
+fn build_application_menu(ids: &MenuCommandIds) -> Menu {
+    let contract = ApplicationMenuContract::new();
+    let preferences_command = contract.preferences();
+    let preferences = MenuItem::with_id(
+        ids.main_preferences.clone(),
+        preferences_command.title(),
+        true,
+        Some(preferences_command.accelerator()),
+    );
+    let quit_command = contract.quit();
+    let quit = MenuItem::with_id(
+        ids.main_quit.clone(),
+        quit_command.title(),
+        true,
+        Some(quit_command.accelerator()),
+    );
+    let close_command = contract.close_window();
+    let close = MenuItem::with_id(
+        ids.main_close.clone(),
+        close_command.title(),
+        true,
+        Some(close_command.accelerator()),
+    );
+    let app = Submenu::new(contract.top_level_titles()[0], true);
+    for role in contract.app_items() {
+        let item: &dyn tray_icon::menu::IsMenuItem = match role {
+            ApplicationMenuRole::About => {
+                &PredefinedMenuItem::about(Some(contract.localized_title(role)), None)
+            }
+            ApplicationMenuRole::Separator => &PredefinedMenuItem::separator(),
+            ApplicationMenuRole::Preferences => &preferences,
+            ApplicationMenuRole::Services => {
+                &PredefinedMenuItem::services(Some(contract.localized_title(role)))
+            }
+            ApplicationMenuRole::Hide => {
+                &PredefinedMenuItem::hide(Some(contract.localized_title(role)))
+            }
+            ApplicationMenuRole::HideOthers => {
+                &PredefinedMenuItem::hide_others(Some(contract.localized_title(role)))
+            }
+            ApplicationMenuRole::ShowAll => {
+                &PredefinedMenuItem::show_all(Some(contract.localized_title(role)))
+            }
+            ApplicationMenuRole::Quit => &quit,
+            ApplicationMenuRole::Close => unreachable!("close belongs to the Window menu"),
+        };
+        app.append(item).expect("build Statlet application menu");
+    }
+    let window = Submenu::new(contract.top_level_titles()[1], true);
+    for role in contract.window_items() {
+        match role {
+            ApplicationMenuRole::Close => window.append(&close).expect("build Statlet window menu"),
+            _ => unreachable!("only close belongs to the Window menu"),
+        }
+    }
+    Menu::with_items(&[&app, &window]).expect("build native application menu")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusItemRedrawTiming {
+    ViaProcessDue,
+    Immediate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StatusItemReconciliation {
+    redraw_timing: StatusItemRedrawTiming,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusItemReconciliationCause {
+    Init { changed: bool },
+    UserEvent { changed: bool },
+    Reopen { changed: bool },
+    MissingButtonRecovery,
+}
+
+impl StatusItemReconciliationCause {
+    const fn plan(
+        self,
+        status_item_visible: bool,
+        button_present: bool,
+    ) -> Option<StatusItemReconciliation> {
+        let redraw_timing = match self {
+            Self::Init { changed: true } => StatusItemRedrawTiming::ViaProcessDue,
+            Self::UserEvent { changed: true } | Self::Reopen { changed: true } => {
+                StatusItemRedrawTiming::Immediate
+            }
+            Self::MissingButtonRecovery if status_item_visible && !button_present => {
+                StatusItemRedrawTiming::ViaProcessDue
+            }
+            _ => return None,
+        };
+        Some(StatusItemReconciliation { redraw_timing })
+    }
+}
 
 fn main() {
     let profile = RuntimeProfile::resolve(macos::bundle_profile_metadata())
@@ -84,42 +615,32 @@ fn main() {
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
     let proxy = event_loop.create_proxy();
 
-    let review_space_item = MenuItem::new("Revisar espaço…", false, None);
-    let review_space_id: MenuId = review_space_item.id().clone();
-    let preferences_item = MenuItem::new("Preferências…", true, None);
-    let preferences_id: MenuId = preferences_item.id().clone();
-    let history_item = MenuItem::new("Histórico…", true, None);
-    let history_id: MenuId = history_item.id().clone();
-    let system_usage_item = MenuItem::new("Uso do sistema…", true, None);
-    let system_usage_id: MenuId = system_usage_item.id().clone();
-    let quit = MenuItem::new("Sair", true, None);
-    let quit_id: MenuId = quit.id().clone();
-    let menu = Menu::new();
-    let dev_identity_item = presentation
-        .menu_identity()
-        .map(|identity| MenuItem::new(identity, false, None));
-    if let Some(identity) = &dev_identity_item {
-        menu.append(identity)
-            .expect("build Dev identity menu header");
-    }
-    menu.append(&system_usage_item).expect("build menu");
-    menu.append(&review_space_item).expect("build menu");
-    menu.append(&preferences_item).expect("build menu");
-    menu.append(&history_item).expect("build menu");
-    menu.append(&quit).expect("build menu");
+    let preferences_store = PreferencesStore::new(storage.preferences_path);
+    let history_store = HistoryStore::new(storage.history_path);
+    let icon_asset_store = IconAssetStore::new(storage.icon_assets_directory);
+    let history = history_store.load();
+    let initial_preferences = preferences_store.load();
+    let initial_metrics_interval = initial_preferences.indicator.refresh_interval;
+    let initial_menu =
+        StatusMenuReadings::default().presentation(initial_preferences.mole_integration_enabled);
+    let (status_menu, menu_ids) =
+        StatusMenuSurface::new(initial_menu, presentation.menu_identity());
+    let application_menu = build_application_menu(&menu_ids);
 
     let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-        let runtime_event = if event.id == review_space_id {
+        let runtime_event = if event.id == menu_ids.review_space {
             Some(RuntimeEvent::App(AppEvent::ReviewSpace))
-        } else if event.id == system_usage_id {
+        } else if event.id == menu_ids.system_usage {
             Some(RuntimeEvent::App(AppEvent::OpenSystemUsage))
-        } else if event.id == preferences_id {
+        } else if event.id == menu_ids.status_preferences || event.id == menu_ids.main_preferences {
             Some(RuntimeEvent::App(AppEvent::OpenPreferences))
-        } else if event.id == history_id {
+        } else if event.id == menu_ids.history {
             Some(RuntimeEvent::App(AppEvent::OpenHistory))
-        } else if event.id == quit_id {
+        } else if event.id == menu_ids.status_quit || event.id == menu_ids.main_quit {
             Some(RuntimeEvent::App(AppEvent::Quit))
+        } else if event.id == menu_ids.main_close {
+            Some(RuntimeEvent::CloseKeyWindow)
         } else {
             None
         };
@@ -128,12 +649,6 @@ fn main() {
         }
     }));
 
-    let preferences_store = PreferencesStore::new(storage.preferences_path);
-    let history_store = HistoryStore::new(storage.history_path);
-    let icon_asset_store = IconAssetStore::new(storage.icon_assets_directory);
-    let history = history_store.load();
-    let initial_preferences = preferences_store.load();
-    let initial_metrics_interval = initial_preferences.indicator.refresh_interval;
     let (mut core, startup_effects) = StatletCore::with_preferences(initial_preferences);
     let mut renderer = Renderer::new(icon_asset_store.clone(), presentation.clone());
     let mut runtime = RuntimeAdapters::new(
@@ -143,52 +658,51 @@ fn main() {
             history: history_store,
         },
         history,
-        review_space_item,
+        status_menu,
+        application_menu,
         proxy.clone(),
         initial_metrics_interval,
         presentation,
     );
-    // tray-icon removes the status item when its owner is dropped.
-    let mut _retained_tray: Option<TrayIcon> = None;
     let mut button = None;
 
     event_loop.run(move |event, _target, control_flow| match event {
         Event::NewEvents(StartCause::Init) => {
-            _retained_tray = match TrayIconBuilder::new()
-                .with_menu(Box::new(menu.clone()))
-                .build()
-            {
-                Ok(tray) => Some(tray),
-                Err(error) => {
-                    eprintln!("Statlet could not create its status item: {error}");
-                    None
-                }
-            };
             let marker = MainThreadMarker::new().expect("main-thread event loop");
-            button = macos::renderer::status_button(marker);
-            runtime.initialize_native(marker, proxy.clone(), button.as_deref());
+            runtime.initialize_native(marker, proxy.clone(), None);
             let _ = proxy.send_event(RuntimeEvent::App(AppEvent::ApplicationLaunched));
-            let _ = runtime.apply_effects(
-                &startup_effects,
-                &mut core,
+            let outcome = runtime.apply_effects(&startup_effects, &mut core, &mut renderer, None);
+            runtime.reconcile_status_item(
+                &mut button,
+                marker,
+                StatusItemReconciliationCause::Init {
+                    changed: outcome.status_item_changed,
+                },
+                &core,
                 &mut renderer,
-                button.as_deref(),
             );
             let _ = runtime.process_due(&mut core, &mut renderer, button.as_deref());
             set_next_wakeup(control_flow, &runtime);
         }
         Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
-            if button.is_none() {
-                let marker = MainThreadMarker::new().expect("main-thread event loop");
-                button = macos::renderer::status_button(marker);
-                runtime.rebind_status_button(button.as_deref());
-            }
+            let marker = MainThreadMarker::new().expect("main-thread event loop");
+            runtime.reconcile_status_item(
+                &mut button,
+                marker,
+                StatusItemReconciliationCause::MissingButtonRecovery,
+                &core,
+                &mut renderer,
+            );
             let _ = runtime.process_due(&mut core, &mut renderer, button.as_deref());
             set_next_wakeup(control_flow, &runtime);
         }
         Event::UserEvent(runtime_event) => {
             let effects = match runtime_event {
                 RuntimeEvent::App(app_event) => core.handle(app_event),
+                RuntimeEvent::CloseKeyWindow => {
+                    runtime.close_key_window();
+                    Vec::new()
+                }
                 RuntimeEvent::MetricPngPrepared {
                     metric,
                     generation,
@@ -238,7 +752,19 @@ fn main() {
                     effects
                 }
             };
-            if runtime.apply_effects(&effects, &mut core, &mut renderer, button.as_deref()) {
+            let outcome =
+                runtime.apply_effects(&effects, &mut core, &mut renderer, button.as_deref());
+            let marker = MainThreadMarker::new().expect("menu changes run on the main thread");
+            runtime.reconcile_status_item(
+                &mut button,
+                marker,
+                StatusItemReconciliationCause::UserEvent {
+                    changed: outcome.status_item_changed,
+                },
+                &core,
+                &mut renderer,
+            );
+            if outcome.should_quit {
                 *control_flow = ControlFlow::Exit;
             } else {
                 set_next_wakeup(control_flow, &runtime);
@@ -251,7 +777,18 @@ fn main() {
             let effects = core.handle(AppEvent::ApplicationReopened {
                 has_visible_windows,
             });
-            let _ = runtime.apply_effects(&effects, &mut core, &mut renderer, button.as_deref());
+            let outcome =
+                runtime.apply_effects(&effects, &mut core, &mut renderer, button.as_deref());
+            let marker = MainThreadMarker::new().expect("reopen runs on the main thread");
+            runtime.reconcile_status_item(
+                &mut button,
+                marker,
+                StatusItemReconciliationCause::Reopen {
+                    changed: outcome.status_item_changed,
+                },
+                &core,
+                &mut renderer,
+            );
             set_next_wakeup(control_flow, &runtime);
         }
         _ => {}
@@ -311,6 +848,19 @@ impl<A> VisualEnvironmentState<A> {
 
 fn visual_environment_redraw_request(changed: bool) -> Option<RedrawRequest> {
     changed.then(RedrawRequest::semantic_colors)
+}
+
+fn request_status_item_redraw<T>(
+    schedule: &mut RuntimeSchedule<T>,
+    now: Duration,
+    appearance_changed: bool,
+) {
+    let request = if appearance_changed {
+        RedrawRequest::semantic_colors()
+    } else {
+        RedrawRequest::paint()
+    };
+    schedule.request_redraw_now(now, request);
 }
 
 fn set_next_wakeup(control_flow: &mut ControlFlow, runtime: &RuntimeAdapters) {
@@ -474,7 +1024,9 @@ struct RuntimeAdapters {
     visual_environment_observer: Option<VisualEnvironmentObserver>,
     visual_environment: VisualEnvironmentState<Retained<NSAppearance>>,
     schedule: RuntimeSchedule<Preferences>,
-    review_space_item: MenuItem,
+    status_menu: StatusMenuSurface,
+    status_menu_readings: StatusMenuReadings,
+    application_menu: Menu,
     event_proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
     png_import_generations: [u64; 2],
     prepared_png_imports: [Option<PreparedPngAsset>; 2],
@@ -494,11 +1046,18 @@ struct RuntimeStores {
     history: HistoryStore,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ApplyEffectsOutcome {
+    should_quit: bool,
+    status_item_changed: bool,
+}
+
 impl RuntimeAdapters {
     fn new(
         stores: RuntimeStores,
         history: History,
-        review_space_item: MenuItem,
+        status_menu: StatusMenuSurface,
+        application_menu: Menu,
         proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
         metrics_interval: MetricsRefreshInterval,
         presentation: statlet::runtime_profile::RuntimePresentation,
@@ -515,7 +1074,9 @@ impl RuntimeAdapters {
             visual_environment_observer: None,
             visual_environment: VisualEnvironmentState::default(),
             schedule: RuntimeSchedule::new(),
-            review_space_item,
+            status_menu,
+            status_menu_readings: StatusMenuReadings::default(),
+            application_menu,
             system_usage: SystemUsageSession::new(),
             event_proxy: proxy,
             png_import_generations: [0; 2],
@@ -610,6 +1171,7 @@ impl RuntimeAdapters {
         proxy: tao::event_loop::EventLoopProxy<RuntimeEvent>,
         button: Option<&objc2_app_kit::NSStatusBarButton>,
     ) {
+        self.application_menu.init_for_nsapp();
         self.windows = Some(WindowManager::new(
             marker,
             proxy.clone(),
@@ -628,6 +1190,55 @@ impl RuntimeAdapters {
     fn rebind_status_button(&mut self, button: Option<&objc2_app_kit::NSStatusBarButton>) {
         if let Some(observer) = &mut self.visual_environment_observer {
             observer.rebind_status_button(button);
+        }
+    }
+
+    fn refresh_recreated_status_item(
+        &mut self,
+        button: Option<&objc2_app_kit::NSStatusBarButton>,
+        marker: MainThreadMarker,
+    ) {
+        self.rebind_status_button(button);
+        let Some(button) = button else {
+            return;
+        };
+        let appearance_changed = self.refresh_visual_environment(Some(button), marker);
+        request_status_item_redraw(
+            &mut self.schedule,
+            self.samplers.clock.now(),
+            appearance_changed,
+        );
+    }
+
+    fn reconcile_status_item(
+        &mut self,
+        button: &mut Option<Retained<objc2_app_kit::NSStatusBarButton>>,
+        marker: MainThreadMarker,
+        cause: StatusItemReconciliationCause,
+        core: &StatletCore,
+        renderer: &mut Renderer,
+    ) {
+        let Some(reconciliation) = cause.plan(self.status_item_is_visible(), button.is_some())
+        else {
+            return;
+        };
+        *button = self
+            .status_item_is_visible()
+            .then(|| macos::renderer::status_button(marker))
+            .flatten();
+        self.refresh_recreated_status_item(button.as_deref(), marker);
+        if reconciliation.redraw_timing == StatusItemRedrawTiming::Immediate {
+            self.redraw_due(core, renderer, button.as_deref());
+        }
+    }
+
+    fn status_item_is_visible(&self) -> bool {
+        self.status_menu.is_visible()
+    }
+
+    fn close_key_window(&self) {
+        if let Some(windows) = &self.windows {
+            windows.close_key_window();
         }
     }
 
@@ -675,20 +1286,53 @@ impl RuntimeAdapters {
         let now = self.samplers.clock.now();
         if self.png_recovery_schedule.take_due(now) {
             let recovery_effects = self.retry_png_asset_recovery(core);
-            if self.apply_effects(&recovery_effects, core, renderer, button) {
+            if self
+                .apply_effects(&recovery_effects, core, renderer, button)
+                .should_quit
+            {
                 return true;
             }
         }
         let poll = self.samplers.poll_due(core);
+        if let Some(observation) = poll.metrics_observation {
+            self.status_menu_readings.observe_metrics(observation);
+        }
+        if let Some(observation) = poll.disk_observation {
+            self.status_menu_readings.observe_disk(observation);
+        }
         self.advance_system_usage_at(SystemUsageCause::Wake(poll.cycle), now);
         if poll.metrics_ticked {
             self.schedule
                 .request_redraw_now(now, RedrawRequest::paint());
         }
-        if self.apply_effects(&poll.effects, core, renderer, button) {
+        if self
+            .apply_effects(&poll.effects, core, renderer, button)
+            .should_quit
+        {
             return true;
         }
 
+        self.redraw_due_at(now, core, renderer, button);
+        self.save_due_preferences(now, core);
+        false
+    }
+
+    fn redraw_due(
+        &mut self,
+        core: &StatletCore,
+        renderer: &mut Renderer,
+        button: Option<&objc2_app_kit::NSStatusBarButton>,
+    ) {
+        self.redraw_due_at(self.samplers.clock.now(), core, renderer, button);
+    }
+
+    fn redraw_due_at(
+        &mut self,
+        now: Duration,
+        core: &StatletCore,
+        renderer: &mut Renderer,
+        button: Option<&objc2_app_kit::NSStatusBarButton>,
+    ) {
         if let Some(request) = self.schedule.take_due_redraw(now) {
             objc2::rc::autoreleasepool(|_| {
                 if request.refresh_fonts {
@@ -703,8 +1347,6 @@ impl RuntimeAdapters {
                 self.redraw_indicator_surfaces(core, renderer, button, include_previews);
             });
         }
-        self.save_due_preferences(now, core);
-        false
     }
 
     fn save_due_preferences(&mut self, now: Duration, core: &mut StatletCore) {
@@ -737,13 +1379,17 @@ impl RuntimeAdapters {
         core: &mut StatletCore,
         _renderer: &mut Renderer,
         _button: Option<&objc2_app_kit::NSStatusBarButton>,
-    ) -> bool {
+    ) -> ApplyEffectsOutcome {
         let mut should_quit = false;
+        let mut status_item_changed = false;
         let mut pending = effects.iter().cloned().collect::<VecDeque<_>>();
         while let Some(effect) = pending.pop_front() {
             match effect {
                 AppEffect::RequestIndicatorRedraw => {
                     self.request_redraw(RedrawRequest::paint());
+                }
+                AppEffect::SetMenuBarVisible(visible) => {
+                    status_item_changed |= self.status_menu.set_visible(visible);
                 }
                 AppEffect::SetMetricsSamplingInterval(interval) => {
                     self.samplers.reschedule_metrics(interval);
@@ -1024,13 +1670,22 @@ impl RuntimeAdapters {
                 AppEffect::Quit => should_quit = true,
             }
         }
-        self.review_space_item
-            .set_enabled(core.state().preferences.mole_integration_enabled);
+        if !core.state().preferences.mole_integration_enabled {
+            self.status_menu_readings.clear_disk();
+        }
+        self.status_menu.update(
+            &self
+                .status_menu_readings
+                .presentation(core.state().preferences.mole_integration_enabled),
+        );
         if let Some(windows) = &self.windows {
             windows.update_state(core.state());
         }
         self.ensure_png_recovery_retry_scheduled();
-        should_quit
+        ApplyEffectsOutcome {
+            should_quit,
+            status_item_changed,
+        }
     }
 
     fn redraw_indicator_surfaces(
@@ -2718,6 +3373,8 @@ struct RuntimeSamplers {
 struct RuntimePoll {
     effects: Vec<AppEffect>,
     metrics_ticked: bool,
+    metrics_observation: Option<Option<statlet::core::SystemSnapshot>>,
+    disk_observation: Option<Option<statlet::disk::DiskObservation>>,
     cycle: SamplingCycle,
 }
 
@@ -2750,25 +3407,36 @@ impl RuntimeSamplers {
         self.sampling_cycle = self.sampling_cycle.wrapping_add(1);
         let cycle = SamplingCycle::new(self.sampling_cycle);
         let metrics_ticked = self.metrics_schedule.take_due(now);
-        if metrics_ticked {
-            if let Some(snapshot) = self.metrics.sample_in_cycle(cycle) {
-                core.handle(AppEvent::MetricsSample(snapshot.compact));
+        let metrics_observation = metrics_ticked.then(|| {
+            let observation = self
+                .metrics
+                .sample_in_cycle(cycle)
+                .map(|sample| sample.compact);
+            if let Some(snapshot) = observation {
+                core.handle(AppEvent::MetricsSample(snapshot));
             }
-        }
-        let effects = if self.disk_schedule.take_due(now) {
+            observation
+        });
+        let disk_due = self.disk_schedule.take_due(now);
+        let (effects, disk_observation) = if disk_due {
             match self.disk.sample(now) {
-                Ok(observation) => core.handle(AppEvent::DiskObserved(observation)),
+                Ok(observation) => (
+                    core.handle(AppEvent::DiskObserved(observation)),
+                    Some(Some(observation)),
+                ),
                 Err(error) => {
                     eprintln!("Statlet could not sample the startup volume: {error:?}");
-                    core.handle(AppEvent::DiskMonitoringFailed)
+                    (core.handle(AppEvent::DiskMonitoringFailed), Some(None))
                 }
             }
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         RuntimePoll {
             effects,
             metrics_ticked,
+            metrics_observation,
+            disk_observation,
             cycle,
         }
     }
@@ -2827,12 +3495,159 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        apply_persistence_intent, preview_contrast_warnings, resolved_scene_srgb_colors,
-        save_preferences, spawn_png_preparation_with, visual_environment_redraw_request, AppEffect,
+        apply_persistence_intent, preview_contrast_warnings, request_status_item_redraw,
+        resolved_scene_srgb_colors, save_preferences, spawn_png_preparation_with,
+        visual_environment_redraw_request, AppEffect, ApplicationMenuContract, Code,
         GlobalIndicatorAssetLifecycle, IconAssetStore, IdentifierResetTransaction, MetricKind,
         PngAssetTransaction, PreferencesStore, PreviewContrastWarnings, RuntimeEvent,
-        RuntimeSamplers, StatletCore, VisualEnvironment, VisualEnvironmentState,
+        RuntimeSamplers, StatletCore, StatusItemReconciliationCause, StatusItemRedrawTiming,
+        StatusItemSlot, StatusMenuReadings, VisualEnvironment, VisualEnvironmentState, CMD_OR_CTRL,
     };
+
+    #[test]
+    fn status_menu_readings_progress_from_unavailable_to_current_and_stale() {
+        let mut readings = StatusMenuReadings::default();
+        assert_eq!(readings.cpu.title("CPU"), "CPU — leitura indisponível");
+        assert_eq!(readings.ram.title("RAM"), "RAM — leitura indisponível");
+
+        readings.observe_metrics(Some(statlet::core::SystemSnapshot {
+            cpu_percent: 42.4,
+            ram_percent: 68.6,
+            memory_pressure: statlet::core::MemoryPressure::Normal,
+        }));
+        assert_eq!(readings.cpu.title("CPU"), "CPU 42% — leitura atual");
+        assert_eq!(readings.ram.title("RAM"), "RAM 69% — leitura atual");
+
+        readings.observe_metrics(None);
+        assert_eq!(readings.cpu.title("CPU"), "CPU 42% — leitura antiga");
+        assert_eq!(readings.ram.title("RAM"), "RAM 69% — leitura antiga");
+    }
+
+    #[test]
+    fn status_item_slot_creates_once_hides_by_dropping_and_can_restore() {
+        let drops = Rc::new(Cell::new(0));
+        let mut slot = StatusItemSlot::default();
+
+        assert!(slot.set_visible_with(true, || DropProbe(drops.clone())));
+        assert!(!slot.set_visible_with(true, || DropProbe(drops.clone())));
+        assert!(slot.is_visible());
+        assert_eq!(drops.get(), 0);
+
+        assert!(slot.set_visible_with(false, || DropProbe(drops.clone())));
+        assert!(!slot.is_visible());
+        assert_eq!(drops.get(), 1);
+
+        assert!(slot.set_visible_with(true, || DropProbe(drops.clone())));
+        assert!(slot.is_visible());
+    }
+
+    #[test]
+    fn recreated_status_item_requests_immediate_paint_when_appearance_is_equivalent() {
+        let now = Duration::from_millis(7);
+        let mut schedule = statlet::runtime_schedule::RuntimeSchedule::<()>::new();
+
+        request_status_item_redraw(&mut schedule, now, false);
+
+        assert_eq!(schedule.redraw_deadline(), Some(now));
+        assert_eq!(
+            schedule.take_due_redraw(now),
+            Some(statlet::runtime_schedule::RedrawRequest::paint())
+        );
+    }
+
+    #[test]
+    fn status_item_reconciliation_covers_effect_paths_and_missing_button_recovery() {
+        use StatusItemReconciliationCause::{Init, MissingButtonRecovery, Reopen, UserEvent};
+
+        assert_eq!(Init { changed: false }.plan(true, false), None);
+        assert_eq!(
+            Init { changed: true }
+                .plan(true, false)
+                .unwrap()
+                .redraw_timing,
+            StatusItemRedrawTiming::ViaProcessDue
+        );
+        assert_eq!(
+            UserEvent { changed: true }
+                .plan(true, false)
+                .unwrap()
+                .redraw_timing,
+            StatusItemRedrawTiming::Immediate
+        );
+        assert_eq!(
+            Reopen { changed: true }
+                .plan(true, false)
+                .unwrap()
+                .redraw_timing,
+            StatusItemRedrawTiming::Immediate
+        );
+        assert_eq!(MissingButtonRecovery.plan(true, true), None);
+        assert_eq!(MissingButtonRecovery.plan(false, false), None);
+        assert_eq!(
+            MissingButtonRecovery
+                .plan(true, false)
+                .unwrap()
+                .redraw_timing,
+            StatusItemRedrawTiming::ViaProcessDue
+        );
+    }
+
+    #[test]
+    fn application_menu_uses_only_the_standard_requested_shortcuts() {
+        let contract = ApplicationMenuContract::new();
+
+        for (command, title, key) in [
+            (contract.preferences(), "Preferências…", Code::Comma),
+            (contract.quit(), "Sair do Statlet", Code::KeyQ),
+            (contract.close_window(), "Fechar", Code::KeyW),
+        ] {
+            assert_eq!(command.title(), title);
+            assert!(command.accelerator().matches(CMD_OR_CTRL, key));
+        }
+        assert_eq!(contract.top_level_titles(), ["Statlet", "Janela"]);
+    }
+
+    #[test]
+    fn application_menu_exposes_standard_app_roles_and_preserves_close_window() {
+        assert_eq!(
+            ApplicationMenuContract::new().app_item_roles(),
+            [
+                "about",
+                "separator",
+                "preferences",
+                "separator",
+                "services",
+                "separator",
+                "hide",
+                "hide-others",
+                "show-all",
+                "separator",
+                "quit",
+            ]
+        );
+        assert_eq!(
+            ApplicationMenuContract::new().window_item_roles(),
+            ["close"]
+        );
+        assert_eq!(
+            ApplicationMenuContract::new().localized_standard_titles(),
+            [
+                "Sobre o Statlet",
+                "Serviços",
+                "Ocultar Statlet",
+                "Ocultar Outros",
+                "Mostrar Tudo",
+            ]
+        );
+    }
+
+    struct DropProbe(Rc<Cell<usize>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
 
     #[test]
     fn png_decode_resize_and_reencode_run_on_a_worker_thread() {
